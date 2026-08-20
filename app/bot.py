@@ -19,12 +19,133 @@ from aiogram.types import Message, TelegramObject
 
 from app.auth import is_allowed_telegram_user
 from app.config import settings
-from app.db import connect, init_db
+from app.db import (
+    init_db,
+    save_bank_lines,
+    save_invoices,
+    save_reconciliations,
+    stable_bank_line_id,
+    stable_invoice_id,
+)
 from app.demo_data import generate_demo_bank_statement, generate_demo_invoices
 from app.excel_report import build_excel_report
 from app.openai_client import OpenAIClientWrapper
 from app.reconciliation import reconcile_invoices
+from app.sheets_client import SheetsClient, SheetsSyncError
 from app.vat import simulate_vat
+
+# Onglets dedies a la synchronisation du bot (distincts des onglets du
+# classeur "X BLASTE" qui contiennent le jeu de donnees de demonstration
+# complet). ID stable en premiere colonne pour une synchronisation idempotente.
+SHEET_TAB_FACTURES = "BOT_FACTURES"
+SHEET_TAB_RELEVE = "BOT_RELEVE"
+SHEET_TAB_RAPPROCHEMENT = "BOT_RAPPROCHEMENT"
+SHEET_TAB_TVA = "BOT_TVA"
+
+_HEADERS_FACTURES = [
+    "ID", "Chat", "Fournisseur", "Numero", "Date", "Montant HT",
+    "Taux TVA", "Montant TVA", "Montant TTC", "Categorie",
+]
+_HEADERS_RELEVE = ["ID", "Chat", "Date operation", "Libelle", "Montant"]
+_HEADERS_RAPPROCHEMENT = ["ID", "Chat", "Facture", "Statut", "Detail"]
+_HEADERS_TVA = ["ID", "Chat", "Facture", "HT", "Taux TVA", "TVA", "TTC"]
+
+sheets_client = SheetsClient(
+    service_account_json=settings.google_service_account_json,
+    service_account_file=settings.google_service_account_file,
+    spreadsheet_id=settings.google_sheet_id,
+)
+
+
+def _sync_invoices_to_sheet(chat_id: int, invoices: list[Any], db_ids: list[int]) -> None:
+    if not sheets_client.is_configured:
+        return
+    try:
+        rows = []
+        for inv, db_id in zip(invoices, db_ids):
+            vat = simulate_vat(inv.montant_ht, inv.taux_tva)
+            rows.append(
+                {
+                    "id": stable_invoice_id(chat_id, db_id),
+                    "ID": stable_invoice_id(chat_id, db_id),
+                    "Chat": str(chat_id),
+                    "Fournisseur": inv.fournisseur,
+                    "Numero": inv.numero,
+                    "Date": inv.date_facture.isoformat(),
+                    "Montant HT": str(vat.montant_ht),
+                    "Taux TVA": str(vat.taux_tva),
+                    "Montant TVA": str(vat.montant_tva),
+                    "Montant TTC": str(vat.montant_ttc),
+                    "Categorie": "",
+                }
+            )
+        sheets_client.upsert_rows(SHEET_TAB_FACTURES, _HEADERS_FACTURES, rows)
+    except SheetsSyncError as exc:
+        logger.warning("Sync Sheets (factures) ignoree: %s", exc)
+
+
+def _sync_bank_lines_to_sheet(chat_id: int, bank_lines: list[Any], db_ids: list[int]) -> None:
+    if not sheets_client.is_configured:
+        return
+    try:
+        rows = [
+            {
+                "id": stable_bank_line_id(chat_id, db_id),
+                "ID": stable_bank_line_id(chat_id, db_id),
+                "Chat": str(chat_id),
+                "Date operation": b.date_operation.isoformat(),
+                "Libelle": b.libelle,
+                "Montant": str(b.montant),
+            }
+            for b, db_id in zip(bank_lines, db_ids)
+        ]
+        sheets_client.upsert_rows(SHEET_TAB_RELEVE, _HEADERS_RELEVE, rows)
+    except SheetsSyncError as exc:
+        logger.warning("Sync Sheets (releve) ignoree: %s", exc)
+
+
+def _sync_reconciliations_to_sheet(chat_id: int, results: list[Any]) -> None:
+    if not sheets_client.is_configured:
+        return
+    try:
+        rows = [
+            {
+                "id": f"RAPPR-{chat_id}-{r.invoice.numero}",
+                "ID": f"RAPPR-{chat_id}-{r.invoice.numero}",
+                "Chat": str(chat_id),
+                "Facture": r.invoice.numero,
+                "Statut": r.status,
+                "Detail": r.detail,
+            }
+            for r in results
+        ]
+        sheets_client.upsert_rows(SHEET_TAB_RAPPROCHEMENT, _HEADERS_RAPPROCHEMENT, rows)
+    except SheetsSyncError as exc:
+        logger.warning("Sync Sheets (rapprochement) ignoree: %s", exc)
+
+
+def _sync_vat_to_sheet(chat_id: int, invoices: list[Any]) -> None:
+    if not sheets_client.is_configured:
+        return
+    try:
+        rows = []
+        for inv in invoices:
+            result = simulate_vat(inv.montant_ht, inv.taux_tva, allowed_rates=settings.vat_rates())
+            rows.append(
+                {
+                    "id": f"TVA-{chat_id}-{inv.numero}",
+                    "ID": f"TVA-{chat_id}-{inv.numero}",
+                    "Chat": str(chat_id),
+                    "Facture": inv.numero,
+                    "HT": str(result.montant_ht),
+                    "Taux TVA": str(result.taux_tva),
+                    "TVA": str(result.montant_tva),
+                    "TTC": str(result.montant_ttc),
+                }
+            )
+        sheets_client.upsert_rows(SHEET_TAB_TVA, _HEADERS_TVA, rows)
+    except SheetsSyncError as exc:
+        logger.warning("Sync Sheets (TVA) ignoree: %s", exc)
 
 FAKE_INVOICE_TEXT_FOR_EXTRACTION = (
     "FACTURE (DEMO - donnee fictive)\n"
@@ -76,7 +197,8 @@ def build_dispatcher() -> Dispatcher:
         await message.answer(
             "Bienvenue sur le bot de demo comptable.\n"
             "Toutes les donnees sont FICTIVES.\n"
-            "Commandes: /help /demo_facture /demo_releve /tva /rapprochement /export /demo_extraction"
+            "Commandes: /help /demo_facture /demo_releve /tva /rapprochement /export "
+            "/demo_extraction /sheet /sync_sheet /dashboard"
         )
 
     @dp.message(Command("help"))
@@ -88,6 +210,9 @@ def build_dispatcher() -> Dispatcher:
             "/rapprochement - rapproche factures et releve bancaire\n"
             "/export - genere et envoie le rapport Excel\n"
             "/demo_extraction - teste l'extraction OpenAI sur une facture fictive\n"
+            "/sheet - lien vers le Google Sheet de suivi (si configure)\n"
+            "/sync_sheet - resynchronise toutes les donnees de session vers le Sheet\n"
+            "/dashboard - resume des KPI de la session en cours\n"
             "/status - etat du bot"
         )
 
@@ -103,6 +228,9 @@ def build_dispatcher() -> Dispatcher:
     async def cmd_demo_facture(message: Message) -> None:
         invoices = generate_demo_invoices(count=5, allowed_rates=settings.vat_rates())
         _DEMO_STATE.setdefault(message.chat.id, {})["invoices"] = invoices
+        db_ids = save_invoices(settings.db_path, message.chat.id, invoices)
+        _sync_invoices_to_sheet(message.chat.id, invoices, db_ids)
+        _sync_vat_to_sheet(message.chat.id, invoices)
         lines = [f"- {i.numero} | {i.fournisseur} | HT {i.montant_ht} | TVA {i.taux_tva}%" for i in invoices]
         await message.answer("Factures fictives generees:\n" + "\n".join(lines))
 
@@ -115,6 +243,8 @@ def build_dispatcher() -> Dispatcher:
             return
         bank_lines = generate_demo_bank_statement(invoices)
         chat_state["bank_lines"] = bank_lines
+        db_ids = save_bank_lines(settings.db_path, message.chat.id, bank_lines)
+        _sync_bank_lines_to_sheet(message.chat.id, bank_lines, db_ids)
         lines = [f"- {b.date_operation.isoformat()} | {b.libelle} | {b.montant}" for b in bank_lines]
         await message.answer("Releve bancaire fictif genere:\n" + "\n".join(lines))
 
@@ -132,6 +262,7 @@ def build_dispatcher() -> Dispatcher:
                 f"- {inv.numero}: HT {result.montant_ht} + TVA({result.taux_tva}%) "
                 f"{result.montant_tva} = TTC {result.montant_ttc}"
             )
+        _sync_vat_to_sheet(message.chat.id, invoices)
         await message.answer("Simulation TVA:\n" + "\n".join(lines))
 
     @dp.message(Command("rapprochement"))
@@ -149,8 +280,74 @@ def build_dispatcher() -> Dispatcher:
             window_days=settings.reconciliation_window_days,
         )
         chat_state["reconciliations"] = results
+        save_reconciliations(settings.db_path, message.chat.id, results)
+        _sync_reconciliations_to_sheet(message.chat.id, results)
         lines = [f"- {r.invoice.numero}: {r.status} ({r.detail})" for r in results]
         await message.answer("Rapprochement bancaire:\n" + "\n".join(lines))
+
+    @dp.message(Command("sheet"))
+    async def cmd_sheet(message: Message) -> None:
+        url = sheets_client.sheet_url()
+        if not url:
+            await message.answer(
+                "Aucun Google Sheet configure pour l'instant "
+                "(GOOGLE_SHEET_ID manquant)."
+            )
+            return
+        await message.answer(f"Google Sheet de suivi:\n{url}")
+
+    @dp.message(Command("sync_sheet"))
+    async def cmd_sync_sheet(message: Message) -> None:
+        if not sheets_client.is_configured:
+            await message.answer(
+                "Synchronisation Google Sheets non configuree sur ce bot "
+                "(GOOGLE_SERVICE_ACCOUNT_JSON/_FILE ou GOOGLE_SHEET_ID manquants)."
+            )
+            return
+        chat_state = _DEMO_STATE.get(message.chat.id, {})
+        invoices = chat_state.get("invoices", [])
+        bank_lines = chat_state.get("bank_lines", [])
+        reconciliations = chat_state.get("reconciliations", [])
+        if not invoices and not bank_lines:
+            await message.answer("Rien a synchroniser: genere d'abord des donnees de demo.")
+            return
+        inv_db_ids = save_invoices(settings.db_path, message.chat.id, invoices) if invoices else []
+        bank_db_ids = save_bank_lines(settings.db_path, message.chat.id, bank_lines) if bank_lines else []
+        if invoices:
+            _sync_invoices_to_sheet(message.chat.id, invoices, inv_db_ids)
+            _sync_vat_to_sheet(message.chat.id, invoices)
+        if bank_lines:
+            _sync_bank_lines_to_sheet(message.chat.id, bank_lines, bank_db_ids)
+        if reconciliations:
+            save_reconciliations(settings.db_path, message.chat.id, reconciliations)
+            _sync_reconciliations_to_sheet(message.chat.id, reconciliations)
+        await message.answer(
+            "Synchronisation terminee (idempotente, sans doublon). "
+            f"Factures: {len(invoices)}, lignes bancaires: {len(bank_lines)}, "
+            f"rapprochements: {len(reconciliations)}."
+        )
+
+    @dp.message(Command("dashboard"))
+    async def cmd_dashboard(message: Message) -> None:
+        chat_state = _DEMO_STATE.get(message.chat.id, {})
+        invoices = chat_state.get("invoices", [])
+        bank_lines = chat_state.get("bank_lines", [])
+        reconciliations = chat_state.get("reconciliations", [])
+        total_ht = sum((i.montant_ht for i in invoices), Decimal("0"))
+        total_ttc = sum(
+            (simulate_vat(i.montant_ht, i.taux_tva).montant_ttc for i in invoices), Decimal("0")
+        )
+        matched = sum(1 for r in reconciliations if r.status == "rapprochee")
+        lines = [
+            "Tableau de bord (session en cours, donnees FICTIVES):",
+            f"- Factures: {len(invoices)} | Total HT: {total_ht} | Total TTC: {total_ttc}",
+            f"- Lignes bancaires: {len(bank_lines)}",
+            f"- Rapprochements: {len(reconciliations)} ({matched} rapproches)",
+        ]
+        url = sheets_client.sheet_url()
+        if url:
+            lines.append(f"- Google Sheet: {url}")
+        await message.answer("\n".join(lines))
 
     @dp.message(Command("demo_extraction"))
     async def cmd_demo_extraction(message: Message) -> None:
