@@ -12,6 +12,10 @@ Perimetre volontairement reduit par rapport au projet complet
 - OpenAI Responses API utilisee uniquement pour une extraction de
   demonstration (texte de facture fictif -> JSON structure), avec repli
   systematique sur needs_human_review en cas d'erreur/ambiguite.
+- Modele unique : gpt-5.6-luna (OPENAI_MODEL), effort de raisonnement
+  none (OPENAI_REASONING_EFFORT). Aucun fallback vers un autre modele :
+  en cas d'erreur API, la demo retombe sur needs_human_review, jamais sur
+  un autre modele.
 
 ## Commandes Telegram
 
@@ -21,6 +25,8 @@ Perimetre volontairement reduit par rapport au projet complet
 - /tva - simule la TVA (HT -> TVA -> TTC) sur les factures generees
 - /rapprochement - rapproche factures et releve bancaire
 - /export - genere et envoie un rapport Excel (.xlsx)
+- /demo_extraction - teste l'extraction OpenAI (Responses API, gpt-5.6-luna)
+  sur une facture fictive
 
 ## Securite
 

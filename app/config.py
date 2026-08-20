@@ -22,11 +22,11 @@ class Settings(BaseSettings):
 
     # --- OpenAI (Responses API uniquement) ---
     openai_api_key: str = Field(default="", alias="OPENAI_API_KEY")
-    openai_model: str = Field(default="gpt-5.6-terra", alias="OPENAI_MODEL")
+    openai_model: str = Field(default="gpt-5.6-luna", alias="OPENAI_MODEL")
     openai_store: bool = Field(default=False, alias="OPENAI_STORE")
     openai_timeout_seconds: float = Field(default=60.0, alias="OPENAI_TIMEOUT_SECONDS")
     openai_max_output_tokens: int = Field(default=2000, alias="OPENAI_MAX_OUTPUT_TOKENS")
-    openai_reasoning_effort: str = Field(default="medium", alias="OPENAI_REASONING_EFFORT")
+    openai_reasoning_effort: str = Field(default="none", alias="OPENAI_REASONING_EFFORT")
 
     # --- Donnees / TVA (configurable, jamais code en dur) ---
     db_path: str = Field(default="/app/data/demo.db", alias="DB_PATH")
