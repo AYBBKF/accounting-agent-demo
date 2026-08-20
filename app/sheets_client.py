@@ -1,26 +1,41 @@
-"""Client de synchronisation Google Sheets (demo).
+"""Client de synchronisation Google Sheets (demo) via Composio.
 
-Utilise gspread + un compte de service Google (aucun secret dans le code
-ni dans l'image : la cle JSON du compte de service et l'ID du classeur
-viennent exclusivement de l'environnement / .env).
+Utilise la connexion Google Sheets deja active dans Composio (OAuth) :
+AUCUN compte de service Google, AUCUNE cle JSON. L'authentification
+Composio est scopee par COMPOSIO_API_KEY et un identifiant de compte
+(COMPOSIO_USER_ID ou COMPOSIO_CONNECTED_ACCOUNT_ID). L'ID du classeur
+cible vient de GOOGLE_SHEET_ID.
 
-La synchronisation est best-effort et idempotente : chaque ligne est
-identifiee par une cle stable (colonne ID en premiere colonne de chaque
-onglet). Relancer une synchronisation ne cree jamais de doublon : une
-ligne dont l'ID existe deja est mise a jour en place, sinon elle est
-ajoutee a la fin.
+Appelle directement l'API REST Composio (POST
+https://backend.composio.dev/api/v3.1/tools/execute/{tool_slug},
+header `x-api-key`) via `httpx`, plutot que le SDK `composio` officiel :
+ce dernier impose `pydantic>=2.10`, incompatible avec `aiogram==3.15.0`
+(qui exige `pydantic<2.10`) dans cette image. L'appel REST reproduit
+exactement le comportement du SDK (meme host, meme chemin, meme
+enveloppe de requete/reponse) sans ce conflit de dependances.
+
+La synchronisation est best-effort et idempotente : elle delegue a
+l'outil Composio GOOGLESHEETS_UPSERT_ROWS, qui met a jour en place toute
+ligne dont l'ID (premiere colonne des headers) existe deja et ajoute les
+autres a la fin. Relancer une synchronisation ne cree jamais de doublon.
 
 Aucun appel a OpenAI n'est effectue ici : la synchronisation Sheets ne
 consomme jamais de tokens OpenAI (uniquement l'extraction de documents
 le fait, ailleurs dans le code).
+
+Aucun secret (cle API Composio, identifiants de compte) n'est jamais
+journalise ni renvoye dans un message d'erreur.
 """
 from __future__ import annotations
 
-import json
 import logging
 from typing import Any
 
 logger = logging.getLogger("demo_bot.sheets")
+
+COMPOSIO_BASE_URL = "https://backend.composio.dev"
+COMPOSIO_TOOLS_EXECUTE_PATH = "/api/v3.1/tools/execute/{tool_slug}"
+_REQUEST_TIMEOUT_SECONDS = 30.0
 
 
 class SheetsSyncError(RuntimeError):
@@ -28,30 +43,31 @@ class SheetsSyncError(RuntimeError):
 
 
 class SheetsClient:
-    """Enveloppe fine autour de gspread, initialisee paresseusement.
+    """Enveloppe fine autour de l'API REST Composio, initialisee paresseusement.
 
-    Si aucun compte de service n'est configure, `is_configured` est False
-    et toute tentative de synchronisation echoue proprement avec un
-    message clair (jamais de crash du bot, jamais de secret dans les logs).
+    Si Composio n'est pas configure (cle API, identifiant de compte ou
+    ID de classeur manquants), `is_configured` est False et toute
+    tentative de synchronisation echoue proprement avec un message
+    clair (jamais de crash du bot, jamais de secret dans les logs).
     """
 
     def __init__(
         self,
-        service_account_json: str,
-        service_account_file: str,
+        composio_api_key: str,
+        composio_user_id: str,
+        composio_connected_account_id: str,
         spreadsheet_id: str,
     ) -> None:
+        self._composio_api_key = composio_api_key
+        self._composio_user_id = composio_user_id
+        self._composio_connected_account_id = composio_connected_account_id
         self._spreadsheet_id = spreadsheet_id
-        self._service_account_json = service_account_json
-        self._service_account_file = service_account_file
-        self._gc = None
-        self._sh = None
+        self._client = None
 
     @property
     def is_configured(self) -> bool:
-        return bool(self._spreadsheet_id) and bool(
-            self._service_account_json or self._service_account_file
-        )
+        has_account_ref = bool(self._composio_user_id or self._composio_connected_account_id)
+        return bool(self._composio_api_key) and bool(self._spreadsheet_id) and has_account_ref
 
     def sheet_url(self) -> str | None:
         if not self._spreadsheet_id:
@@ -59,46 +75,44 @@ class SheetsClient:
         return f"https://docs.google.com/spreadsheets/d/{self._spreadsheet_id}/edit"
 
     def _ensure_client(self):
-        if self._gc is not None:
-            return self._gc
+        if self._client is not None:
+            return self._client
         if not self.is_configured:
             raise SheetsSyncError(
                 "Synchronisation Google Sheets non configuree "
-                "(GOOGLE_SERVICE_ACCOUNT_JSON/_FILE ou GOOGLE_SHEET_ID manquants)."
+                "(COMPOSIO_API_KEY / COMPOSIO_USER_ID ou "
+                "COMPOSIO_CONNECTED_ACCOUNT_ID / GOOGLE_SHEET_ID manquants)."
             )
         try:
-            import gspread
-            from google.oauth2.service_account import Credentials
+            import httpx
         except ImportError as exc:  # pragma: no cover - dependance manquante
-            raise SheetsSyncError(f"Dependance Google Sheets manquante: {exc}") from exc
+            raise SheetsSyncError(f"Dependance httpx manquante: {exc}") from exc
+        self._client = httpx.Client(
+            base_url=COMPOSIO_BASE_URL,
+            headers={"x-api-key": self._composio_api_key, "Content-Type": "application/json"},
+            timeout=_REQUEST_TIMEOUT_SECONDS,
+        )
+        return self._client
 
-        scopes = [
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive.file",
-        ]
+    def _execute(self, slug: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        client = self._ensure_client()
+        body: dict[str, Any] = {"arguments": arguments}
+        if self._composio_user_id:
+            body["user_id"] = self._composio_user_id
+        else:
+            body["connected_account_id"] = self._composio_connected_account_id
+        path = COMPOSIO_TOOLS_EXECUTE_PATH.format(tool_slug=slug)
         try:
-            if self._service_account_json:
-                info = json.loads(self._service_account_json)
-                creds = Credentials.from_service_account_info(info, scopes=scopes)
-            else:
-                creds = Credentials.from_service_account_file(
-                    self._service_account_file, scopes=scopes
-                )
-            self._gc = gspread.authorize(creds)
-        except Exception as exc:  # noqa: BLE001 - on ne veut jamais crasher le bot
-            # Ne jamais logger le contenu de la cle de service.
-            raise SheetsSyncError("Authentification Google Sheets echouee.") from exc
-        return self._gc
-
-    def _ensure_spreadsheet(self):
-        if self._sh is not None:
-            return self._sh
-        gc = self._ensure_client()
-        try:
-            self._sh = gc.open_by_key(self._spreadsheet_id)
-        except Exception as exc:  # noqa: BLE001
-            raise SheetsSyncError("Impossible d'ouvrir le classeur Google Sheets.") from exc
-        return self._sh
+            response = client.post(path, json=body)
+            response.raise_for_status()
+            result = response.json()
+        except Exception as exc:  # noqa: BLE001 - jamais de secret dans le log/l'erreur
+            raise SheetsSyncError(f"Appel Composio '{slug}' echoue.") from exc
+        if not result.get("successful", False):
+            raise SheetsSyncError(
+                f"Outil Composio '{slug}' a echoue: {result.get('error') or 'erreur inconnue'}."
+            )
+        return result.get("data") or {}
 
     def upsert_rows(
         self, sheet_name: str, headers: list[str], rows: list[dict[str, Any]]
@@ -106,52 +120,38 @@ class SheetsClient:
         """Met a jour ou ajoute des lignes dans un onglet, par ID stable
         (rows[i]["id"] doit correspondre a la colonne `headers[0]`, ex. "ID").
 
+        Delegue integralement a l'outil Composio GOOGLESHEETS_UPSERT_ROWS
+        (cle = premiere colonne des headers), qui gere lui-meme la
+        correspondance mise-a-jour / ajout sans jamais creer de doublon.
+
         Retourne {"updated": n, "appended": n} pour le rapport de sync.
         """
-        sh = self._ensure_spreadsheet()
-        try:
-            ws = sh.worksheet(sheet_name)
-        except Exception as exc:  # noqa: BLE001
-            raise SheetsSyncError(f"Onglet '{sheet_name}' introuvable.") from exc
-
-        try:
-            existing_ids = ws.col_values(1)  # colonne A = ID
-        except Exception as exc:  # noqa: BLE001
-            raise SheetsSyncError(f"Lecture de l'onglet '{sheet_name}' impossible.") from exc
-
-        id_to_row_number = {
-            value: idx + 1 for idx, value in enumerate(existing_ids) if idx > 0 and value
+        if not rows:
+            return {"updated": 0, "appended": 0}
+        key_column = headers[0]
+        data_rows = [[row.get(key, "") for key in headers] for row in rows]
+        data = self._execute(
+            "GOOGLESHEETS_UPSERT_ROWS",
+            {
+                "spreadsheetId": self._spreadsheet_id,
+                "sheetName": sheet_name,
+                "headers": headers,
+                "rows": data_rows,
+                "keyColumn": key_column,
+            },
+        )
+        return {
+            "updated": int(data.get("rowsUpdated", 0)),
+            "appended": int(data.get("rowsInserted", 0)),
         }
 
-        updated = 0
-        to_append = []
-        for row in rows:
-            row_id = str(row.get("id", ""))
-            if not row_id:
-                continue
-            values = [row.get(key, "") for key in headers]
-            if row_id in id_to_row_number:
-                row_number = id_to_row_number[row_id]
-                try:
-                    ws.update(
-                        f"A{row_number}:{chr(64 + len(headers))}{row_number}",
-                        [values],
-                    )
-                    updated += 1
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("Echec mise a jour ligne %s de %s: %s", row_id, sheet_name, exc)
-            else:
-                to_append.append(values)
-
-        if to_append:
-            try:
-                ws.append_rows(to_append, value_input_option="USER_ENTERED")
-            except Exception as exc:  # noqa: BLE001
-                raise SheetsSyncError(f"Echec ajout de lignes dans '{sheet_name}'.") from exc
-
-        return {"updated": updated, "appended": len(to_append)}
-
     def update_cell(self, sheet_name: str, a1_range: str, value: Any) -> None:
-        sh = self._ensure_spreadsheet()
-        ws = sh.worksheet(sheet_name)
-        ws.update(a1_range, [[value]])
+        self._execute(
+            "GOOGLESHEETS_VALUES_UPDATE",
+            {
+                "spreadsheet_id": self._spreadsheet_id,
+                "range": f"{sheet_name}!{a1_range}",
+                "values": [[value]],
+                "value_input_option": "USER_ENTERED",
+            },
+        )
