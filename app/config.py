@@ -37,12 +37,16 @@ class Settings(BaseSettings):
         default=Decimal("0.01"), alias="RECONCILIATION_AMOUNT_TOLERANCE"
     )
 
-    # --- Google Sheets (synchronisation, optionnelle) ---
-    # Compte de service Google Cloud dedie au conteneur deploye, distinct de
-    # toute session interactive. Aucune valeur par defaut : si absent, la
-    # synchronisation est simplement desactivee (le bot ne plante jamais).
-    google_service_account_json: str = Field(default="", alias="GOOGLE_SERVICE_ACCOUNT_JSON")
-    google_service_account_file: str = Field(default="", alias="GOOGLE_SERVICE_ACCOUNT_FILE")
+    # --- Google Sheets (synchronisation, optionnelle, via Composio) ---
+    # Utilise la connexion Google Sheets deja active dans Composio (OAuth) :
+    # aucun compte de service Google, aucune cle JSON. Aucune valeur par
+    # defaut sensible : si absent, la synchronisation est simplement
+    # desactivee (le bot ne plante jamais).
+    composio_api_key: str = Field(default="", alias="COMPOSIO_API_KEY")
+    composio_user_id: str = Field(default="", alias="COMPOSIO_USER_ID")
+    composio_connected_account_id: str = Field(
+        default="", alias="COMPOSIO_CONNECTED_ACCOUNT_ID"
+    )
     google_sheet_id: str = Field(default="", alias="GOOGLE_SHEET_ID")
 
     def allowed_user_ids(self) -> set[int]:

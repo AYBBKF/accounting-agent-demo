@@ -1,8 +1,11 @@
 """Bot Telegram de demo (aiogram, long polling).
 
-Un seul conteneur, aucune dependance externe (pas de Postgres/Redis/
-worker/Composio/MCP). Toutes les donnees manipulees sont explicitement
-fictives ("DEMO").
+Un seul conteneur, aucune dependance externe lourde (pas de Postgres/
+Redis/worker). La seule integration externe est la synchronisation
+Google Sheets optionnelle, via la connexion Composio deja active
+(voir app/sheets_client.py) : aucun compte de service Google, aucune
+cle JSON. Toutes les donnees manipulees sont explicitement fictives
+("DEMO").
 """
 from __future__ import annotations
 
@@ -15,7 +18,13 @@ from typing import Any, Awaitable, Callable
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import Message, TelegramObject
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+    TelegramObject,
+)
 
 from app.auth import is_allowed_telegram_user
 from app.config import settings
@@ -51,9 +60,19 @@ _HEADERS_RAPPROCHEMENT = ["ID", "Chat", "Facture", "Statut", "Detail"]
 _HEADERS_TVA = ["ID", "Chat", "Facture", "HT", "Taux TVA", "TVA", "TTC"]
 
 sheets_client = SheetsClient(
-    service_account_json=settings.google_service_account_json,
-    service_account_file=settings.google_service_account_file,
+    composio_api_key=settings.composio_api_key,
+    composio_user_id=settings.composio_user_id,
+    composio_connected_account_id=settings.composio_connected_account_id,
     spreadsheet_id=settings.google_sheet_id,
+)
+
+SYNC_SHEET_BUTTON_TEXT = "Synchroniser Google Sheets"
+SYNC_SHEET_CALLBACK_DATA = "sync_sheet"
+
+_sync_sheet_keyboard = InlineKeyboardMarkup(
+    inline_keyboard=[
+        [InlineKeyboardButton(text=SYNC_SHEET_BUTTON_TEXT, callback_data=SYNC_SHEET_CALLBACK_DATA)]
+    ]
 )
 
 
@@ -296,36 +315,48 @@ def build_dispatcher() -> Dispatcher:
             return
         await message.answer(f"Google Sheet de suivi:\n{url}")
 
-    @dp.message(Command("sync_sheet"))
-    async def cmd_sync_sheet(message: Message) -> None:
+    async def _run_sync_sheet(chat_id: int) -> str:
+        """Synchronisation idempotente SQLite -> Google Sheets, partagee
+        entre la commande /sync_sheet et le bouton inline. Aucun appel
+        OpenAI n'a lieu ici."""
         if not sheets_client.is_configured:
-            await message.answer(
+            return (
                 "Synchronisation Google Sheets non configuree sur ce bot "
-                "(GOOGLE_SERVICE_ACCOUNT_JSON/_FILE ou GOOGLE_SHEET_ID manquants)."
+                "(COMPOSIO_API_KEY / COMPOSIO_USER_ID ou "
+                "COMPOSIO_CONNECTED_ACCOUNT_ID / GOOGLE_SHEET_ID manquants)."
             )
-            return
-        chat_state = _DEMO_STATE.get(message.chat.id, {})
+        chat_state = _DEMO_STATE.get(chat_id, {})
         invoices = chat_state.get("invoices", [])
         bank_lines = chat_state.get("bank_lines", [])
         reconciliations = chat_state.get("reconciliations", [])
         if not invoices and not bank_lines:
-            await message.answer("Rien a synchroniser: genere d'abord des donnees de demo.")
-            return
-        inv_db_ids = save_invoices(settings.db_path, message.chat.id, invoices) if invoices else []
-        bank_db_ids = save_bank_lines(settings.db_path, message.chat.id, bank_lines) if bank_lines else []
+            return "Rien a synchroniser: genere d'abord des donnees de demo."
+        inv_db_ids = save_invoices(settings.db_path, chat_id, invoices) if invoices else []
+        bank_db_ids = save_bank_lines(settings.db_path, chat_id, bank_lines) if bank_lines else []
         if invoices:
-            _sync_invoices_to_sheet(message.chat.id, invoices, inv_db_ids)
-            _sync_vat_to_sheet(message.chat.id, invoices)
+            _sync_invoices_to_sheet(chat_id, invoices, inv_db_ids)
+            _sync_vat_to_sheet(chat_id, invoices)
         if bank_lines:
-            _sync_bank_lines_to_sheet(message.chat.id, bank_lines, bank_db_ids)
+            _sync_bank_lines_to_sheet(chat_id, bank_lines, bank_db_ids)
         if reconciliations:
-            save_reconciliations(settings.db_path, message.chat.id, reconciliations)
-            _sync_reconciliations_to_sheet(message.chat.id, reconciliations)
-        await message.answer(
+            save_reconciliations(settings.db_path, chat_id, reconciliations)
+            _sync_reconciliations_to_sheet(chat_id, reconciliations)
+        return (
             "Synchronisation terminee (idempotente, sans doublon). "
             f"Factures: {len(invoices)}, lignes bancaires: {len(bank_lines)}, "
             f"rapprochements: {len(reconciliations)}."
         )
+
+    @dp.message(Command("sync_sheet"))
+    async def cmd_sync_sheet(message: Message) -> None:
+        result = await _run_sync_sheet(message.chat.id)
+        await message.answer(result, reply_markup=_sync_sheet_keyboard)
+
+    @dp.callback_query(F.data == SYNC_SHEET_CALLBACK_DATA)
+    async def cb_sync_sheet(callback: CallbackQuery) -> None:
+        await callback.answer("Synchronisation en cours...")
+        result = await _run_sync_sheet(callback.message.chat.id)
+        await callback.message.answer(result, reply_markup=_sync_sheet_keyboard)
 
     @dp.message(Command("dashboard"))
     async def cmd_dashboard(message: Message) -> None:
@@ -347,7 +378,7 @@ def build_dispatcher() -> Dispatcher:
         url = sheets_client.sheet_url()
         if url:
             lines.append(f"- Google Sheet: {url}")
-        await message.answer("\n".join(lines))
+        await message.answer("\n".join(lines), reply_markup=_sync_sheet_keyboard)
 
     @dp.message(Command("demo_extraction"))
     async def cmd_demo_extraction(message: Message) -> None:

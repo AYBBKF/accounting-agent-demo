@@ -4,5 +4,4 @@ pydantic==2.9.2
 pydantic-settings==2.6.1
 openpyxl==3.1.5
 python-dotenv==1.0.1
-gspread==6.1.4
-google-auth==2.36.0
+httpx==0.28.1

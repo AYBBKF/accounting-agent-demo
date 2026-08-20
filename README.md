@@ -8,7 +8,9 @@ Perimetre volontairement reduit par rapport au projet complet
 `client-accounting-agent` :
 - 1 seul conteneur (bot Telegram + logique), 1 seule image publique.
 - SQLite local, pas de Postgres/Redis/worker.
-- Pas de Composio/MCP, pas de Gmail/Sheets/Drive.
+- La seule integration externe est la synchronisation Google Sheets
+  optionnelle, via la connexion Composio deja active (voir plus bas) ;
+  pas de Gmail/Drive, pas de MCP dans le conteneur lui-meme.
 - OpenAI Responses API utilisee uniquement pour une extraction de
   demonstration (texte de facture fictif -> JSON structure), avec repli
   systematique sur `needs_human_review` en cas d'erreur/ambiguite.
@@ -40,18 +42,20 @@ Perimetre volontairement reduit par rapport au projet complet
 
 ## Synchronisation Google Sheets (optionnelle)
 
-Desactivee par defaut. Pour l'activer, le conteneur a besoin de son **propre**
-compte de service Google Cloud, independant de tout compte utilisateur :
+Desactivee par defaut. Pour l'activer, le bot utilise la connexion Google
+Sheets **deja active dans Composio** (OAuth) : aucun compte de service
+Google Cloud, aucune cle JSON a creer ou a fournir.
 
-1. Creer un projet GCP (ou reutiliser un projet existant) et y activer les
-   API Google Sheets et Google Drive.
-2. Creer un compte de service, generer une cle JSON.
-3. Partager le Google Sheet cible avec l'adresse e-mail du compte de service,
-   en acces **Editeur**.
-4. Renseigner dans `.env` (jamais committe) : `GOOGLE_SHEET_ID` (l'ID dans
-   l'URL du classeur) et soit `GOOGLE_SERVICE_ACCOUNT_JSON` (le contenu JSON
-   de la cle sur une seule ligne), soit `GOOGLE_SERVICE_ACCOUNT_FILE` (chemin
-   vers un fichier de cle monte dans le conteneur).
+1. S'assurer que la connexion Google Sheets est active cote Composio pour
+   le compte/utilisateur qui sera utilise par le bot.
+2. Renseigner dans `.env` (jamais committe) : `COMPOSIO_API_KEY`, l'un des
+   deux `COMPOSIO_USER_ID` ou `COMPOSIO_CONNECTED_ACCOUNT_ID` (identifiant
+   du compte/de la connexion Composio), et `GOOGLE_SHEET_ID` (l'ID dans
+   l'URL du classeur).
+
+Un bouton Telegram inline « Synchroniser Google Sheets » declenche la meme
+synchronisation idempotente que `/sync_sheet` (affiche sous `/sync_sheet`
+et `/dashboard`).
 
 OpenAI n'est jamais consomme par la synchronisation Sheets : les tokens
 OpenAI ne servent qu'a `/demo_extraction` (extraction de document).
@@ -63,9 +67,9 @@ OpenAI ne servent qu'a `/demo_extraction` (extraction de document).
   (voir `.env.example`), jamais committe.
 - Aucun port publie : long polling uniquement, ne touche jamais aux ports
   80/443 ni au reverse proxy de l'hote.
-- La cle de compte de service Google n'est jamais loggee ; toute erreur
-  d'authentification/synchronisation Sheets est capturee et n'interrompt
-  jamais le bot.
+- La cle API Composio et les identifiants de compte ne sont jamais
+  loggues ; toute erreur d'authentification/synchronisation Sheets est
+  capturee et n'interrompt jamais le bot.
 
 ## Tests
 
