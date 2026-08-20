@@ -27,6 +27,7 @@ from aiogram.types import (
 )
 
 from app.auth import is_allowed_telegram_user
+from app.composio_connect import ComposioConnectError, ComposioConnectManager, SERVICES
 from app.config import settings
 from app.db import (
     init_db,
@@ -64,6 +65,20 @@ sheets_client = SheetsClient(
     composio_user_id=settings.composio_user_id,
     composio_connected_account_id=settings.composio_connected_account_id,
     spreadsheet_id=settings.google_sheet_id,
+)
+
+# Connexions Google multi-clients (Gmail/Sheets/Drive/Calendar), isolees par
+# client Telegram via user_id = "telegram_<chat_id>" (/connect, /status).
+# Independant de `sheets_client` ci-dessus, qui reste dedie au classeur de
+# demo "X BLASTE" (une connexion unique, cote bot).
+connect_manager = ComposioConnectManager(
+    api_key=settings.composio_api_key,
+    auth_config_by_service={
+        "gmail": settings.composio_auth_config_gmail,
+        "googlesheets": settings.composio_auth_config_googlesheets,
+        "googledrive": settings.composio_auth_config_googledrive,
+        "googlecalendar": settings.composio_auth_config_googlecalendar,
+    },
 )
 
 SYNC_SHEET_BUTTON_TEXT = "Synchroniser Google Sheets"
@@ -217,7 +232,7 @@ def build_dispatcher() -> Dispatcher:
             "Bienvenue sur le bot de demo comptable.\n"
             "Toutes les donnees sont FICTIVES.\n"
             "Commandes: /help /demo_facture /demo_releve /tva /rapprochement /export "
-            "/demo_extraction /sheet /sync_sheet /dashboard"
+            "/demo_extraction /sheet /sync_sheet /dashboard /connect /status"
         )
 
     @dp.message(Command("help"))
@@ -232,15 +247,61 @@ def build_dispatcher() -> Dispatcher:
             "/sheet - lien vers le Google Sheet de suivi (si configure)\n"
             "/sync_sheet - resynchronise toutes les donnees de session vers le Sheet\n"
             "/dashboard - resume des KPI de la session en cours\n"
-            "/status - etat du bot"
+            "/connect - connecte TES comptes Google (Gmail lecture seule, Sheets, "
+            "Drive, Calendar) via un lien d'autorisation individuel\n"
+            "/status - etat du bot + statut de tes connexions Google"
         )
 
     @dp.message(Command("status"))
     async def cmd_status(message: Message) -> None:
         chat_state = _DEMO_STATE.get(message.chat.id, {})
-        await message.answer(
+        lines = [
             f"OK. Factures en session: {len(chat_state.get('invoices', []))}. "
-            f"Lignes bancaires: {len(chat_state.get('bank_lines', []))}."
+            f"Lignes bancaires: {len(chat_state.get('bank_lines', []))}.",
+            "",
+            "Connexions Google (ce client uniquement):",
+        ]
+        if not connect_manager.is_configured:
+            lines.append("- non configurees sur ce bot pour l'instant.")
+        else:
+            try:
+                statuses = await asyncio.to_thread(connect_manager.get_status, message.chat.id)
+                for service_key, _, label in SERVICES:
+                    entry = statuses.get(service_key, {})
+                    icon = "OK" if entry.get("status") == "ACTIVE" else "--"
+                    lines.append(f"- [{icon}] {label}: {entry.get('status_label', 'non connecte')}")
+                lines.append("")
+                lines.append("Pour connecter ou reconnecter un service: /connect")
+            except ComposioConnectError as exc:
+                lines.append(f"- lecture du statut impossible: {exc}")
+        await message.answer("\n".join(lines))
+
+    @dp.message(Command("connect"))
+    async def cmd_connect(message: Message) -> None:
+        if not connect_manager.is_configured:
+            await message.answer(
+                "Connexions Google non configurees sur ce bot pour l'instant "
+                "(COMPOSIO_API_KEY / COMPOSIO_AUTH_CONFIG_* manquants)."
+            )
+            return
+        await message.answer("Generation de tes liens de connexion Google...")
+        try:
+            results = await asyncio.to_thread(connect_manager.create_links, message.chat.id)
+        except ComposioConnectError as exc:
+            await message.answer(f"Impossible de generer les liens de connexion: {exc}")
+            return
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text=f"Connecter {r.label}", url=r.redirect_url)]
+                for r in results
+            ]
+        )
+        await message.answer(
+            "Clique sur le service a connecter (tu seras redirige vers la page "
+            "d'autorisation Google - aucun mot de passe ne transite par ce bot). "
+            "Chaque lien est valable quelques minutes ; relance /connect si besoin.\n"
+            "Une fois autorise, verifie avec /status.",
+            reply_markup=keyboard,
         )
 
     @dp.message(Command("demo_facture"))

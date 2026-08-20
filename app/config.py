@@ -49,6 +49,23 @@ class Settings(BaseSettings):
     )
     google_sheet_id: str = Field(default="", alias="GOOGLE_SHEET_ID")
 
+    # --- Composio Connect Links multi-client (Gmail, Sheets, Drive, Calendar) ---
+    # Un auth config par toolkit, cree une seule fois pour tout le projet
+    # Composio du bot (composio-managed OAuth : pas de client_id/secret Google
+    # a fournir). Chaque client genere sa propre connexion via /connect, isolee
+    # par user_id = "telegram_<chat_id>". Valeurs par defaut = auth configs du
+    # projet pr_76EmxezsdHvO ; surchargeables par env si le projet change.
+    composio_auth_config_gmail: str = Field(default="ac_1VhZyQnF2Xtu", alias="COMPOSIO_AUTH_CONFIG_GMAIL")
+    composio_auth_config_googlesheets: str = Field(
+        default="ac_1zYvYaXY82zA", alias="COMPOSIO_AUTH_CONFIG_GOOGLESHEETS"
+    )
+    composio_auth_config_googledrive: str = Field(
+        default="ac_CLzIDDkOVwLz", alias="COMPOSIO_AUTH_CONFIG_GOOGLEDRIVE"
+    )
+    composio_auth_config_googlecalendar: str = Field(
+        default="ac_u-hiMj7UNB3-", alias="COMPOSIO_AUTH_CONFIG_GOOGLECALENDAR"
+    )
+
     def allowed_user_ids(self) -> set[int]:
         raw = self.allowed_telegram_user_ids.strip()
         if not raw:
