@@ -26,6 +26,17 @@ from app.openai_client import OpenAIClientWrapper
 from app.reconciliation import reconcile_invoices
 from app.vat import simulate_vat
 
+FAKE_INVOICE_TEXT_FOR_EXTRACTION = (
+    "FACTURE (DEMO - donnee fictive)\n"
+    "Fournisseur: Fournitures Atlas SARL (DEMO)\n"
+    "Numero: DEMO-2026-9001\n"
+    "Date: 2026-08-15\n"
+    "Montant HT: 250.00 MAD\n"
+    "TVA: 20%\n"
+    "Montant TTC: 300.00 MAD\n"
+    "Mode de paiement: virement\n"
+)
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("demo_bot")
 
@@ -65,7 +76,7 @@ def build_dispatcher() -> Dispatcher:
         await message.answer(
             "Bienvenue sur le bot de demo comptable.\n"
             "Toutes les donnees sont FICTIVES.\n"
-            "Commandes: /help /demo_facture /demo_releve /tva /rapprochement /export"
+            "Commandes: /help /demo_facture /demo_releve /tva /rapprochement /export /demo_extraction"
         )
 
     @dp.message(Command("help"))
@@ -76,6 +87,7 @@ def build_dispatcher() -> Dispatcher:
             "/tva - simule la TVA sur les factures generees\n"
             "/rapprochement - rapproche factures et releve bancaire\n"
             "/export - genere et envoie le rapport Excel\n"
+            "/demo_extraction - teste l'extraction OpenAI sur une facture fictive\n"
             "/status - etat du bot"
         )
 
@@ -139,6 +151,43 @@ def build_dispatcher() -> Dispatcher:
         chat_state["reconciliations"] = results
         lines = [f"- {r.invoice.numero}: {r.status} ({r.detail})" for r in results]
         await message.answer("Rapprochement bancaire:\n" + "\n".join(lines))
+
+    @dp.message(Command("demo_extraction"))
+    async def cmd_demo_extraction(message: Message) -> None:
+        if not settings.openai_api_key:
+            await message.answer(
+                "OPENAI_API_KEY non configuree : impossible de tester l'extraction. "
+                "Ceci est le comportement attendu (needs_human_review), pas une erreur."
+            )
+            return
+        wrapper = OpenAIClientWrapper(
+            api_key=settings.openai_api_key,
+            model=settings.openai_model,
+            store=settings.openai_store,
+            timeout_seconds=settings.openai_timeout_seconds,
+            max_output_tokens=settings.openai_max_output_tokens,
+            reasoning_effort=settings.openai_reasoning_effort,
+        )
+        await message.answer(f"Extraction en cours via {settings.openai_model} (Responses API)...")
+        outcome = await asyncio.to_thread(
+            wrapper.extract_invoice_text, FAKE_INVOICE_TEXT_FOR_EXTRACTION
+        )
+        if outcome.data is None:
+            await message.answer(
+                f"Extraction incomplete (needs_human_review). Raison: {outcome.reason}"
+            )
+            return
+        d = outcome.data
+        await message.answer(
+            "Extraction reussie (facture fictive):\n"
+            f"- Fournisseur: {d.get('fournisseur')}\n"
+            f"- Numero: {d.get('numero')}\n"
+            f"- Date: {d.get('date_facture')}\n"
+            f"- HT: {d.get('montant_ht')}\n"
+            f"- Taux TVA: {d.get('taux_tva')}\n"
+            f"- TTC: {d.get('montant_ttc')}\n"
+            f"- needs_human_review: {outcome.needs_human_review}"
+        )
 
     @dp.message(Command("export"))
     async def cmd_export(message: Message) -> None:
