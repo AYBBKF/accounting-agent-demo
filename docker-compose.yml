@@ -1,0 +1,39 @@
+name: accounting_agent_demo
+
+networks:
+  accounting_agent_demo_net:
+    name: accounting_agent_demo_net
+    driver: bridge
+
+volumes:
+  accounting_agent_demo_data:
+    name: accounting_agent_demo_data
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  demo_bot:
+    image: ${IMAGE_DEMO:-ghcr.io/aybbkf/accounting-agent-demo:latest}
+    container_name: accounting_agent_demo_bot
+    restart: unless-stopped
+    env_file: [.env]
+    volumes:
+      - accounting_agent_demo_data:/app/data
+    networks: [accounting_agent_demo_net]
+    healthcheck:
+      test: ["CMD-SHELL", "find /app/data/heartbeat -mmin -2 | grep -q heartbeat || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+    logging: *default-logging
+    # Long polling uniquement : aucun port publie, ne touche pas a 80/443.
