@@ -37,6 +37,14 @@ class Settings(BaseSettings):
         default=Decimal("0.01"), alias="RECONCILIATION_AMOUNT_TOLERANCE"
     )
 
+    # --- Google Sheets (synchronisation, optionnelle) ---
+    # Compte de service Google Cloud dedie au conteneur deploye, distinct de
+    # toute session interactive. Aucune valeur par defaut : si absent, la
+    # synchronisation est simplement desactivee (le bot ne plante jamais).
+    google_service_account_json: str = Field(default="", alias="GOOGLE_SERVICE_ACCOUNT_JSON")
+    google_service_account_file: str = Field(default="", alias="GOOGLE_SERVICE_ACCOUNT_FILE")
+    google_sheet_id: str = Field(default="", alias="GOOGLE_SHEET_ID")
+
     def allowed_user_ids(self) -> set[int]:
         raw = self.allowed_telegram_user_ids.strip()
         if not raw:
