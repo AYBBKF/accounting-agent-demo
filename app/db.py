@@ -39,6 +39,21 @@ CREATE TABLE IF NOT EXISTS demo_bank_lines (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS gmail_processed_emails (
+    message_id TEXT PRIMARY KEY,
+    thread_id TEXT,
+    chat_id TEXT NOT NULL,
+    subject TEXT,
+    sender TEXT,
+    received_at TEXT,
+    attachment_name TEXT,
+    numero TEXT,
+    status TEXT NOT NULL,
+    payload TEXT,
+    created_at TEXT NOT NULL,
+    decided_at TEXT
+);
+
 CREATE TABLE IF NOT EXISTS demo_reconciliations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     chat_id TEXT NOT NULL DEFAULT '',
@@ -149,3 +164,66 @@ def stable_invoice_id(chat_id: int, db_id: int) -> str:
 
 def stable_bank_line_id(chat_id: int, db_id: int) -> str:
     return f"BANK-{chat_id}-{db_id}"
+
+
+# --- Emails Gmail traites (anti-doublon du watcher) -----------------------
+# La cle primaire est le message_id Gmail : un email deja vu ne peut jamais
+# etre retraite, meme apres un redemarrage du conteneur.
+
+def claim_gmail_message(
+    db_path: str,
+    message_id: str,
+    chat_id: int,
+    *,
+    thread_id: str = "",
+    subject: str = "",
+    sender: str = "",
+    received_at: str = "",
+    attachment_name: str = "",
+    numero: str = "",
+    payload: str = "",
+    status: str = "pending",
+) -> bool:
+    """Enregistre un email comme pris en charge.
+
+    Retourne True si l'email est nouveau (il vient d'etre reserve), False
+    s'il avait deja ete traite - dans ce cas l'appelant doit l'ignorer.
+    L'insertion est atomique : deux passages concurrents ne peuvent pas
+    reserver le meme message_id.
+    """
+    from datetime import datetime, timezone
+
+    with connect(db_path) as conn:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO gmail_processed_emails "
+            "(message_id, thread_id, chat_id, subject, sender, received_at, "
+            " attachment_name, numero, status, payload, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                message_id, thread_id, str(chat_id), subject, sender, received_at,
+                attachment_name, numero, status, payload,
+                datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            ),
+        )
+        conn.commit()
+        return cur.rowcount == 1
+
+
+def get_gmail_message(db_path: str, message_id: str) -> dict[str, Any] | None:
+    with connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM gmail_processed_emails WHERE message_id = ?", (message_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def set_gmail_message_status(db_path: str, message_id: str, status: str) -> None:
+    from datetime import datetime, timezone
+
+    with connect(db_path) as conn:
+        conn.execute(
+            "UPDATE gmail_processed_emails SET status = ?, decided_at = ? WHERE message_id = ?",
+            (status, datetime.now(timezone.utc).isoformat(timespec="seconds"), message_id),
+        )
+        conn.commit()

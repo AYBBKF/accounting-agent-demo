@@ -84,6 +84,22 @@ class Settings(BaseSettings):
         default="ac_u-hiMj7UNB3-", alias="COMPOSIO_AUTH_CONFIG_GOOGLECALENDAR"
     )
 
+    # --- Worker Gmail (detection automatique des factures) ---------------
+    # Desactive tant que GMAIL_WATCH_CHAT_ID vaut 0 : le bot demarre alors
+    # exactement comme avant. La requete est celle du marqueur [XBLASTE] ;
+    # elle reste surchargeable si la convention de sujet change.
+    gmail_watch_enabled: bool = Field(default=True, alias="GMAIL_WATCH_ENABLED")
+    gmail_watch_chat_id: int = Field(default=0, alias="GMAIL_WATCH_CHAT_ID")
+    gmail_watch_query: str = Field(
+        default='subject:"[XBLASTE]" has:attachment filename:pdf', alias="GMAIL_WATCH_QUERY"
+    )
+    gmail_watch_interval_seconds: int = Field(default=60, alias="GMAIL_WATCH_INTERVAL_SECONDS")
+    gmail_watch_max_per_cycle: int = Field(default=5, alias="GMAIL_WATCH_MAX_PER_CYCLE")
+    company_name: str = Field(default="X BLASTE", alias="COMPANY_NAME")
+    drive_archive_folder: str = Field(
+        default="XBLASTE - Factures", alias="DRIVE_ARCHIVE_FOLDER"
+    )
+
     def allowed_user_ids(self) -> set[int]:
         raw = self.allowed_telegram_user_ids.strip()
         if not raw:
