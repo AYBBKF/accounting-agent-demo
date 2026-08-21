@@ -31,6 +31,7 @@ from app.accounting_agent import (
     AccountingAgentClarification,
     AccountingAgentError,
 )
+from app.agent_intent import LLMIntentRouter
 from app.auth import is_allowed_telegram_user
 from app.composio_connect import ComposioConnectError, ComposioConnectManager, SERVICES
 from app.config import settings
@@ -92,9 +93,22 @@ connect_manager = ComposioConnectManager(
 # dans app/accounting_agent.py, jamais produits par un modele de langage.
 AGENT_TIMEOUT_SECONDS = 45.0
 
+# Le routeur LLM ne sert qu'a COMPRENDRE la demande (intention, periode,
+# client, facture) en francais / darija / arabe. Il ne recoit aucun montant
+# et ne calcule rien. Sans cle OpenAI, un routeur de secours par mots-cles
+# prend le relais : le bot reste utilisable.
+_intent_router = LLMIntentRouter(
+    api_key=settings.openai_api_key,
+    model=settings.openai_model,
+    store=settings.openai_store,
+    timeout_seconds=settings.openai_timeout_seconds,
+    reasoning_effort=settings.openai_reasoning_effort,
+)
+
 accounting_agent = AccountingAgent(
     api_key=settings.composio_api_key,
     spreadsheet_id=settings.google_sheet_id,
+    router=_intent_router,
 )
 
 # Libelles des services affiches dans /help, derives de SERVICES pour qu'ils
