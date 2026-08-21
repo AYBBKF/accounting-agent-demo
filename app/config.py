@@ -55,7 +55,9 @@ class Settings(BaseSettings):
     # a fournir). Chaque client genere sa propre connexion via /connect, isolee
     # par user_id = "telegram_<chat_id>". Valeurs par defaut = auth configs du
     # projet pr_76EmxezsdHvO ; surchargeables par env si le projet change.
-    composio_auth_config_gmail: str = Field(default="ac_1VhZyQnF2Xtu", alias="COMPOSIO_AUTH_CONFIG_GMAIL")
+    # Gmail: id recree suite au blocage OAuth Google ("Cette application est
+    # bloquee") sur l'ancien Auth Config Gmail - voir tests/test_config.py.
+    composio_auth_config_gmail: str = Field(default="ac_gjPyVvtCNdXS", alias="COMPOSIO_AUTH_CONFIG_GMAIL")
     composio_auth_config_googlesheets: str = Field(
         default="ac_1zYvYaXY82zA", alias="COMPOSIO_AUTH_CONFIG_GOOGLESHEETS"
     )

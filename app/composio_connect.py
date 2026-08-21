@@ -160,6 +160,8 @@ class ComposioConnectManager:
         for item in data.get("items", []):
             toolkit_slug = (item.get("toolkit") or {}).get("slug", "")
             status = item.get("status")
+            # Le premier vu par toolkit est le plus recent (order_by=updated_at desc) ;
+            # on garde une entree ACTIVE si on en croise une, sinon la plus recente.
             existing = by_toolkit.get(toolkit_slug)
             if existing is None or (status == "ACTIVE" and existing.get("status") != "ACTIVE"):
                 by_toolkit[toolkit_slug] = {
