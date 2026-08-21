@@ -44,6 +44,13 @@ from app.db import (
     stable_invoice_id,
 )
 from app.demo_data import generate_demo_bank_statement, generate_demo_invoices
+from app.gmail_watcher import (
+    CALLBACK_CONFIRM_PREFIX,
+    CALLBACK_REFUSE_PREFIX,
+    GmailWatcher,
+    GmailWatcherError,
+    build_preview,
+)
 from app.excel_report import build_excel_report
 from app.openai_client import OpenAIClientWrapper
 from app.reconciliation import reconcile_invoices
@@ -114,6 +121,21 @@ accounting_agent = AccountingAgent(
 # Libelles des services affiches dans /help, derives de SERVICES pour qu'ils
 # ne puissent jamais diverger des libelles reels des boutons /connect.
 SERVICES_SUMMARY = ", ".join(label for _, _, label in SERVICES)
+
+# Worker Gmail : detecte les factures [XBLASTE] recues par email et les
+# soumet a confirmation dans Telegram. Aucune ecriture Sheets/Drive n'a lieu
+# avant le clic sur "Confirmer l'ecriture".
+gmail_watcher = GmailWatcher(
+    api_key=settings.composio_api_key,
+    chat_id=settings.gmail_watch_chat_id,
+    db_path=settings.db_path,
+    spreadsheet_id=settings.google_sheet_id,
+    query=settings.gmail_watch_query,
+    poll_seconds=settings.gmail_watch_interval_seconds,
+    company_name=settings.company_name,
+    drive_folder=settings.drive_archive_folder,
+    max_per_cycle=settings.gmail_watch_max_per_cycle,
+)
 
 SYNC_SHEET_BUTTON_TEXT = "Synchroniser Google Sheets"
 SYNC_SHEET_CALLBACK_DATA = "sync_sheet"
@@ -577,7 +599,96 @@ def build_dispatcher() -> Dispatcher:
             return
         await message.answer(reply)
 
+    @dp.callback_query(F.data.startswith(CALLBACK_CONFIRM_PREFIX))
+    async def cb_invoice_confirm(callback: CallbackQuery) -> None:
+        message_id = callback.data[len(CALLBACK_CONFIRM_PREFIX):]
+        await callback.answer("Enregistrement en cours...")
+        logger.info("Confirmation d'ecriture recue (message=%s)", message_id)
+        try:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(gmail_watcher.confirm, message_id),
+                timeout=AGENT_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Ecriture trop longue (message=%s)", message_id)
+            await callback.message.answer(
+                "L'enregistrement a pris trop de temps. Rien n'est garanti ecrit : "
+                "verifie ton classeur avant de reessayer."
+            )
+            return
+        except GmailWatcherError as exc:
+            logger.warning("Ecriture impossible (message=%s): %s", message_id, exc)
+            await callback.message.answer(f"Enregistrement impossible : {exc}")
+            return
+        except Exception:  # noqa: BLE001 - jamais de silence cote client
+            logger.exception("Erreur inattendue a l'ecriture (message=%s)", message_id)
+            await callback.message.answer(
+                "Une erreur interne est survenue pendant l'enregistrement. "
+                "L'incident est journalise ; verifie ton classeur avant de reessayer."
+            )
+            return
+        await callback.message.answer(result)
+
+    @dp.callback_query(F.data.startswith(CALLBACK_REFUSE_PREFIX))
+    async def cb_invoice_refuse(callback: CallbackQuery) -> None:
+        message_id = callback.data[len(CALLBACK_REFUSE_PREFIX):]
+        await callback.answer("Facture refusee.")
+        logger.info("Refus recu (message=%s)", message_id)
+        try:
+            result = await asyncio.to_thread(gmail_watcher.refuse, message_id)
+        except GmailWatcherError as exc:
+            await callback.message.answer(f"Refus impossible : {exc}")
+            return
+        await callback.message.answer(result)
+
     return dp
+
+
+def invoice_keyboard(message_id: str) -> InlineKeyboardMarkup:
+    """Boutons de validation envoyes avec chaque apercu de facture."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(
+                text="Confirmer l'ecriture", callback_data=f"{CALLBACK_CONFIRM_PREFIX}{message_id}"
+            ),
+            InlineKeyboardButton(
+                text="Refuser", callback_data=f"{CALLBACK_REFUSE_PREFIX}{message_id}"
+            ),
+        ]]
+    )
+
+
+async def _gmail_watch_loop(bot: Bot) -> None:
+    """Boucle de fond : interroge Gmail toutes les N secondes et pousse un
+    apercu dans Telegram. Ne s'arrete jamais sur une erreur ponctuelle."""
+    if not settings.gmail_watch_enabled or not gmail_watcher.is_configured:
+        logger.info(
+            "Worker Gmail desactive (GMAIL_WATCH_ENABLED=%s, chat_id=%s).",
+            settings.gmail_watch_enabled, settings.gmail_watch_chat_id,
+        )
+        return
+    logger.info(
+        "Worker Gmail demarre (user=%s, intervalle=%ss, requete=%r).",
+        gmail_watcher.user_id, gmail_watcher.poll_seconds, gmail_watcher.query,
+    )
+    while True:
+        try:
+            pendings = await asyncio.to_thread(gmail_watcher.process_once)
+            for pending in pendings:
+                await bot.send_message(
+                    chat_id=settings.gmail_watch_chat_id,
+                    text=build_preview(pending),
+                    reply_markup=invoice_keyboard(pending.message_id),
+                )
+                logger.info(
+                    "Apercu envoye dans Telegram (message=%s, numero=%s)",
+                    pending.message_id, pending.fields.numero,
+                )
+        except GmailWatcherError as exc:
+            logger.warning("Cycle Gmail en echec: %s", exc)
+        except Exception:  # noqa: BLE001 - la boucle ne doit jamais mourir
+            logger.exception("Erreur inattendue dans le worker Gmail")
+        await asyncio.sleep(gmail_watcher.poll_seconds)
 
 
 async def _heartbeat_loop() -> None:
@@ -597,6 +708,7 @@ async def main() -> None:
     dp = build_dispatcher()
 
     asyncio.create_task(_heartbeat_loop())
+    asyncio.create_task(_gmail_watch_loop(bot))
     logger.info("Demarrage du bot de demo (long polling).")
     await dp.start_polling(bot)
 
