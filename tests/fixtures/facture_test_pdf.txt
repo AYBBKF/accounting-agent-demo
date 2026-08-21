@@ -1,0 +1,52 @@
+DOCUMENT FICTIF - TEST TECHNIQUE - AUCUNE VALEUR COMMERCIALE
+AB
+ATLAS BUREAU SARL
+Fournitures et equipements professionnels
+FACTURE
+N° FAC-TEST-2026-001
+EMETTEUR
+ATLAS BUREAU SARL
+12, rue des Entrepreneurs, Casablanca
+ICE: 002345678000043   IF: 18765432
+RC: 345678 Casablanca
+CLIENT
+X BLASTE
+45, boulevard Zerktouni, Casablanca
+ICE: 003456789000051
+Maroc
+DATE DE FACTURE
+21/08/2026
+DATE D'ECHEANCE
+20/09/2026
+DEVISE
+MAD
+STATUT
+NON PAYEE
+DESCRIPTION
+QTE
+PRIX UNITAIRE HT
+TVA
+TOTAL HT
+Ramettes papier A4 premium
+2
+750.00 MAD
+20 %
+1 500.00 MAD
+Imprimante laser professionnelle
+1
+2 500.00 MAD
+20 %
+2 500.00 MAD
+ Total HT
+ 4 000.00 MAD
+ TVA 20 %
+ 800.00 MAD
+ TOTAL TTC
+ 4 800.00 MAD
+CONDITIONS DE PAIEMENT
+Mode: Virement bancaire
+Echeance: 30 jours - Statut: Non payee
+Reference de paiement: FAC-TEST-2026-001
+RIB fictif: 007 780 0000000000000000 00
+Facture fictive creee uniquement pour tester l'extraction Gmail, Google Sheets et Google Drive.
+Aucun paiement ne doit etre effectue a partir de ce document.
