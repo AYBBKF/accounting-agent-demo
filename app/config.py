@@ -52,12 +52,20 @@ class Settings(BaseSettings):
     # --- Composio Connect Links multi-client (Gmail, Sheets, Drive, Calendar) ---
     # Un auth config par toolkit, cree une seule fois pour tout le projet
     # Composio du bot (composio-managed OAuth : pas de client_id/secret Google
-    # a fournir). Chaque client genere sa propre connexion via /connect, isolee
-    # par user_id = "telegram_<chat_id>". Valeurs par defaut = auth configs du
-    # projet pr_76EmxezsdHvO ; surchargeables par env si le projet change.
-    # Gmail: id recree suite au blocage OAuth Google ("Cette application est
-    # bloquee") sur l'ancien Auth Config Gmail - voir tests/test_config.py.
-    composio_auth_config_gmail: str = Field(default="ac_gjPyVvtCNdXS", alias="COMPOSIO_AUTH_CONFIG_GMAIL")
+    # a fournir, sauf Gmail - voir ci-dessous). Chaque client genere sa propre
+    # connexion via /connect, isolee par user_id = "telegram_<chat_id>".
+    # Valeurs par defaut = auth configs du projet pr_76EmxezsdHvO ;
+    # surchargeables par env si le projet change.
+    #
+    # Gmail: le scope gmail.readonly est un scope Google "restreint". Le
+    # client OAuth partage du Managed Auth Composio declenche
+    # systematiquement le blocage Google "Cette application est bloquee"
+    # (confirme sur 2 Auth Configs Composio-manages distincts recrees a
+    # l'identique). Gmail utilise donc un Auth Config Custom OAuth avec notre
+    # propre app Google Cloud (is_composio_managed=false, meme scope unique
+    # gmail.readonly, aucun scope supplementaire) - voir tests/test_config.py.
+    # Sheets/Drive/Calendar restent en Composio Managed Auth (aucun blocage).
+    composio_auth_config_gmail: str = Field(default="ac_0fyBzPbu5_Db", alias="COMPOSIO_AUTH_CONFIG_GMAIL")
     composio_auth_config_googlesheets: str = Field(
         default="ac_1zYvYaXY82zA", alias="COMPOSIO_AUTH_CONFIG_GOOGLESHEETS"
     )

@@ -2,19 +2,23 @@
 
 Verifie que le bot utilise bien un Auth Config Gmail distinct et dedie
 (pas reutilise/confondu avec Sheets, Drive ou Calendar), et que sa valeur
-par defaut est celle recreee suite au blocage OAuth Google ("Cette
-application est bloquee") sur l'ancien Auth Config Gmail composio-manage.
+par defaut est celle du Custom OAuth Gmail (notre propre app Google Cloud),
+apres que le Managed OAuth Composio (recree une premiere fois a l'identique)
+ait ete confirme bloque par Google sur le scope gmail.readonly ("Cette
+application est bloquee").
 """
 from app.config import Settings
 
-# Auth Config Gmail recree apres le blocage OAuth ("app is blocked") sur
-# l'ancien ac_1VhZyQnF2Xtu : meme type (Composio Managed OAuth) et meme
-# scope unique gmail.readonly, mais nouvel ID cote Composio (invalide donc
-# tout ancien lien /connect Gmail genere avant ce correctif).
-EXPECTED_GMAIL_AUTH_CONFIG_ID = "ac_gjPyVvtCNdXS"
+# Auth Config Gmail Custom OAuth (is_composio_managed=false, notre propre
+# Client ID/Secret Google Cloud) : le Managed OAuth partage de Composio a ete
+# essaye deux fois (ac_1VhZyQnF2Xtu puis ac_gjPyVvtCNdXS, meme scope unique
+# gmail.readonly a chaque fois) et bloque les deux fois par la verification
+# Google des scopes restreints. Seul Gmail utilise un Custom Auth Config ;
+# Sheets/Drive/Calendar restent en Managed OAuth (jamais bloques).
+EXPECTED_GMAIL_AUTH_CONFIG_ID = "ac_0fyBzPbu5_Db"
 
 
-def test_default_gmail_auth_config_matches_recreated_managed_oauth_config():
+def test_default_gmail_auth_config_matches_custom_oauth_config():
     settings = Settings(_env_file=None)
     assert settings.composio_auth_config_gmail == EXPECTED_GMAIL_AUTH_CONFIG_ID
 
