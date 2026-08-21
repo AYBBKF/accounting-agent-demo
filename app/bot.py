@@ -26,6 +26,11 @@ from aiogram.types import (
     TelegramObject,
 )
 
+from app.accounting_agent import (
+    AccountingAgent,
+    AccountingAgentClarification,
+    AccountingAgentError,
+)
 from app.auth import is_allowed_telegram_user
 from app.composio_connect import ComposioConnectError, ComposioConnectManager, SERVICES
 from app.config import settings
@@ -79,6 +84,17 @@ connect_manager = ComposioConnectManager(
         "googledrive": settings.composio_auth_config_googledrive,
         "googlecalendar": settings.composio_auth_config_googlecalendar,
     },
+)
+
+# Agent comptable en langage naturel : repond aux messages texte libre en
+# lisant le Google Sheet du client via SA propre connexion Composio
+# (user_id = "telegram_<chat_id>"). Les montants sont calcules en Decimal
+# dans app/accounting_agent.py, jamais produits par un modele de langage.
+AGENT_TIMEOUT_SECONDS = 45.0
+
+accounting_agent = AccountingAgent(
+    api_key=settings.composio_api_key,
+    spreadsheet_id=settings.google_sheet_id,
 )
 
 # Libelles des services affiches dans /help, derives de SERVICES pour qu'ils
@@ -494,6 +510,58 @@ def build_dispatcher() -> Dispatcher:
         output_path = f"/app/data/exports/rapport_demo_{message.chat.id}.xlsx"
         build_excel_report(invoices, bank_lines, reconciliations, output_path)
         await message.answer_document(document=open(output_path, "rb"))
+
+    # --- Handler texte libre : DOIT rester le dernier enregistre ---
+    # aiogram evalue les handlers dans l'ordre d'enregistrement : place ici,
+    # ce filtre attrape tout message texte qui n'est pas une commande, sans
+    # jamais court-circuiter les commandes ci-dessus. Avant ce handler,
+    # aiogram journalisait "Update ... is not handled" et le bot restait muet.
+    @dp.message(F.text & ~F.text.startswith("/"))
+    async def cmd_free_text(message: Message) -> None:
+        question = (message.text or "").strip()
+        if not question:
+            return
+        chat_id = message.chat.id
+        logger.info(
+            "Question libre recue (chat=%s, longueur=%s)", chat_id, len(question)
+        )
+        try:
+            await message.bot.send_chat_action(chat_id=chat_id, action="typing")
+        except Exception:  # noqa: BLE001 - l'indicateur ne doit jamais bloquer
+            logger.debug("Indicateur 'typing' indisponible (chat=%s)", chat_id)
+        try:
+            reply = await asyncio.wait_for(
+                asyncio.to_thread(accounting_agent.answer, chat_id, question),
+                timeout=AGENT_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Agent comptable: delai depasse (chat=%s, timeout=%ss)",
+                chat_id,
+                AGENT_TIMEOUT_SECONDS,
+            )
+            await message.answer(
+                "Le traitement a pris trop de temps (plus de "
+                f"{int(AGENT_TIMEOUT_SECONDS)}s). Reessaie dans un moment."
+            )
+            return
+        except AccountingAgentClarification as exc:
+            logger.info("Agent comptable: precision demandee (chat=%s)", chat_id)
+            await message.answer(str(exc))
+            return
+        except AccountingAgentError as exc:
+            # Erreur metier : message deja formule pour le client, sans secret.
+            logger.warning("Agent comptable: erreur metier (chat=%s): %s", chat_id, exc)
+            await message.answer(str(exc))
+            return
+        except Exception:  # noqa: BLE001 - jamais de silence cote client
+            logger.exception("Agent comptable: erreur inattendue (chat=%s)", chat_id)
+            await message.answer(
+                "Une erreur interne est survenue pendant l'analyse de ton classeur. "
+                "L'incident est journalise ; reessaie dans un moment ou utilise /help."
+            )
+            return
+        await message.answer(reply)
 
     return dp
 
