@@ -81,6 +81,10 @@ connect_manager = ComposioConnectManager(
     },
 )
 
+# Libelles des services affiches dans /help, derives de SERVICES pour qu'ils
+# ne puissent jamais diverger des libelles reels des boutons /connect.
+SERVICES_SUMMARY = ", ".join(label for _, _, label in SERVICES)
+
 SYNC_SHEET_BUTTON_TEXT = "Synchroniser Google Sheets"
 SYNC_SHEET_CALLBACK_DATA = "sync_sheet"
 
@@ -247,8 +251,8 @@ def build_dispatcher() -> Dispatcher:
             "/sheet - lien vers le Google Sheet de suivi (si configure)\n"
             "/sync_sheet - resynchronise toutes les donnees de session vers le Sheet\n"
             "/dashboard - resume des KPI de la session en cours\n"
-            "/connect - connecte TES comptes Google (Gmail lecture seule, Sheets, "
-            "Drive, Calendar) via un lien d'autorisation individuel\n"
+            f"/connect - connecte TES comptes Google ({SERVICES_SUMMARY}) "
+            "via un lien d'autorisation individuel\n"
             "/status - etat du bot + statut de tes connexions Google"
         )
 

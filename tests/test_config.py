@@ -1,24 +1,28 @@
 """Garde-fous sur la configuration Composio Connect Links (`/connect`).
 
-Verifie que le bot utilise bien un Auth Config Gmail distinct et dedie
-(pas reutilise/confondu avec Sheets, Drive ou Calendar), et que sa valeur
-par defaut est celle du Custom OAuth Gmail (notre propre app Google Cloud),
-apres que le Managed OAuth Composio (recree une premiere fois a l'identique)
-ait ete confirme bloque par Google sur le scope gmail.readonly ("Cette
-application est bloquee").
+Couvre deux risques distincts :
+
+1. Le bon Auth Config Gmail est utilise, et il est distinct de ceux des
+   autres services (pas de fuite de perimetre entre services).
+2. Le libelle affiche pour Gmail ne promet PAS la "lecture seule" : les
+   scopes OAuth par defaut de Composio (non surchargeables sans declencher
+   le blocage Google) incluent https://mail.google.com/, soit un acces
+   Gmail complet. La restriction reelle est appliquee cote Composio via
+   l'allowlist d'outils de l'auth config, pas par le scope OAuth.
 """
+from app.composio_connect import SERVICES
 from app.config import Settings
 
-# Auth Config Gmail Custom OAuth (is_composio_managed=false, notre propre
-# Client ID/Secret Google Cloud) : le Managed OAuth partage de Composio a ete
-# essaye deux fois (ac_1VhZyQnF2Xtu puis ac_gjPyVvtCNdXS, meme scope unique
-# gmail.readonly a chaque fois) et bloque les deux fois par la verification
-# Google des scopes restreints. Seul Gmail utilise un Custom Auth Config ;
-# Sheets/Drive/Calendar restent en Managed OAuth (jamais bloques).
-EXPECTED_GMAIL_AUTH_CONFIG_ID = "ac_0fyBzPbu5_Db"
+# Auth Config Gmail "Composio Managed Auth" SANS surcharge de scopes.
+# Historique : ac_1VhZyQnF2Xtu puis ac_gjPyVvtCNdXS (managed + scopes forces
+# a gmail.readonly) ont tous deux ete bloques par Google ("Cette application
+# est bloquee"), car l'app OAuth partagee de Composio n'est pas verifiee pour
+# gmail.readonly. ac_0fyBzPbu5_Db (Custom OAuth) a ensuite echoue en
+# redirect_uri_mismatch. Celui-ci utilise les scopes par defaut verifies.
+EXPECTED_GMAIL_AUTH_CONFIG_ID = "ac_zOiFKyWk3Pac"
 
 
-def test_default_gmail_auth_config_matches_custom_oauth_config():
+def test_default_gmail_auth_config_is_the_managed_unscoped_config():
     settings = Settings(_env_file=None)
     assert settings.composio_auth_config_gmail == EXPECTED_GMAIL_AUTH_CONFIG_ID
 
@@ -42,3 +46,24 @@ def test_env_override_still_wins_over_gmail_default():
     # variable d'environnement (ex. si le projet Composio change a nouveau).
     settings = Settings(_env_file=None, COMPOSIO_AUTH_CONFIG_GMAIL="ac_overridden")
     assert settings.composio_auth_config_gmail == "ac_overridden"
+
+
+def test_gmail_label_does_not_claim_read_only_access():
+    # Le scope OAuth reellement accorde (https://mail.google.com/) est un
+    # acces Gmail complet : annoncer "lecture seule" a l'utilisateur serait
+    # mensonger, meme si le bot s'interdit l'ecriture cote outils.
+    label = next(label for key, _, label in SERVICES if key == "gmail")
+    assert "lecture seule" not in label.lower()
+    assert "readonly" not in label.lower()
+
+
+def test_every_service_has_a_configured_auth_config():
+    settings = Settings(_env_file=None)
+    by_service = {
+        "gmail": settings.composio_auth_config_gmail,
+        "googlesheets": settings.composio_auth_config_googlesheets,
+        "googledrive": settings.composio_auth_config_googledrive,
+        "googlecalendar": settings.composio_auth_config_googlecalendar,
+    }
+    for service_key, _, _ in SERVICES:
+        assert by_service.get(service_key), f"auth config manquant pour {service_key}"

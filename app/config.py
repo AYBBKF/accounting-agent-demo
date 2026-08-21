@@ -51,21 +51,29 @@ class Settings(BaseSettings):
 
     # --- Composio Connect Links multi-client (Gmail, Sheets, Drive, Calendar) ---
     # Un auth config par toolkit, cree une seule fois pour tout le projet
-    # Composio du bot (composio-managed OAuth : pas de client_id/secret Google
-    # a fournir, sauf Gmail - voir ci-dessous). Chaque client genere sa propre
+    # Composio du bot (composio-managed OAuth : AUCUN client_id/secret Google
+    # a fournir, pour les 4 services). Chaque client genere sa propre
     # connexion via /connect, isolee par user_id = "telegram_<chat_id>".
     # Valeurs par defaut = auth configs du projet pr_76EmxezsdHvO ;
     # surchargeables par env si le projet change.
     #
-    # Gmail: le scope gmail.readonly est un scope Google "restreint". Le
-    # client OAuth partage du Managed Auth Composio declenche
-    # systematiquement le blocage Google "Cette application est bloquee"
-    # (confirme sur 2 Auth Configs Composio-manages distincts recrees a
-    # l'identique). Gmail utilise donc un Auth Config Custom OAuth avec notre
-    # propre app Google Cloud (is_composio_managed=false, meme scope unique
-    # gmail.readonly, aucun scope supplementaire) - voir tests/test_config.py.
-    # Sheets/Drive/Calendar restent en Composio Managed Auth (aucun blocage).
-    composio_auth_config_gmail: str = Field(default="ac_0fyBzPbu5_Db", alias="COMPOSIO_AUTH_CONFIG_GMAIL")
+    # Gmail: NE JAMAIS surcharger `credentials.scopes` sur l'auth config
+    # managee. L'application OAuth partagee de Composio est verifiee par
+    # Google pour un jeu de scopes precis (userinfo/contacts +
+    # https://mail.google.com/) qui n'inclut PAS gmail.readonly. Demander
+    # gmail.readonly dessus fait echouer Google en "Cette application est
+    # bloquee" (verifie sur 2 auth configs managees successives). On utilise
+    # donc les scopes par defaut de Composio, non surcharges.
+    #
+    # Contrepartie: ces scopes par defaut donnent un acces Gmail COMPLET au
+    # niveau OAuth (https://mail.google.com/), plus large que la lecture
+    # seule. La restriction "lecture seule" est donc appliquee cote Composio
+    # via `restrict_to_following_tools` sur l'auth config (allowlist de 10
+    # outils de lecture: FETCH_EMAILS, GET_ATTACHMENT, LIST_MESSAGES...),
+    # ce qui rend tout envoi/suppression impossible depuis ce bot. Le libelle
+    # du bouton /connect ne dit donc PAS "lecture seule" (cf. SERVICES dans
+    # app/composio_connect.py).
+    composio_auth_config_gmail: str = Field(default="ac_zOiFKyWk3Pac", alias="COMPOSIO_AUTH_CONFIG_GMAIL")
     composio_auth_config_googlesheets: str = Field(
         default="ac_1zYvYaXY82zA", alias="COMPOSIO_AUTH_CONFIG_GOOGLESHEETS"
     )

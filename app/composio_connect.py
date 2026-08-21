@@ -10,7 +10,11 @@ Identifiant utilise : "telegram_<chat_id>" (voir `composio_user_id_for_chat`).
 
 Un "auth config" par toolkit est cree une seule fois pour tout le projet
 Composio du bot (composio-managed OAuth : pas de client_id/secret Google a
-fournir - voir app/config.py). Ce module ne fait que generer des liens et
+fournir - voir app/config.py). L'acces Gmail est restreint cote Composio a
+une allowlist d'outils en lecture seule (restrict_to_following_tools), car
+l'application OAuth geree par Composio demande a Google un perimetre plus
+large que gmail.readonly (voir app/config.py) : aucun envoi ni suppression
+n'est possible via ce bot. Ce module ne fait que generer des liens et
 lire des statuts de connexion pour un `user_id` donne ; il n'effectue aucune
 action metier (lecture/ecriture de donnees) - ca reste le role des outils
 Composio individuels appeles ailleurs (ex. sheets_client.py, futur trigger
@@ -37,7 +41,7 @@ _REQUEST_TIMEOUT_SECONDS = 20.0
 # Services geres, dans l'ordre d'affichage du menu /connect.
 SERVICES: list[tuple[str, str, str]] = [
     # (cle interne, toolkit slug Composio, libelle affiche)
-    ("gmail", "gmail", "Gmail (lecture seule)"),
+    ("gmail", "gmail", "Gmail"),
     ("googlesheets", "googlesheets", "Google Sheets"),
     ("googledrive", "googledrive", "Google Drive"),
     ("googlecalendar", "googlecalendar", "Google Calendar"),
