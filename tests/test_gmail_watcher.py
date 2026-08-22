@@ -1,5 +1,19 @@
-"""Tests du worker Gmail : anti-doublon, isolation, et surtout le fait
-qu'AUCUNE ecriture Sheets/Drive n'a lieu avant confirmation explicite.
+"""Tests du worker Gmail.
+
+Ce que ces tests garantissent :
+
+  - une facture lisible, complete, coherente et non ambigue est importee
+    AUTOMATIQUEMENT, sans confirmation, avec une notification "Facture
+    importée avec succès" ;
+  - une facture douteuse (montant illisible, HT+TVA != TTC, ICE manquant,
+    fournisseur ambigu, plusieurs valeurs possibles, avoir, doublon
+    incertain) demande une validation humaine et n'ecrit RIEN ;
+  - un doublon certain (meme ICE fournisseur + meme numero) n'est jamais
+    ecrit : le client est seulement informe ;
+  - les valeurs ecrites respectent les conventions reelles du classeur
+    (ID stable FA-..., ID fournisseur, nombres natifs, taux 20, statut
+    Impayee, formules recopiees) ;
+  - Gmail reste en lecture seule et aucune cle API ne fuit.
 
 Aucun appel reseau reel : les appels Composio sont mockes.
 """
@@ -37,7 +51,24 @@ MESSAGE = {
     ],
 }
 
-TABS = ["00_DASHBOARD", "04_FACTURES_VENTES", "05_FACTURES_ACHATS", "06_RELEVE_BANCAIRE"]
+TABS = ["00_DASHBOARD", "03_FOURNISSEURS", "04_FACTURES_VENTES",
+        "05_FACTURES_ACHATS", "14_IMPORTS_LOG"]
+
+# Les 5 fournisseurs de demonstration : ATLAS BUREAU SARL n'y figure pas,
+# il devra donc etre cree a partir de son ICE.
+DEMO_SUPPLIERS = [
+    ["FRS-001", "Fournitures Atlas SARL (DEMO)", "DEMO-ICE-200341"],
+    ["FRS-002", "Papeterie Zellige (DEMO)", "DEMO-ICE-200342"],
+    ["FRS-003", "Transport Sindibad (DEMO)", "DEMO-ICE-200343"],
+    ["FRS-004", "Cyber Cafe Medina Services (DEMO)", "DEMO-ICE-200344"],
+    ["FRS-005", "Imprimerie Argan (DEMO)", "DEMO-ICE-200345"],
+]
+
+# 12 lignes d'achat existantes (A, B, C, D) : la prochaine sera la 14e ligne.
+DEMO_PURCHASES = [
+    [f"FA-2026-{i:03d}", 46200 + i, f"FAC-ACH-2026-{i:03d}", f"FRS-{(i % 5) + 1:03d}"]
+    for i in range(1, 13)
+]
 
 
 @pytest.fixture
@@ -57,15 +88,33 @@ def watcher(db_path):
 
 
 class Recorder:
-    """Enregistre chaque outil Composio appele, pour prouver ce qui a - ou
-    surtout n'a PAS - ete execute."""
+    """Faux classeur + faux Gmail. Enregistre chaque outil appele, pour
+    prouver ce qui a - ou surtout n'a PAS - ete execute."""
 
-    def __init__(self):
+    def __init__(self, suppliers=None, purchases=None):
         self.calls: list[tuple[str, dict]] = []
+        self.suppliers = [list(r) for r in (DEMO_SUPPLIERS if suppliers is None else suppliers)]
+        self.purchases = [list(r) for r in (DEMO_PURCHASES if purchases is None else purchases)]
 
     @property
     def slugs(self) -> list[str]:
         return [s for s, _ in self.calls]
+
+    def writes(self) -> list[dict]:
+        return [a for s, a in self.calls if s == "GOOGLESHEETS_VALUES_UPDATE"]
+
+    def write_to(self, prefix: str) -> list[dict]:
+        return [a for a in self.writes() if a["range"].startswith(prefix)]
+
+    def _batch_get(self, arguments):
+        a1 = (arguments.get("ranges") or [""])[0]
+        if a1.startswith("03_FOURNISSEURS"):
+            return {"valueRanges": [{"values": self.suppliers}]}
+        if a1.startswith("05_FACTURES_ACHATS!A2:A"):
+            return {"valueRanges": [{"values": [[r[0]] for r in self.purchases]}]}
+        if a1.startswith("05_FACTURES_ACHATS"):
+            return {"valueRanges": [{"values": self.purchases}]}
+        return {"valueRanges": [{"values": []}]}
 
     def __call__(self, slug, arguments):
         self.calls.append((slug, arguments))
@@ -74,19 +123,30 @@ class Recorder:
         if slug == "GMAIL_FETCH_MESSAGE_BY_MESSAGE_ID":
             return MESSAGE
         if slug == "GMAIL_GET_ATTACHMENT":
-            return {"file": {"s3url": "https://example.invalid/f.pdf", "mimetype": "application/pdf"}}
+            return {"file": {"s3url": "https://example.invalid/f.pdf",
+                             "mimetype": "application/pdf"}}
+        if slug == "GOOGLESHEETS_BATCH_GET":
+            return self._batch_get(arguments)
         if slug == "GOOGLESHEETS_GET_SPREADSHEET_INFO":
-            return {"sheets": [{"properties": {"title": t}} for t in TABS]}
+            if arguments.get("ranges"):
+                return {"sheets": [{"data": [{"rowData": [{"values": [
+                    {"effectiveFormat": {"backgroundColor": {"red": 1, "green": 1, "blue": 1}}}
+                ]}]}]}]}
+            return {"sheets": [
+                {"properties": {"title": t, "sheetId": i}} for i, t in enumerate(TABS)
+            ]}
+        if slug == "GOOGLEDRIVE_UPLOAD_FROM_URL":
+            return {"id": "drive-file-id"}
         return {}
 
 
-def _run_cycle(watcher, recorder):
+def _run_cycle(watcher, recorder, text=REAL_PDF_TEXT):
     from app.invoice_pdf import extract_invoice_fields
 
     with patch.object(GmailWatcher, "_execute", side_effect=recorder), \
          patch.object(GmailWatcher, "download_attachment", return_value=b"%PDF-fake"), \
          patch("app.gmail_watcher.extract_from_pdf_bytes",
-               side_effect=lambda b: extract_invoice_fields(REAL_PDF_TEXT)):
+               side_effect=lambda b: extract_invoice_fields(text)):
         return watcher.process_once()
 
 
@@ -100,23 +160,6 @@ def test_watcher_uses_the_specified_query_and_client_user_id(watcher):
     assert query == 'subject:"[XBLASTE]" has:attachment filename:pdf'
 
 
-def test_a_matching_email_produces_a_pending_invoice(watcher, db_path):
-    pendings = _run_cycle(watcher, Recorder())
-    assert len(pendings) == 1
-    p = pendings[0]
-    assert p.fields.numero == "FAC-TEST-2026-001"
-    assert p.scope == "purchases"          # X BLASTE est le client -> achat
-    row = get_gmail_message(db_path, p.message_id)
-    assert row["status"] == "pending"
-
-
-def test_nothing_is_written_to_sheets_or_drive_before_confirmation(watcher):
-    recorder = Recorder()
-    _run_cycle(watcher, recorder)
-    forbidden = [s for s in recorder.slugs if "UPSERT" in s or "DRIVE" in s or "UPDATE" in s]
-    assert forbidden == [], f"ecriture prematuree detectee: {forbidden}"
-
-
 def test_gmail_is_only_read_never_written(watcher):
     recorder = Recorder()
     _run_cycle(watcher, recorder)
@@ -127,7 +170,239 @@ def test_gmail_is_only_read_never_written(watcher):
     )
 
 
-# --- anti-doublon ---------------------------------------------------------
+# --- import automatique ---------------------------------------------------
+
+def test_a_clean_invoice_is_imported_without_any_confirmation(watcher, db_path):
+    outcomes = _run_cycle(watcher, Recorder())
+    assert len(outcomes) == 1
+    outcome = outcomes[0]
+    assert outcome.decision.action == "auto"
+    assert outcome.needs_buttons is False
+    assert "Facture importée avec succès" in outcome.message
+    assert get_gmail_message(db_path, MESSAGE["messageId"])["status"] == "confirmed"
+
+
+def test_the_success_notification_carries_every_requested_detail(watcher):
+    message = _run_cycle(watcher, Recorder())[0].message
+    for expected in ("FAC-TEST-2026-001", "ATLAS BUREAU SARL", "4000.00",
+                     "800.00", "4800.00", "05_FACTURES_ACHATS", "14"):
+        assert expected in message, f"absent de la notification : {expected}"
+
+
+def test_the_written_row_follows_the_workbook_conventions(watcher):
+    recorder = Recorder()
+    _run_cycle(watcher, recorder)
+    main = recorder.write_to("05_FACTURES_ACHATS!A14:J14")
+    assert len(main) == 1
+    row = main[0]["values"][0]
+    assert main[0]["value_input_option"] == "RAW"
+    assert row[0] == "FA-2026-013"          # ID stable, PAS le numero de facture
+    assert row[2] == "FAC-TEST-2026-001"    # numero de facture en colonne C
+    assert row[3] == "FRS-006"              # ID fournisseur en colonne D
+    assert row[1] == 46255                  # date en numero de serie (2026-08-21)
+    assert row[6] == 4000.0                 # HT : nombre natif, jamais "4000.00 MAD"
+    assert row[7] == 20.0                   # taux TVA au format du classeur (20, pas 0,2)
+    assert row[8] == 800.0
+    assert row[9] == 4800.0
+    for cell in row[6:10]:
+        assert not isinstance(cell, str), f"montant ecrit en chaine : {cell!r}"
+
+
+def test_status_uses_the_workbook_vocabulary(watcher):
+    recorder = Recorder()
+    _run_cycle(watcher, recorder)
+    tail = recorder.write_to("05_FACTURES_ACHATS!N14:P14")[0]["values"][0]
+    assert tail[0] == 46285          # echeance 2026-09-20 en numero de serie
+    assert tail[1] == 0.0            # montant paye
+    assert tail[2] == "Impayee"      # et surtout pas "NON PAYEE"
+
+
+def test_formulas_are_copied_into_k_l_m_and_q(watcher):
+    recorder = Recorder()
+    _run_cycle(watcher, recorder)
+    klm = recorder.write_to("05_FACTURES_ACHATS!K14:M14")[0]
+    q = recorder.write_to("05_FACTURES_ACHATS!Q14")[0]
+    assert klm["value_input_option"] == "USER_ENTERED"
+    assert klm["values"][0][0] == "=ROUND(G14+I14;2)"
+    assert klm["values"][0][1] == "=J14-K14"
+    assert klm["values"][0][2] == '=IF(COUNTIF($C$2:$C$14;C14)>1;"DOUBLON";"")'
+    assert q["values"][0][0] == "=IF(AND(O14<J14;TODAY()>N14);TODAY()-N14;0)"
+
+
+def test_number_formats_and_status_validation_are_applied(watcher):
+    recorder = Recorder()
+    _run_cycle(watcher, recorder)
+    formats = {a["range"]: a for s, a in recorder.calls if s == "GOOGLESHEETS_FORMAT_CELL"}
+    assert formats["G14"]["number_format_pattern"] == '#,##0.00 "MAD"'
+    assert formats["H14"]["number_format_pattern"] == '0"%"'
+    assert formats["B14"]["number_format_pattern"] == "yyyy-mm-dd"
+    validations = [a for s, a in recorder.calls if s == "GOOGLESHEETS_SET_DATA_VALIDATION_RULE"]
+    assert len(validations) == 1
+    assert validations[0]["values"] == ["Payee", "Partiellement payee", "Impayee"]
+    assert validations[0]["start_column_index"] == 15   # colonne P
+
+
+def test_no_other_invoice_row_is_ever_touched(watcher):
+    recorder = Recorder()
+    _run_cycle(watcher, recorder)
+    for write in recorder.write_to("05_FACTURES_ACHATS"):
+        assert "14" in write["range"], f"ecriture hors de la ligne 14 : {write['range']}"
+
+
+# --- fournisseur ----------------------------------------------------------
+
+def test_an_unknown_supplier_is_created_from_its_ice(watcher):
+    recorder = Recorder()
+    _run_cycle(watcher, recorder)
+    created = recorder.write_to("03_FOURNISSEURS")
+    assert len(created) == 1
+    row = created[0]["values"][0]
+    assert row[0] == "FRS-006"
+    assert row[1] == "ATLAS BUREAU SARL"
+    assert row[2] == "002345678000043"       # ICE du fournisseur, pas celui du client
+
+
+def test_a_known_supplier_is_reused_and_never_duplicated(watcher):
+    recorder = Recorder(
+        suppliers=DEMO_SUPPLIERS + [["FRS-006", "ATLAS BUREAU SARL", "002345678000043"]]
+    )
+    _run_cycle(watcher, recorder)
+    assert recorder.write_to("03_FOURNISSEURS") == []
+    row = recorder.write_to("05_FACTURES_ACHATS!A14:J14")[0]["values"][0]
+    assert row[3] == "FRS-006"
+
+
+def test_a_supplier_with_the_same_name_but_another_ice_is_ambiguous(watcher):
+    recorder = Recorder(
+        suppliers=DEMO_SUPPLIERS + [["FRS-006", "ATLAS BUREAU SARL", "999999999999999"]]
+    )
+    outcome = _run_cycle(watcher, recorder)[0]
+    assert outcome.decision.action == "review"
+    assert any("ambigu" in r for r in outcome.decision.reasons)
+    assert recorder.write_to("05_FACTURES_ACHATS") == []
+
+
+# --- lignes de detail et journal ------------------------------------------
+
+def test_invoice_detail_lines_go_to_a_dedicated_tab(watcher):
+    recorder = Recorder()
+    _run_cycle(watcher, recorder)
+    added = [a for s, a in recorder.calls if s == "GOOGLESHEETS_ADD_SHEET"]
+    assert added and added[0]["title"] == "16_LIGNES_FACTURES"
+    lines = recorder.write_to("16_LIGNES_FACTURES!A2")
+    assert len(lines) == 1
+    rows = lines[0]["values"]
+    assert len(rows) == 2
+    assert rows[0][0] == "FA-2026-013"        # lie a l'ID de facture
+    assert rows[0][4] == "Ramettes papier A4 premium"
+    assert rows[0][5] == 2.0 and rows[0][8] == 1500.0
+    assert rows[1][8] == 2500.0
+
+
+def test_the_import_log_keeps_gmail_and_drive_information(watcher):
+    recorder = Recorder()
+    _run_cycle(watcher, recorder)
+    log = recorder.write_to("14_IMPORTS_LOG")
+    assert len(log) == 1
+    row = log[0]["values"][0]
+    assert row[2] == "FA-2026-013"
+    assert row[3] == "Créé"
+    detail = row[5]
+    for expected in ("FAC-TEST-2026-001", "002345678000043", "05_FACTURES_ACHATS ligne 14",
+                     MESSAGE["messageId"], "Facture_test_X_BLASTE_FAC-TEST-2026-001.pdf",
+                     "drive.google.com"):
+        assert expected in detail, f"absent du journal d'import : {expected}"
+
+
+# --- cas exigeant une validation humaine ----------------------------------
+
+def _review(watcher, recorder, text):
+    outcome = _run_cycle(watcher, recorder, text=text)[0]
+    assert outcome.decision.action == "review"
+    assert outcome.needs_buttons is True
+    assert recorder.write_to("05_FACTURES_ACHATS") == []
+    return outcome
+
+
+def test_an_incoherent_total_requires_human_validation(watcher):
+    text = REAL_PDF_TEXT.replace(" 4 800.00 MAD", " 4 900.00 MAD")
+    outcome = _review(watcher, Recorder(), text)
+    assert any("HT + TVA ne correspond pas au TTC" in r for r in outcome.decision.reasons)
+
+
+def test_a_missing_supplier_ice_requires_human_validation(watcher):
+    text = REAL_PDF_TEXT.replace("ICE: 002345678000043   IF: 18765432", "IF: 18765432")
+    outcome = _review(watcher, Recorder(), text)
+    assert any("ICE du fournisseur absent" in r for r in outcome.decision.reasons)
+
+
+def test_an_unreadable_amount_requires_human_validation(watcher):
+    text = REAL_PDF_TEXT.replace(" 4 000.00 MAD", " illisible")
+    outcome = _review(watcher, Recorder(), text)
+    assert any("montant HT" in r for r in outcome.decision.reasons)
+
+
+def test_a_credit_note_requires_human_validation(watcher):
+    text = REAL_PDF_TEXT.replace("FACTURE\n", "FACTURE D AVOIR\n")
+    outcome = _review(watcher, Recorder(), text)
+    assert any("avoir" in r for r in outcome.decision.reasons)
+
+
+def test_several_possible_values_require_human_validation(watcher):
+    text = REAL_PDF_TEXT.replace(
+        " TOTAL TTC\n 4 800.00 MAD", " TOTAL TTC\n 4 800.00 MAD\n TOTAL TTC\n 5 000.00 MAD"
+    )
+    outcome = _review(watcher, Recorder(), text)
+    assert any("plusieurs valeurs possibles" in r for r in outcome.decision.reasons)
+
+
+def test_review_message_shows_the_reasons_and_states_nothing_was_written(watcher):
+    text = REAL_PDF_TEXT.replace("ICE: 002345678000043   IF: 18765432", "IF: 18765432")
+    outcome = _review(watcher, Recorder(), text)
+    assert "Validation humaine demandee car :" in outcome.message
+    assert "Rien n'a encore ete ecrit" in outcome.message
+
+
+# --- doublons -------------------------------------------------------------
+
+def test_a_certain_duplicate_is_never_written_only_reported(watcher, db_path):
+    _run_cycle(watcher, Recorder())          # premier import : ecrit la ligne 14
+    assert get_gmail_message(db_path, MESSAGE["messageId"])["status"] == "confirmed"
+
+    # Le meme email revient sous un autre message_id (renvoi / transfert).
+    recorder = Recorder(
+        purchases=DEMO_PURCHASES + [["FA-2026-013", 46255, "FAC-TEST-2026-001", "FRS-006"]],
+        suppliers=DEMO_SUPPLIERS + [["FRS-006", "ATLAS BUREAU SARL", "002345678000043"]],
+    )
+    with patch.dict(MESSAGE, {"messageId": "second-message-id"}):
+        outcome = _run_cycle(watcher, recorder)[0]
+    assert outcome.decision.action == "duplicate"
+    assert outcome.needs_buttons is False
+    assert "deja importee" in outcome.message
+    assert recorder.write_to("05_FACTURES_ACHATS") == []
+
+
+def test_the_duplicate_key_is_ice_plus_invoice_number():
+    from app.invoice_policy import fingerprint
+
+    assert fingerprint("002345678000043", "FAC-TEST-2026-001") == \
+        "002345678000043|FAC-TEST-2026-001"
+    # Meme numero, fournisseur different -> ce n'est PAS le meme doublon.
+    assert fingerprint("111", "F-1") != fingerprint("222", "F-1")
+    # Sans ICE, aucun doublon ne peut etre affirme.
+    assert fingerprint(None, "F-1") == ""
+    assert fingerprint("111", None) == ""
+
+
+def test_the_same_number_from_another_supplier_is_only_uncertain(watcher):
+    recorder = Recorder(
+        purchases=DEMO_PURCHASES + [["FA-2026-013", 46255, "FAC-TEST-2026-001", "FRS-002"]],
+    )
+    outcome = _run_cycle(watcher, recorder)[0]
+    assert outcome.decision.action == "review"
+    assert any("doublon possible" in r for r in outcome.decision.reasons)
+    assert recorder.write_to("05_FACTURES_ACHATS") == []
+
 
 def test_the_same_email_is_never_processed_twice(watcher, db_path):
     first = _run_cycle(watcher, Recorder())
@@ -167,79 +442,71 @@ def test_two_chats_use_two_different_composio_user_ids(db_path):
     assert a.user_id != b.user_id
 
 
-# --- apercu ---------------------------------------------------------------
+# --- apercu (cas douteux uniquement) --------------------------------------
 
-def test_preview_shows_every_field_and_says_nothing_is_written(watcher):
-    pending = _run_cycle(watcher, Recorder())[0]
-    preview = build_preview(pending)
+def test_preview_shows_every_field_including_the_ice(watcher):
+    text = REAL_PDF_TEXT.replace(" 4 800.00 MAD", " 4 900.00 MAD")
+    outcome = _run_cycle(watcher, Recorder(), text=text)[0]
+    preview = build_preview(outcome.pending)
     for expected in ("FAC-TEST-2026-001", "2026-08-21", "2026-09-20",
-                     "ATLAS BUREAU SARL", "X BLASTE", "4 000,00", "800,00",
-                     "4 800,00", "NON PAYEE", "Virement bancaire"):
+                     "ATLAS BUREAU SARL", "X BLASTE", "002345678000043",
+                     "4 000,00", "800,00", "NON PAYEE", "Virement bancaire"):
         assert expected in preview, f"absent de l'apercu : {expected}"
     assert "Rien n'a encore ete ecrit" in preview
 
 
 def test_preview_lists_missing_fields_when_extraction_is_partial(watcher):
-    from app.invoice_pdf import extract_invoice_fields
-
-    with patch.object(GmailWatcher, "_execute", side_effect=Recorder()), \
-         patch.object(GmailWatcher, "download_attachment", return_value=b"x"), \
-         patch("app.gmail_watcher.extract_from_pdf_bytes",
-               return_value=extract_invoice_fields("FACTURE\nDivers\nfin")):
-        pending = watcher.process_once()[0]
-    preview = build_preview(pending)
+    outcome = _run_cycle(watcher, Recorder(), text="FACTURE\nDivers\nfin")[0]
+    preview = build_preview(outcome.pending)
     assert "Champs introuvables" in preview
     assert "non devines" in preview
 
 
-# --- confirmation / refus -------------------------------------------------
+# --- confirmation / refus (chemin humain) ---------------------------------
 
-def test_confirm_writes_to_the_purchases_tab(watcher, db_path):
-    pending = _run_cycle(watcher, Recorder())[0]
+def test_confirm_after_review_writes_the_row(watcher, db_path):
+    text = REAL_PDF_TEXT.replace(" 4 800.00 MAD", " 4 900.00 MAD")
+    outcome = _run_cycle(watcher, Recorder(), text=text)[0]
     recorder = Recorder()
     with patch.object(GmailWatcher, "_execute", side_effect=recorder):
-        result = watcher.confirm(pending.message_id)
-
-    upserts = [a for s, a in recorder.calls if s == "GOOGLESHEETS_UPSERT_ROWS"]
-    assert len(upserts) == 1
-    assert upserts[0]["sheetName"] == "05_FACTURES_ACHATS"
-    row = upserts[0]["rows"][0]
-    assert row[0] == "FAC-TEST-2026-001"          # ID = numero (idempotent)
-    assert "4000.00 MAD" in row[6]                 # HT
-    assert "4800.00 MAD" in row[9]                 # TTC
-    assert "05_FACTURES_ACHATS" in result
-    assert get_gmail_message(db_path, pending.message_id)["status"] == "confirmed"
+        result = watcher.confirm(outcome.pending.message_id)
+    assert "Facture importée avec succès" in result
+    assert recorder.write_to("05_FACTURES_ACHATS!A14:J14")
+    assert get_gmail_message(db_path, outcome.pending.message_id)["status"] == "confirmed"
 
 
 def test_confirm_is_idempotent_and_never_writes_twice(watcher, db_path):
-    pending = _run_cycle(watcher, Recorder())[0]
+    text = REAL_PDF_TEXT.replace(" 4 800.00 MAD", " 4 900.00 MAD")
+    outcome = _run_cycle(watcher, Recorder(), text=text)[0]
     with patch.object(GmailWatcher, "_execute", side_effect=Recorder()):
-        watcher.confirm(pending.message_id)
+        watcher.confirm(outcome.pending.message_id)
     second = Recorder()
     with patch.object(GmailWatcher, "_execute", side_effect=second):
-        message = watcher.confirm(pending.message_id)
+        message = watcher.confirm(outcome.pending.message_id)
     assert "deja ete enregistree" in message
-    assert [s for s in second.slugs if "UPSERT" in s] == []
+    assert second.write_to("05_FACTURES_ACHATS") == []
 
 
 def test_refuse_writes_nothing_at_all(watcher, db_path):
-    pending = _run_cycle(watcher, Recorder())[0]
+    text = REAL_PDF_TEXT.replace(" 4 800.00 MAD", " 4 900.00 MAD")
+    outcome = _run_cycle(watcher, Recorder(), text=text)[0]
     recorder = Recorder()
     with patch.object(GmailWatcher, "_execute", side_effect=recorder):
-        message = watcher.refuse(pending.message_id)
+        message = watcher.refuse(outcome.pending.message_id)
     assert recorder.calls == []
     assert "Rien n'a ete ecrit" in message
-    assert get_gmail_message(db_path, pending.message_id)["status"] == "refused"
+    assert get_gmail_message(db_path, outcome.pending.message_id)["status"] == "refused"
 
 
 def test_a_refused_invoice_cannot_be_confirmed_afterwards(watcher):
-    pending = _run_cycle(watcher, Recorder())[0]
-    watcher.refuse(pending.message_id)
+    text = REAL_PDF_TEXT.replace(" 4 800.00 MAD", " 4 900.00 MAD")
+    outcome = _run_cycle(watcher, Recorder(), text=text)[0]
+    watcher.refuse(outcome.pending.message_id)
     recorder = Recorder()
     with patch.object(GmailWatcher, "_execute", side_effect=recorder):
-        message = watcher.confirm(pending.message_id)
+        message = watcher.confirm(outcome.pending.message_id)
     assert "refusee" in message
-    assert [s for s in recorder.slugs if "UPSERT" in s] == []
+    assert recorder.write_to("05_FACTURES_ACHATS") == []
 
 
 def test_confirm_on_unknown_message_raises_clearly(watcher):
