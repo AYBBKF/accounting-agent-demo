@@ -1,0 +1,43 @@
+PACK DE TEST COMPTABLE - X BLASTE
+DOCUMENT FICTIF - TEST
+Données entièrement fictives - Ne pas utiliser comme justificatif réel
+Page 1
+Fournisseur : NORTH DATA SARL
+Adresse : 7 zone industrielle, Tanger, Maroc
+ICE : 002998877000061
+IF : 99112233
+ FACTURE
+ FOURNISSEUR
+Client : X BLASTE
+Adresse : 25 boulevard Zerktouni, Casablanca, Maroc
+ICE : 003456789000052
+Référence : FAC-TEST-2026-003
+Numéro de facture
+FAC-TEST-2026-003
+Date
+22/08/2026
+Échéance
+21/09/2026
+Statut
+NON PAYÉE
+Détail
+ Désignation
+ Qté
+Prix unitaire HT
+Montant HT
+Maintenance serveurs
+1
+ 3 000.00 MAD
+ 3 000.00 MAD
+ 
+ Total HT
+ 3 000.00 MAD
+ 
+ TVA 20 %
+ 600.00 MAD
+ 
+Total TTC imprimé
+ 3 900.00 MAD
+ 
+CAS DE TEST : incohérence volontaire. 3 000 + 600 = 3 600 MAD, pas 3 900 MAD. Le bot doit
+demander une validation et ne rien écrire automatiquement.

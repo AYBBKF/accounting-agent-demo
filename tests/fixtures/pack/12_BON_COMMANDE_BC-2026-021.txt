@@ -1,0 +1,47 @@
+PACK DE TEST COMPTABLE - X BLASTE
+DOCUMENT FICTIF - TEST
+Données entièrement fictives - Ne pas utiliser comme justificatif réel
+Page 1
+Acheteur : X BLASTE
+Adresse : 25 boulevard Zerktouni, Casablanca, Maroc
+ICE : 003456789000052
+ BON DE
+COMMANDE
+ Fournisseur : ATLAS BUREAU SARL
+Adresse : 18 avenue Hassan II, Casablanca, Maroc
+ICE : 002345678000043
+ Référence : BC-2026-021
+ 
+Numéro de commande
+BC-2026-021
+Date
+22/08/2026
+Livraison souhaitée
+29/08/2026
+Statut
+ENVOYÉ
+Articles commandés
+ Désignation
+ Qté
+Prix unitaire HT
+Montant HT
+Ramette papier A4 Premium
+10
+ 350.00 MAD
+ 3 500.00 MAD
+ 
+Cartouche toner Laser XL
+5
+ 550.00 MAD
+ 2 750.00 MAD
+ 
+Total HT commande
+ 6 250.00 MAD
+ 
+ TVA indicative
+ 1 250.00 MAD
+ 
+Total TTC commande
+ 7 500.00 MAD
+ 
+Ce bon de commande ne doit pas être comptabilisé comme facture.

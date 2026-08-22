@@ -1,0 +1,43 @@
+PACK DE TEST COMPTABLE - X BLASTE
+DOCUMENT FICTIF - TEST
+Données entièrement fictives - Ne pas utiliser comme justificatif réel
+Page 1
+Émetteur : DIGITAL OFFICE MAROC SARL
+Adresse : 42 rue Al Massira, Casablanca, Maroc
+ICE : 002112233000077
+IF : 33445566
+DEVIS - NON CO
+MPTABILISABLE
+Client : X BLASTE
+Adresse : 25 boulevard Zerktouni, Casablanca, Maroc
+ICE : 003456789000052
+ Référence : DEV-2026-008
+ 
+Numéro de devis
+DEV-2026-008
+Date
+22/08/2026
+Validité
+15 jours - jusqu'au 06/09/2026
+Statut
+EN ATTENTE D'ACCEPTATION
+Proposition commerciale
+ Désignation
+ Qté
+Prix unitaire HT
+Montant HT
+Ordinateur portable professionnel
+2
+ 4 000.00 MAD
+ 8 000.00 MAD
+ 
+ Total HT
+ 8 000.00 MAD
+ 
+ TVA 20 %
+ 1 600.00 MAD
+ 
+ Total TTC
+ 9 600.00 MAD
+ 
+Ce document est un devis et ne constitue pas une facture.

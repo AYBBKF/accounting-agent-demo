@@ -1,0 +1,43 @@
+PACK DE TEST COMPTABLE - X BLASTE
+DOCUMENT FICTIF - TEST
+Données entièrement fictives - Ne pas utiliser comme justificatif réel
+Page 1
+Fournisseur : EXPRESS SERVICE
+Adresse : 3 rue des Orangers, Casablanca, Maroc
+ICE : NON RENSEIGNÉ
+IF : NON RENSEIGNÉ
+ FACTURE
+ FOURNISSEUR
+Client : X BLASTE
+Adresse : 25 boulevard Zerktouni, Casablanca, Maroc
+ICE : 003456789000052
+Référence : FAC-TEST-2026-004
+Numéro de facture
+FAC-TEST-2026-004
+Date
+22/08/2026
+Échéance
+21/09/2026
+Statut
+NON PAYÉE
+Détail
+ Désignation
+ Qté
+Prix unitaire HT
+Montant HT
+Livraison express de matériel
+1
+ 1 000.00 MAD
+ 1 000.00 MAD
+ 
+ Total HT
+ 1 000.00 MAD
+ 
+ TVA 20 %
+ 200.00 MAD
+ 
+ Total TTC
+ 1 200.00 MAD
+ 
+CAS DE TEST : ICE fournisseur absent. Le bot doit demander une validation et ne pas créer
+automatiquement le fournisseur.

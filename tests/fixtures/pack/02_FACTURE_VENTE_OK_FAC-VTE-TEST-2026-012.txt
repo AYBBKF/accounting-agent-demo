@@ -1,0 +1,51 @@
+PACK DE TEST COMPTABLE - X BLASTE
+DOCUMENT FICTIF - TEST
+Données entièrement fictives - Ne pas utiliser comme justificatif réel
+Page 1
+Fournisseur : X BLASTE
+Adresse : 25 boulevard Zerktouni, Casablanca, Maroc
+ICE : 003456789000052
+IF : 55667788
+ FACTURE DE
+ VENTE
+ 
+Client : CLINIQUE AL AMAL SARL
+Adresse : 10 rue Ibn Sina, Rabat, Maroc
+ICE : 001987654000018
+ Référence :
+ FAC-VTE-TEST-2026-012
+ 
+Numéro de facture
+FAC-VTE-TEST-2026-012
+Date
+22/08/2026
+Échéance
+21/09/2026
+Statut
+IMPAYÉE
+Mode de paiement
+Virement bancaire
+Prestations
+ Désignation
+ Qté
+Prix unitaire HT
+Montant HT
+Audit d'automatisation comptable
+1
+ 5 000.00 MAD
+ 5 000.00 MAD
+ 
+Intégration agent IA et formation
+1
+ 7 000.00 MAD
+ 7 000.00 MAD
+ 
+ Total HT
+ 12 000.00 MAD
+ 
+ TVA 20 %
+ 2 400.00 MAD
+ 
+ Total TTC
+ 14 400.00 MAD
+ 

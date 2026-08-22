@@ -1,0 +1,53 @@
+PACK DE TEST COMPTABLE - X BLASTE
+DOCUMENT FICTIF - TEST
+Données entièrement fictives - Ne pas utiliser comme justificatif réel
+Page 1
+Fournisseur : X BLASTE
+Adresse : 25 boulevard Zerktouni, Casablanca, Maroc
+ICE : 003456789000052
+IF : 55667788
+ FACTURE
+ COMMERCIALE
+ EXPORT
+ Client / Importer : SENEGAL DISTRIBUTION SARL
+Adresse : 12 avenue Cheikh Anta Diop, Dakar, Sénégal
+NINEA : SN-DEMO-0098877
+ Référence : EXP-2026-019
+ 
+Numéro export
+EXP-2026-019
+Date
+22/08/2026
+Devise
+EUR
+Incoterm
+DAP Dakar
+Pays de destination
+Sénégal
+Échéance
+21/09/2026
+Services exportés
+ Désignation
+ Qté
+Prix unitaire
+Montant
+Licence annuelle plateforme IA
+1
+ 4 500.00 EUR
+ 4 500.00 EUR
+ 
+Formation et configuration à distance
+1
+ 1 500.00 EUR
+ 1 500.00 EUR
+ 
+ Total hors taxes
+ 6 000.00 EUR
+ 
+ TVA Maroc
+ 0.00 EUR
+ 
+ Total export
+ 6 000.00 EUR
+ 
+Opération export fictive - traitement fiscal à valider par un professionnel.

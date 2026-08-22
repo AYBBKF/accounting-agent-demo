@@ -1,0 +1,56 @@
+PACK DE TEST COMPTABLE - X BLASTE
+DOCUMENT FICTIF - TEST
+Données entièrement fictives - Ne pas utiliser comme justificatif réel
+Page 1
+Exporter : SHENZHEN TECH SUPPLIES LTD.
+Address : 88 Nanshan Avenue, Shenzhen, China
+Tax ID : CN-DEMO-91440300
+ COMMERCIAL
+INVOICE -
+IMPORT
+ Importer : X BLASTE
+Address : 25 boulevard Zerktouni, Casablanca, Morocco
+ICE : 003456789000052
+ Référence : CI-2026-045
+ 
+Invoice number
+CI-2026-045
+Invoice date
+22/08/2026
+Currency
+USD
+Incoterm
+CIF Casablanca
+Country of origin
+China
+Payment terms
+30 days - due 21/09/2026
+Imported goods
+ Description
+ HS code
+Qty
+Unit price
+Amount
+ 
+Barcode scanners
+847160
+20
+ 110.00 USD
+ 2 200.00 USD
+ 
+Thermal label printers
+844332
+5
+ 200.00 USD
+ 1 000.00 USD
+ 
+ Goods value
+ 3 200.00 USD
+ 
+Freight and insurance
+ 320.00 USD
+ 
+ Total CIF
+ 3 520.00 USD
+ 
+Customs duties and Moroccan import VAT are not included in this commercial invoice.

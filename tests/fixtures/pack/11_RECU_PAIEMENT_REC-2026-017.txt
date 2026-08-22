@@ -1,0 +1,30 @@
+PACK DE TEST COMPTABLE - X BLASTE
+DOCUMENT FICTIF - TEST
+Données entièrement fictives - Ne pas utiliser comme justificatif réel
+Page 1
+Payeur : CLINIQUE AL AMAL SARL
+ICE : 001987654000018
+Adresse : 10 rue Ibn Sina, Rabat, Maroc
+ REÇU DE
+PAIEMENT
+ Bénéficiaire : X BLASTE
+ICE : 003456789000052
+Compte : MA64 0000 0000 0000 0000 0000 000
+ Référence : REC-2026-017
+ 
+Numéro du reçu
+REC-2026-017
+Date de paiement
+22/08/2026
+Facture réglée
+FAC-VTE-TEST-2026-012
+Mode
+Virement bancaire
+Référence bancaire
+VIR-DEMO-220826-771
+Montant payé
+14 400.00 MAD
+Statut
+PAYÉE INTÉGRALEMENT
+Ce reçu doit servir au rapprochement et à la mise à jour du paiement, pas à créer une nouvelle
+facture.

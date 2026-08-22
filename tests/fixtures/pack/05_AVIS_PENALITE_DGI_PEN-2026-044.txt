@@ -1,0 +1,35 @@
+PACK DE TEST COMPTABLE - X BLASTE
+DOCUMENT FICTIF - TEST
+Données entièrement fictives - Ne pas utiliser comme justificatif réel
+Page 1
+Organisme : ADMINISTRATION FISCALE - DEMO
+Nature : Avis fictif de pénalité
+Référence : PEN-2026-044
+ AVIS DE
+PÉNALITÉ À
+ PAYER
+ Client : X BLASTE
+Adresse : 25 boulevard Zerktouni, Casablanca, Maroc
+ICE : 003456789000052
+ Référence : PEN-2026-044
+ 
+Référence contribuable
+XB-2026-DEMO-0451
+Motif
+Dépôt tardif de la déclaration TVA - juillet 2026
+Date de l'avis
+22/08/2026
+Date limite de paiement
+31/08/2026
+Statut
+À PAYER
+ Pénalité
+ 400.00 MAD
+ 
+ Majoration
+ 50.00 MAD
+ 
+ Total à payer
+ 450.00 MAD
+ 
+Ce document est fictif et n'émane d'aucune administration réelle.

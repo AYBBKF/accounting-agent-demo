@@ -1,0 +1,50 @@
+PACK DE TEST COMPTABLE - X BLASTE
+DOCUMENT FICTIF - TEST
+Données entièrement fictives - Ne pas utiliser comme justificatif réel
+Page 1
+Fournisseur : ATLAS BUREAU SARL
+Adresse : 18 avenue Hassan II, Casablanca, Maroc
+ICE : 002345678000043
+IF : 18765432
+RC : 455233 Casablanca
+ FACTURE
+ FOURNISSEUR
+Client : X BLASTE
+Adresse : 25 boulevard Zerktouni, Casablanca, Maroc
+ICE : 003456789000052
+Référence : FAC-TEST-2026-002
+Numéro de facture
+FAC-TEST-2026-002
+Date
+22/08/2026
+Échéance
+21/09/2026
+Statut
+NON PAYÉE
+Mode de paiement
+Virement bancaire
+Détail de la facture
+ Désignation
+ Qté
+Prix unitaire HT
+Montant HT
+Ramette papier A4 Premium
+10
+ 350.00 MAD
+ 3 500.00 MAD
+ 
+Cartouche toner Laser XL
+5
+ 550.00 MAD
+ 2 750.00 MAD
+ 
+ Total HT
+ 6 250.00 MAD
+ 
+ TVA 20 %
+ 1 250.00 MAD
+ 
+ Total TTC
+ 7 500.00 MAD
+ 
+Référence de paiement : FAC-TEST-2026-002

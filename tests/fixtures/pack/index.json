@@ -1,0 +1,50 @@
+{
+  "01_FACTURE_ACHAT_OK_FAC-TEST-2026-002.pdf": {
+    "sha256": "70126eddf04b81563797d2597bf6e3ca9cda028151945acc4a215fde2c8f0a53",
+    "pages": 1
+  },
+  "02_FACTURE_VENTE_OK_FAC-VTE-TEST-2026-012.pdf": {
+    "sha256": "8bac23a9f7bd06122d7fc461a4922bc1086f784fa2bde8ae4cd1474f45bb9d4a",
+    "pages": 1
+  },
+  "03_DEVIS_DEV-2026-008.pdf": {
+    "sha256": "439f4d5a293d568a7ad2e137541ff443677a123528c21750da714a589fd8c06a",
+    "pages": 1
+  },
+  "04_RELEVE_BANCAIRE_AOUT_2026.pdf": {
+    "sha256": "9cd1167f62b91458c8302e2bd9bb3ab6ca20d4eed0854144935a3f7f5dbbe464",
+    "pages": 1
+  },
+  "05_AVIS_PENALITE_DGI_PEN-2026-044.pdf": {
+    "sha256": "84c20715c0e25f841f616a1a43e7664662c43454a60b9195dad6203235d3c99f",
+    "pages": 1
+  },
+  "06_FACTURE_IMPORT_COMMERCIAL_INVOICE_CI-2026-045.pdf": {
+    "sha256": "70528b9ba0da106d9046cd786a0221ec58bc05a44d132c9931e464b2be767757",
+    "pages": 1
+  },
+  "07_FACTURE_EXPORT_EXP-2026-019.pdf": {
+    "sha256": "cdd6816c41851539e54a7976375678d52580c9fb72a8d14cd5e159d9d80034bd",
+    "pages": 1
+  },
+  "08_AVOIR_AV-2026-003_VALIDATION_REQUISE.pdf": {
+    "sha256": "73524e4939e598ef7308a7e33025371d46054b467cda09ee89bb26c073183bfa",
+    "pages": 1
+  },
+  "09_FACTURE_ANOMALIE_FAC-TEST-2026-003_VALIDATION_REQUISE.pdf": {
+    "sha256": "1190ce77affc58b939e6036cc2b942bca283d283636b66725ca846f9ceb3239f",
+    "pages": 1
+  },
+  "10_FACTURE_ICE_MANQUANT_FAC-TEST-2026-004_VALIDATION_REQUISE.pdf": {
+    "sha256": "d7fcfc992ff748debfd17c4bf81ea9a46e3d3afe81c8d807c5fdf836d529f19d",
+    "pages": 1
+  },
+  "11_RECU_PAIEMENT_REC-2026-017.pdf": {
+    "sha256": "197a90671d60c8bf5385da63ee418d71ad4f203c573f70c8bd13ee78bc64add7",
+    "pages": 1
+  },
+  "12_BON_COMMANDE_BC-2026-021.pdf": {
+    "sha256": "4669223609376fd31600382c326feaf3983708963446e13b23b7072ea73704c5",
+    "pages": 1
+  }
+}

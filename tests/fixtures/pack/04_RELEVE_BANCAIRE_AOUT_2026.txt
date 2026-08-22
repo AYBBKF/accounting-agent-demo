@@ -1,0 +1,65 @@
+PACK DE TEST COMPTABLE - X BLASTE
+DOCUMENT FICTIF - TEST
+Données entièrement fictives - Ne pas utiliser comme justificatif réel
+Page 1
+Banque : BANQUE DEMO DU MAROC
+Agence : Casablanca Centre
+Document : Relevé de compte fictif
+ RELEVÉ
+BANCAIRE
+ Titulaire : X BLASTE
+Compte : MA64 0000 0000 0000 0000 0000 000
+Période : 01/08/2026 au 31/08/2026
+Référence : REL-AOUT-2026
+ 
+Solde d'ouverture
+24 800.00 MAD
+Total débits
+8 049.00 MAD
+Total crédits
+18 000.00 MAD
+Solde de clôture
+34 751.00 MAD
+Mouvements du compte
+Date
+ Libellé
+ Débit
+Crédit
+Solde
+01/08/2026
+SOLDE INITIAL
+24 800.00
+ MAD
+ 
+05/08/2026
+VIR CLINIQUE AL AMAL - FAC-VTE-2026-010
+14 400.00
+ MAD
+ 39 200.00
+ MAD
+ 
+08/08/2026
+VIR ATLAS BUREAU - FAC-TEST-2026-002
+7 500.00 MAD
+31 700.00
+ MAD
+ 
+12/08/2026
+FRAIS BANCAIRES
+99.00 MAD
+31 601.00
+ MAD
+ 
+18/08/2026
+PAIEMENT DGI - PEN-2026-044
+450.00 MAD
+31 151.00
+ MAD
+ 
+22/08/2026
+VIR CLIENT OASIS CONSEIL
+3 600.00 MAD
+34 751.00
+ MAD
+ 
+Toutes les coordonnées bancaires et opérations de ce relevé sont fictives.
