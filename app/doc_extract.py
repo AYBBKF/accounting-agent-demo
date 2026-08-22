@@ -1,0 +1,832 @@
+"""Extraction structuree d'un document, avec provenance de chaque montant.
+
+Regles non negociables :
+
+  - aucun montant n'est invente ni recalcule par un modele de langage ;
+  - tous les calculs et controles sont faits en `Decimal` ;
+  - chaque montant conserve sa valeur, sa devise, le libelle source, la page
+    et un niveau de confiance ;
+  - une valeur DEDUITE (jamais lue telle quelle dans le document) porte le
+    drapeau `inferred=True` et doit etre presentee comme deduite.
+
+La couche texte des PDF du client coupe les valeurs sur plusieurs lignes :
+un montant peut etre suivi de sa devise sur la ligne suivante
+("24 800.00" puis " MAD"). Une passe de normalisation recolle ces lignes
+avant toute analyse.
+"""
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from datetime import date
+from decimal import Decimal, InvalidOperation
+
+from app.doc_types import (
+    BANK_STATEMENT,
+    EXPORT_INVOICE,
+    IMPORT_INVOICE,
+    PAYMENT_RECEIPT,
+    PENALTY_NOTICE,
+    SIGNED_NEGATIVE_TYPES,
+    Classification,
+    classify,
+    normalize,
+)
+
+
+class DocumentExtractError(RuntimeError):
+    """Document sans couche texte exploitable, meme apres OCR."""
+
+
+# Devises reconnues. Le code seul sur une ligne est recolle a la precedente.
+CURRENCIES = ("MAD", "EUR", "USD", "GBP", "CHF", "DH", "DHS")
+_CURRENCY_ONLY_RE = re.compile(rf"^\s*({'|'.join(CURRENCIES)})\s*$", re.I)
+_AMOUNT_RE = re.compile(
+    rf"(-?\d[\d\s  .,]*\d|-?\d)\s*({'|'.join(CURRENCIES)})?\b", re.I
+)
+_PURE_AMOUNT_RE = re.compile(
+    rf"^[\s  ]*-?\d[\d\s  .,]*(?:\s*(?:{'|'.join(CURRENCIES)}))?[\s]*$",
+    re.I,
+)
+_DATE_RE = re.compile(r"\b(\d{2})[/\-.](\d{2})[/\-.](\d{4})\b")
+_ISO_DATE_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
+_ICE_RE = re.compile(r"\bICE\s*:?\s*([0-9]{6,20})\b", re.I)
+
+
+@dataclass
+class Line:
+    """Une ligne de texte et la page dont elle provient."""
+
+    page: int
+    text: str
+
+    @property
+    def norm(self) -> str:
+        return normalize(self.text)
+
+
+@dataclass
+class Amount:
+    """Un montant et sa provenance complete."""
+
+    value: Decimal
+    currency: str
+    label: str                  # libelle source, tel qu'ecrit dans le document
+    page: int
+    confidence: float = 1.0
+    inferred: bool = False      # True = valeur deduite, jamais lue telle quelle
+
+    def signed(self, negative: bool) -> "Amount":
+        """Meme montant, force en negatif (avoirs) ou positif."""
+        magnitude = abs(self.value)
+        return Amount(
+            value=-magnitude if negative else magnitude,
+            currency=self.currency, label=self.label, page=self.page,
+            confidence=self.confidence, inferred=self.inferred,
+        )
+
+
+@dataclass
+class DocumentLine:
+    """Ligne de detail d'un document (facture, devis, bon de commande)."""
+
+    description: str
+    quantite: Decimal | None
+    prix_unitaire: Decimal | None
+    taux_tva: Decimal | None
+    total: Decimal | None
+    devise: str = ""
+    hs_code: str = ""
+
+
+@dataclass
+class BankLine:
+    """Operation d'un releve bancaire.
+
+    Le sens (debit/credit) n'est jamais devine a partir d'une position de
+    colonne - la couche texte ne la conserve pas. Il est deduit de la
+    VARIATION DU SOLDE, puis recoupe avec le montant lu.
+    """
+
+    date_operation: date | None
+    libelle: str
+    reference: str
+    debit: Decimal | None
+    credit: Decimal | None
+    solde: Decimal | None
+    devise: str
+    page: int
+    inferred_direction: bool = False
+
+
+@dataclass
+class ExtractedDocument:
+    """Tout ce qui a pu etre lu, plus ce qui manque et ce qui cloche."""
+
+    classification: Classification
+    text_source: str = "native"          # "native" ou "ocr"
+    pages: int = 1
+
+    numero: str | None = None
+    date_document: date | None = None
+    date_echeance: date | None = None
+
+    emetteur: str | None = None
+    emetteur_ice: str | None = None
+    destinataire: str | None = None
+    destinataire_ice: str | None = None
+
+    montant_ht: Amount | None = None
+    montant_tva: Amount | None = None
+    montant_ttc: Amount | None = None
+    montant_paye: Amount | None = None
+    frais_annexes: Amount | None = None      # fret, assurance a l'import
+    taux_tva: Decimal | None = None
+    devise: str = ""
+
+    statut: str | None = None
+    mode_paiement: str | None = None
+    facture_liee: str | None = None
+    motif: str = ""
+
+    # Commerce international
+    incoterm: str = ""
+    pays_origine: str = ""
+    pays_destination: str = ""
+
+    lignes: list[DocumentLine] = field(default_factory=list)
+    bank_lines: list[BankLine] = field(default_factory=list)
+
+    missing: list[str] = field(default_factory=list)
+    anomalies: list[str] = field(default_factory=list)
+    ambigus: list[str] = field(default_factory=list)
+
+    @property
+    def doc_type(self) -> str:
+        return self.classification.doc_type
+
+    @property
+    def amounts(self) -> list[Amount]:
+        return [a for a in (self.montant_ht, self.montant_tva, self.montant_ttc,
+                            self.montant_paye) if a is not None]
+
+    @property
+    def confidence(self) -> float:
+        """Confiance globale : la plus faible du type et des montants."""
+        scores = [self.classification.confidence] + [a.confidence for a in self.amounts]
+        return min(scores) if scores else 0.0
+
+
+# --- primitives de lecture ------------------------------------------------
+
+def parse_money(text: str) -> tuple[Decimal, str] | None:
+    """Parse un montant et sa devise. Retourne None plutot que de deviner."""
+    if not text:
+        return None
+    m = _AMOUNT_RE.search(text.strip())
+    if not m:
+        return None
+    raw, currency = m.group(1), (m.group(2) or "").upper()
+    cleaned = re.sub(r"[\s  ]", "", raw)
+    if "," in cleaned and "." in cleaned:
+        if cleaned.rfind(",") > cleaned.rfind("."):
+            cleaned = cleaned.replace(".", "").replace(",", ".")
+        else:
+            cleaned = cleaned.replace(",", "")
+    elif "," in cleaned:
+        cleaned = (
+            cleaned.replace(",", ".") if re.search(r",\d{1,2}$", cleaned)
+            else cleaned.replace(",", "")
+        )
+    try:
+        return Decimal(cleaned), ("MAD" if currency in ("DH", "DHS") else currency)
+    except InvalidOperation:
+        return None
+
+
+def parse_date(text: str) -> date | None:
+    if not text:
+        return None
+    m = _DATE_RE.search(text)
+    if m:
+        try:
+            return date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+        except ValueError:
+            return None
+    m = _ISO_DATE_RE.search(text)
+    if m:
+        try:
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            return None
+    return None
+
+
+def build_lines(pages: list[str]) -> list[Line]:
+    """Texte par page -> lignes numerotees, devises recollees.
+
+    Un code devise seul sur sa ligne appartient au montant precedent : la
+    mise en page PDF les separe, pas le document.
+    """
+    lines: list[Line] = []
+    for page_no, page_text in enumerate(pages, start=1):
+        for raw in (page_text or "").splitlines():
+            if _CURRENCY_ONLY_RE.match(raw) and lines and lines[-1].page == page_no:
+                lines[-1].text = f"{lines[-1].text.rstrip()} {raw.strip().upper()}"
+                continue
+            lines.append(Line(page=page_no, text=raw))
+    return lines
+
+
+def is_amount_line(line: Line) -> bool:
+    return bool(_PURE_AMOUNT_RE.match(line.text))
+
+
+def strip_label(raw: str, label: str) -> str:
+    """Retire un libelle du DEBUT d'une ligne, accents compris.
+
+    Le retrait ne peut pas se faire par expression reguliere sur le texte
+    brut : "Numero de facture" ne matche pas "Numero de facture" accentue.
+    La normalisation preservant le decoupage en mots, on retire donc autant
+    de mots que le libelle en compte, puis la ponctuation residuelle et un
+    eventuel second libelle ("Client / Importer : X").
+    """
+    words = raw.strip().split()
+    label_words = normalize(label).split()
+    remainder = " ".join(words[len(label_words):]).strip()
+    remainder = re.sub(r"^[:/\-]\s*", "", remainder).strip()
+    remainder = re.sub(r"^[A-Za-zÀ-ſ]+\s*:\s*", "", remainder).strip()
+    return remainder
+
+
+def value_after(lines: list[Line], label: str) -> tuple[str, int] | None:
+    """Valeur associee a un libelle, avec la page ou elle a ete trouvee.
+
+    Gere les deux mises en page rencontrees : "Libelle : valeur" et
+    "Libelle" seul avec la valeur sur la ligne suivante non vide.
+    """
+    target = normalize(label)
+    for i, line in enumerate(lines):
+        n = line.norm
+        if n != target and not n.startswith(target + " ") and not n.startswith(target + ":"):
+            continue
+        remainder = strip_label(line.text, label)
+        if remainder:
+            return remainder, line.page
+        for nxt in lines[i + 1:]:
+            if nxt.text.strip():
+                return nxt.text.strip(), nxt.page
+        return None
+    return None
+
+
+def amount_after(lines: list[Line], label: str, *, last: bool = True) -> Amount | None:
+    """Montant associe a un libelle, avec sa provenance.
+
+    `last=True` prend la DERNIERE occurrence : dans un tableau, les totaux
+    figurent apres les lignes de detail.
+    """
+    target = normalize(label)
+    indexes = [i for i, l in enumerate(lines) if l.norm.startswith(target)]
+    if not indexes:
+        return None
+    for i in reversed(indexes) if last else indexes:
+        line = lines[i]
+        remainder = line.norm[len(target):]
+        if re.search(r"\d", remainder):
+            parsed = parse_money(remainder)
+            if parsed:
+                return Amount(parsed[0], parsed[1], line.text.strip(), line.page)
+        for nxt in lines[i + 1:]:
+            if not nxt.text.strip():
+                continue
+            if not is_amount_line(nxt):
+                break
+            parsed = parse_money(nxt.text)
+            if parsed:
+                return Amount(parsed[0], parsed[1], line.text.strip(), nxt.page)
+            break
+    return None
+
+
+def all_amounts_for(lines: list[Line], label: str) -> list[Decimal]:
+    """Valeurs distinctes proposees pour un meme libelle (detection d'ambiguite)."""
+    target = normalize(label)
+    found: list[Decimal] = []
+    for i, line in enumerate(lines):
+        if not line.norm.startswith(target):
+            continue
+        remainder = line.norm[len(target):]
+        parsed = parse_money(remainder) if re.search(r"\d", remainder) else None
+        if parsed is None:
+            for nxt in lines[i + 1:]:
+                if not nxt.text.strip():
+                    continue
+                parsed = parse_money(nxt.text) if is_amount_line(nxt) else None
+                break
+        if parsed and parsed[0] not in found:
+            found.append(parsed[0])
+    return found
+
+
+def party(lines: list[Line], labels: tuple[str, ...]) -> tuple[str | None, str | None, int]:
+    """(nom, ICE, page) d'une partie. L'ICE est celui du bloc, pas un autre."""
+    for i, line in enumerate(lines):
+        for label in labels:
+            target = normalize(label)
+            n = line.norm
+            if n != target and not n.startswith(target + " :") and not n.startswith(target + " "):
+                continue
+            name = strip_label(line.text, label)
+            if not name:
+                for nxt in lines[i + 1:]:
+                    if nxt.text.strip():
+                        name = nxt.text.strip()
+                        break
+            ice = None
+            for nxt in lines[i + 1:i + 8]:
+                m = _ICE_RE.search(nxt.text)
+                if m:
+                    ice = m.group(1)
+                    break
+                if any(normalize(nxt.text).startswith(normalize(l)) for l in
+                       ("CLIENT", "FOURNISSEUR", "EMETTEUR", "ACHETEUR", "IMPORTER",
+                        "BENEFICIAIRE", "EXPORTER")):
+                    break
+            return (name or None), ice, line.page
+    return None, None, 1
+
+
+# --- lignes de detail -----------------------------------------------------
+
+_COLUMN_ALIASES = {
+    "DESIGNATION": "description", "DESCRIPTION": "description",
+    "QTE": "quantite", "QTY": "quantite", "QUANTITE": "quantite",
+    "PRIX UNITAIRE HT": "prix_unitaire", "PRIX UNITAIRE": "prix_unitaire",
+    "UNIT PRICE": "prix_unitaire",
+    "MONTANT HT": "total", "MONTANT": "total", "AMOUNT": "total",
+    "TOTAL HT": "total", "TOTAL": "total",
+    "TVA": "taux_tva",
+    "HS CODE": "hs_code", "CODE SH": "hs_code",
+}
+_TOTALS_PREFIXES = (
+    "TOTAL", "SOUS TOTAL", "SOUS-TOTAL", "TVA", "GOODS VALUE", "FREIGHT",
+    "MONTANT TOTAL", "NET A PAYER", "PENALITE", "MAJORATION",
+)
+
+
+def extract_detail_lines(lines: list[Line]) -> list[DocumentLine]:
+    """Lignes du tableau de detail, pilotees par les en-tetes reels.
+
+    Le nombre de colonnes varie selon le document (4 pour une facture
+    nationale, 5 avec un code SH a l'import). Il est lu dans l'en-tete, pas
+    suppose. Toute ligne qui ne respecte pas le format arrete la lecture :
+    mieux vaut zero ligne qu'une ligne inventee.
+    """
+    start = None
+    columns: list[str] = []
+    for i, line in enumerate(lines):
+        if _COLUMN_ALIASES.get(line.norm) != "description":
+            continue
+        columns = ["description"]
+        j = i + 1
+        while j < len(lines):
+            role = _COLUMN_ALIASES.get(lines[j].norm)
+            if role is None:
+                break
+            columns.append(role)
+            j += 1
+        if len(columns) >= 3:
+            start = j
+            break
+        columns = []
+    if start is None or not columns:
+        return []
+
+    width = len(columns)
+    items: list[DocumentLine] = []
+    buffer: list[Line] = []
+    for line in lines[start:]:
+        if not line.text.strip():
+            continue
+        if not buffer and any(line.norm.startswith(p) for p in _TOTALS_PREFIXES):
+            break
+        buffer.append(line)
+        if len(buffer) < width:
+            continue
+        values = dict(zip(columns, buffer))
+        description = values["description"].text.strip()
+        qty = parse_money(values["quantite"].text) if "quantite" in values else None
+        unit = parse_money(values["prix_unitaire"].text) if "prix_unitaire" in values else None
+        total = parse_money(values["total"].text) if "total" in values else None
+        rate = None
+        if "taux_tva" in values:
+            m = re.search(r"(\d+(?:[.,]\d+)?)\s*%", values["taux_tva"].text)
+            rate = parse_money(m.group(1))[0] if m else None
+        if total is None:
+            break
+        items.append(
+            DocumentLine(
+                description=description,
+                quantite=qty[0] if qty else None,
+                prix_unitaire=unit[0] if unit else None,
+                taux_tva=rate,
+                total=total[0],
+                devise=total[1],
+                hs_code=values["hs_code"].text.strip() if "hs_code" in values else "",
+            )
+        )
+        buffer = []
+    return items
+
+
+def extract_vat(lines: list[Line]) -> tuple[Decimal | None, Amount | None]:
+    """(taux, montant) de TVA.
+
+    Piege reel du classeur client : le libelle du total de TVA porte deja le
+    taux ("TVA 20 %"). Lire le premier nombre de cette ligne donnerait un
+    montant de TVA de 20,00 MAD. Le taux est donc extrait, puis EXCLU, et le
+    montant est cherche sur la ligne suivante.
+    """
+    rate: Decimal | None = None
+    amount: Amount | None = None
+    for i, line in enumerate(lines):
+        m = re.match(r"^TVA\s*(\d+(?:[.,]\d+)?)\s*%\s*(.*)$", line.norm)
+        if not m:
+            continue
+        parsed_rate = parse_money(m.group(1))
+        if parsed_rate:
+            rate = parsed_rate[0]
+        trailing = m.group(2)
+        if re.search(r"\d", trailing):
+            parsed = parse_money(trailing)
+            if parsed:
+                amount = Amount(parsed[0], parsed[1], line.text.strip(), line.page)
+        if amount is None:
+            for nxt in lines[i + 1:]:
+                if not nxt.text.strip():
+                    continue
+                if is_amount_line(nxt):
+                    parsed = parse_money(nxt.text)
+                    if parsed:
+                        amount = Amount(parsed[0], parsed[1], line.text.strip(), nxt.page)
+                break
+        break
+    if amount is None:
+        amount = amount_after(lines, "TVA")
+        if amount is not None and rate is not None and abs(amount.value) == rate:
+            # On a relu le taux, pas un montant : on prefere ne rien affirmer.
+            amount = None
+    return rate, amount
+
+
+# --- releve bancaire ------------------------------------------------------
+
+def extract_bank_lines(lines: list[Line], devise: str) -> tuple[list[BankLine], list[str]]:
+    """Operations d'un releve bancaire, sens deduit de la variation du solde.
+
+    La couche texte ne conserve pas les colonnes : impossible de savoir si
+    "7 500.00 MAD" est un debit ou un credit par sa position. Le sens est
+    donc calcule a partir du solde courant, puis RECOUPE avec le montant lu.
+    Si les deux ne concordent pas, la ligne est signalee plutot que devinee.
+    """
+    anomalies: list[str] = []
+    entries: list[BankLine] = []
+    blocks: list[tuple[Line, list[Line]]] = []
+    current: tuple[Line, list[Line]] | None = None
+    for line in lines:
+        if not line.text.strip():
+            continue
+        if _DATE_RE.fullmatch(line.text.strip()):
+            if current:
+                blocks.append(current)
+            current = (line, [])
+        elif current is not None:
+            current[1].append(line)
+    if current:
+        blocks.append(current)
+
+    previous_balance: Decimal | None = None
+    for date_line, body in blocks:
+        operation_date = parse_date(date_line.text)
+        amounts = [parse_money(l.text) for l in body if is_amount_line(l)]
+        amounts = [a for a in amounts if a is not None]
+        labels = [l.text.strip() for l in body if not is_amount_line(l)]
+        if not amounts:
+            continue
+        libelle = labels[0] if labels else ""
+        balance = amounts[-1][0]
+        currency = next((a[1] for a in amounts if a[1]), devise)
+
+        debit = credit = None
+        inferred = False
+        if len(amounts) >= 2:
+            movement = amounts[-2][0]
+            if previous_balance is None:
+                anomalies.append(
+                    f"operation du {operation_date} sans solde de depart connu : sens non determine"
+                )
+            else:
+                delta = balance - previous_balance
+                inferred = True
+                if abs(delta) != abs(movement):
+                    anomalies.append(
+                        f"operation du {operation_date} : mouvement lu {movement} "
+                        f"incoherent avec la variation de solde {delta}"
+                    )
+                elif delta > 0:
+                    credit = abs(movement)
+                elif delta < 0:
+                    debit = abs(movement)
+        previous_balance = balance
+
+        reference = ""
+        m = re.search(r"\b([A-Z]{2,}[-_][A-Z0-9\-_]+)\b", libelle)
+        if m:
+            reference = m.group(1)
+        entries.append(
+            BankLine(
+                date_operation=operation_date, libelle=libelle, reference=reference,
+                debit=debit, credit=credit, solde=balance, devise=currency,
+                page=date_line.page, inferred_direction=inferred,
+            )
+        )
+    return entries, anomalies
+
+
+def check_bank_totals(doc: "ExtractedDocument", lines: list[Line]) -> list[str]:
+    """Recoupe les lignes extraites avec les totaux annonces par le releve."""
+    problems: list[str] = []
+    declared_debit = amount_after(lines, "Total debits")
+    declared_credit = amount_after(lines, "Total credits")
+    closing = amount_after(lines, "Solde de cloture")
+    total_debit = sum((l.debit for l in doc.bank_lines if l.debit), Decimal("0"))
+    total_credit = sum((l.credit for l in doc.bank_lines if l.credit), Decimal("0"))
+    if declared_debit and total_debit != abs(declared_debit.value):
+        problems.append(
+            f"total des debits extraits {total_debit} != total annonce {declared_debit.value}"
+        )
+    if declared_credit and total_credit != abs(declared_credit.value):
+        problems.append(
+            f"total des credits extraits {total_credit} != total annonce {declared_credit.value}"
+        )
+    if closing and doc.bank_lines:
+        last = doc.bank_lines[-1].solde
+        if last is not None and last != closing.value:
+            problems.append(
+                f"dernier solde extrait {last} != solde de cloture annonce {closing.value}"
+            )
+    return problems
+
+
+# --- orchestration --------------------------------------------------------
+
+# Champs sans lesquels on refuse d'ecrire quoi que ce soit, par type.
+REQUIRED_FIELDS = {
+    "facture_achat": ("numero", "date_document", "emetteur", "montant_ht", "montant_ttc"),
+    "facture_vente": ("numero", "date_document", "destinataire", "montant_ht", "montant_ttc"),
+    "avoir_fournisseur": ("numero", "date_document", "emetteur", "montant_ttc"),
+    "avoir_client": ("numero", "date_document", "destinataire", "montant_ttc"),
+    "facture_import": ("numero", "date_document", "emetteur", "montant_ttc"),
+    "facture_export": ("numero", "date_document", "destinataire", "montant_ttc"),
+    "avis_penalite": ("numero", "date_document", "montant_ttc", "date_echeance"),
+    "recu_paiement": ("numero", "date_document", "montant_paye"),
+    "releve_bancaire": ("date_document",),
+    "devis": ("numero", "date_document"),
+    "bon_commande": ("numero", "date_document"),
+    "bon_livraison": ("numero", "date_document"),
+    "inconnu": (),
+}
+
+_NUMBER_LABELS = (
+    "Numero de facture", "Numero du recu", "Numero d'avoir", "Numero de devis",
+    "Numero de commande", "Numero export", "Invoice number", "Numero de bon",
+    "Reference",
+)
+_DATE_LABELS = (
+    "Date de facture", "Date de paiement", "Date de l'avis", "Invoice date",
+    "Date",
+)
+_DUE_LABELS = (
+    "Date limite de paiement", "Echeance", "Date d'echeance", "Due date",
+)
+
+# Le montant total ne porte pas le meme libelle selon le document.
+# Le libelle "Total" seul est volontairement absent : sur un releve
+# bancaire il attraperait "Total credits" et inventerait un TTC.
+_TTC_LABELS = {
+    "facture_import": ("Total CIF", "Total amount"),
+    "facture_export": ("Total export",),
+    "avis_penalite": ("Total a payer", "Net a payer"),
+    "recu_paiement": ("Montant paye",),
+}
+_DEFAULT_TTC_LABELS = ("Total TTC", "Total toutes taxes", "Net a payer")
+_HT_LABELS = {
+    "facture_import": ("Goods value", "Total HT", "Total hors taxes"),
+    "facture_export": ("Total hors taxes", "Total HT"),
+}
+
+
+def _first_amount(lines: list[Line], labels: tuple[str, ...]) -> Amount | None:
+    for label in labels:
+        found = amount_after(lines, label)
+        if found is not None:
+            return found
+    return None
+
+
+def _first_value(lines: list[Line], labels: tuple[str, ...]) -> tuple[str, int] | None:
+    for label in labels:
+        found = value_after(lines, label)
+        if found is not None:
+            return found
+    return None
+
+
+def extract_document(
+    pages: list[str], *, company: str = "X BLASTE", text_source: str = "native"
+) -> ExtractedDocument:
+    """Classe puis extrait un document. Ne devine jamais un montant absent."""
+    joined = "\n".join(pages)
+    if not joined.strip():
+        raise DocumentExtractError(
+            "Aucune couche texte exploitable dans ce document, meme apres OCR."
+        )
+    classification = classify(joined, company=company)
+    lines = build_lines(pages)
+    doc = ExtractedDocument(
+        classification=classification, text_source=text_source, pages=len(pages)
+    )
+    kind = classification.doc_type
+
+    # --- identite -------------------------------------------------------
+    numero = _first_value(lines, _NUMBER_LABELS)
+    if numero:
+        doc.numero = numero[0].split()[0] if numero[0] else None
+    found_date = _first_value(lines, _DATE_LABELS)
+    doc.date_document = parse_date(found_date[0]) if found_date else None
+    due = _first_value(lines, _DUE_LABELS)
+    doc.date_echeance = parse_date(due[0]) if due else None
+
+    # --- parties --------------------------------------------------------
+    doc.emetteur, doc.emetteur_ice, _ = party(
+        lines, ("Fournisseur", "Emetteur", "Exporter", "Organisme", "Payeur", "Banque")
+    )
+    doc.destinataire, doc.destinataire_ice, _ = party(
+        lines, ("Client", "Acheteur", "Importer", "Beneficiaire", "Titulaire")
+    )
+    if kind in ("bon_commande",):
+        # Sur un bon de commande, l'acheteur est en tete et le fournisseur
+        # apres : les roles sont inverses par rapport a une facture.
+        doc.emetteur, doc.emetteur_ice, _ = party(lines, ("Fournisseur",))
+        doc.destinataire, doc.destinataire_ice, _ = party(lines, ("Acheteur", "Client"))
+
+    # --- montants -------------------------------------------------------
+    if kind != BANK_STATEMENT:
+        # Un releve n'a ni HT ni TTC : ses propres totaux sont controles
+        # separement par check_bank_totals.
+        doc.montant_ht = _first_amount(
+            lines, _HT_LABELS.get(kind, ("Total HT", "Total hors taxes"))
+        )
+        doc.montant_ttc = _first_amount(lines, _TTC_LABELS.get(kind, _DEFAULT_TTC_LABELS))
+    if kind == PAYMENT_RECEIPT:
+        doc.montant_paye = _first_amount(lines, ("Montant paye",))
+        doc.montant_ttc = doc.montant_paye
+    if kind in (IMPORT_INVOICE, EXPORT_INVOICE):
+        doc.frais_annexes = _first_amount(
+            lines, ("Freight and insurance", "Fret et assurance", "Frais annexes")
+        )
+
+    if kind != BANK_STATEMENT:
+        doc.taux_tva, doc.montant_tva = extract_vat(lines)
+
+    doc.devise = next(
+        (a.currency for a in doc.amounts if a.currency),
+        (parse_money(_first_value(lines, ("Devise", "Currency"))[0])[1]
+         if False else ""),
+    )
+    if not doc.devise:
+        explicit = _first_value(lines, ("Devise", "Currency"))
+        if explicit:
+            candidate = normalize(explicit[0]).split()[0] if explicit[0] else ""
+            if candidate in CURRENCIES:
+                doc.devise = "MAD" if candidate in ("DH", "DHS") else candidate
+
+    # --- divers ---------------------------------------------------------
+    statut = _first_value(lines, ("Statut",))
+    doc.statut = statut[0] if statut else None
+    mode = _first_value(lines, ("Mode de paiement", "Mode"))
+    doc.mode_paiement = mode[0] if mode else None
+    motif = _first_value(lines, ("Motif", "Objet", "Nature"))
+    doc.motif = motif[0] if motif else ""
+    linked = _first_value(lines, ("Facture reglee", "Facture d'origine", "Facture liee"))
+    if linked:
+        doc.facture_liee = linked[0].split()[0]
+
+    incoterm = _first_value(lines, ("Incoterm",))
+    doc.incoterm = incoterm[0] if incoterm else ""
+    origin = _first_value(lines, ("Country of origin", "Pays d'origine"))
+    doc.pays_origine = origin[0] if origin else ""
+    destination = _first_value(lines, ("Pays de destination", "Country of destination"))
+    doc.pays_destination = destination[0] if destination else ""
+
+    # --- contenu --------------------------------------------------------
+    if kind == BANK_STATEMENT:
+        doc.bank_lines, bank_anomalies = extract_bank_lines(lines, doc.devise or "MAD")
+        doc.anomalies.extend(bank_anomalies)
+        doc.anomalies.extend(check_bank_totals(doc, lines))
+        period = _first_value(lines, ("Periode",))
+        if period:
+            doc.date_document = parse_date(period[0]) or doc.date_document
+    else:
+        doc.lignes = extract_detail_lines(lines)
+
+    # --- signature des avoirs -------------------------------------------
+    if kind in SIGNED_NEGATIVE_TYPES:
+        for attr in ("montant_ht", "montant_tva", "montant_ttc"):
+            amount = getattr(doc, attr)
+            if amount is not None:
+                setattr(doc, attr, amount.signed(negative=True))
+
+    # --- controles deterministes ----------------------------------------
+    doc.missing = [
+        f for f in REQUIRED_FIELDS.get(kind, ()) if getattr(doc, f, None) is None
+    ]
+    for label, attr in (("Total HT", "montant_ht"), ("Total TTC", "montant_ttc")):
+        if len(all_amounts_for(lines, label)) > 1:
+            doc.ambigus.append(attr)
+
+    if doc.montant_ht and doc.montant_tva and doc.montant_ttc:
+        expected = doc.montant_ht.value + doc.montant_tva.value
+        if expected != doc.montant_ttc.value:
+            doc.anomalies.append(
+                f"HT + TVA = {expected} mais TTC indique = {doc.montant_ttc.value} "
+                f"(ecart {abs(expected - doc.montant_ttc.value)})"
+            )
+    if doc.lignes and doc.montant_ht is not None:
+        total_lignes = sum(
+            (abs(l.total) for l in doc.lignes if l.total is not None), Decimal("0")
+        )
+        if total_lignes != abs(doc.montant_ht.value):
+            doc.anomalies.append(
+                f"somme des lignes {total_lignes} != total HT {abs(doc.montant_ht.value)}"
+            )
+    if doc.date_document and doc.date_echeance and doc.date_echeance < doc.date_document:
+        doc.anomalies.append("la date d'echeance precede la date du document")
+
+    currencies = {a.currency for a in doc.amounts if a.currency}
+    if len(currencies) > 1:
+        doc.anomalies.append(f"plusieurs devises dans le meme document : {sorted(currencies)}")
+
+    return doc
+
+
+def extract_from_pdf_bytes(
+    data: bytes, *, company: str = "X BLASTE", ocr: bool = True
+) -> ExtractedDocument:
+    """Lit un PDF : couche texte native, puis OCR si elle est insuffisante."""
+    pages = read_pdf_pages(data)
+    source = "native"
+    if ocr and not _has_usable_text(pages):
+        ocr_pages = ocr_pdf_pages(data)
+        if _has_usable_text(ocr_pages):
+            pages, source = ocr_pages, "ocr"
+    return extract_document(pages, company=company, text_source=source)
+
+
+# Un PDF scanne renvoie quelques caracteres parasites : on exige un minimum
+# de texte reel avant de considerer la couche native comme exploitable.
+_MIN_USABLE_CHARS = 120
+
+
+def _has_usable_text(pages: list[str]) -> bool:
+    return sum(len((p or "").strip()) for p in pages) >= _MIN_USABLE_CHARS
+
+
+def read_pdf_pages(data: bytes) -> list[str]:
+    try:
+        from pypdf import PdfReader
+    except ImportError as exc:  # pragma: no cover - dependance manquante
+        raise DocumentExtractError(f"Dependance pypdf manquante: {exc}") from exc
+    import io
+
+    try:
+        reader = PdfReader(io.BytesIO(data))
+        return [(page.extract_text() or "") for page in reader.pages]
+    except Exception as exc:  # noqa: BLE001 - PDF corrompu / chiffre
+        raise DocumentExtractError("PDF illisible ou corrompu.") from exc
+
+
+def ocr_pdf_pages(data: bytes) -> list[str]:
+    """OCR de secours. Absence d'outil OCR = liste vide, jamais une exception :
+    le document partira simplement en validation humaine."""
+    try:
+        import pdf2image  # type: ignore
+        import pytesseract  # type: ignore
+    except ImportError:
+        return []
+    try:
+        images = pdf2image.convert_from_bytes(data, dpi=300)
+        return [pytesseract.image_to_string(img, lang="fra+eng") for img in images]
+    except Exception:  # noqa: BLE001 - OCR indisponible ou en echec
+        return []
