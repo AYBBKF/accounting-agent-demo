@@ -157,7 +157,8 @@ def test_watcher_uses_the_specified_query_and_client_user_id(watcher):
     _run_cycle(watcher, recorder)
     assert watcher.user_id == "telegram_999653395"
     query = dict(recorder.calls)["GMAIL_FETCH_EMAILS"]["query"]
-    assert query == 'subject:"[XBLASTE]" has:attachment filename:pdf'
+    assert query.startswith("in:inbox has:attachment filename:pdf")
+    assert " after:" in query, "le curseur doit borner la requete"
 
 
 def test_gmail_is_only_read_never_written(watcher):
@@ -455,8 +456,11 @@ def test_preview_shows_every_field_including_the_ice(watcher):
     assert "Rien n'a encore ete ecrit" in preview
 
 
+PARTIAL_INVOICE = "FACTURE\nDATE DE FACTURE\n21/08/2026\n TOTAL TTC\n 1 200.00 MAD\n"
+
+
 def test_preview_lists_missing_fields_when_extraction_is_partial(watcher):
-    outcome = _run_cycle(watcher, Recorder(), text="FACTURE\nDivers\nfin")[0]
+    outcome = _run_cycle(watcher, Recorder(), text=PARTIAL_INVOICE)[0]
     preview = build_preview(outcome.pending)
     assert "Champs introuvables" in preview
     assert "non devines" in preview
@@ -549,3 +553,121 @@ def test_watcher_is_disabled_without_a_configured_chat(db_path):
     assert GmailWatcher(api_key="k", chat_id=0, db_path=db_path).is_configured is False
     assert GmailWatcher(api_key="", chat_id=42, db_path=db_path).is_configured is False
     assert GmailWatcher(api_key="k", chat_id=42, db_path=db_path).is_configured is True
+
+
+# --- curseur Gmail durable ------------------------------------------------
+# La requete couvrant desormais toute la boite de reception, le curseur est le
+# seul garde-fou contre l'import de l'historique.
+
+def test_the_query_is_bounded_by_a_cursor(watcher):
+    recorder = Recorder()
+    _run_cycle(watcher, recorder)
+    query = dict(recorder.calls)["GMAIL_FETCH_EMAILS"]["query"]
+    assert query.startswith("in:inbox has:attachment filename:pdf after:")
+    epoch = int(query.rsplit("after:", 1)[1])
+    assert epoch > 1_600_000_000, "le curseur doit etre un epoch plausible"
+
+
+def test_the_cursor_is_frozen_at_first_start_and_survives_a_restart(db_path):
+    w1 = GmailWatcher(api_key="k", chat_id=999653395, db_path=db_path, spreadsheet_id="s")
+    first = w1.cursor_epoch()
+    # Nouveau watcher = redemarrage du conteneur.
+    w2 = GmailWatcher(api_key="k", chat_id=999653395, db_path=db_path, spreadsheet_id="s")
+    assert w2.cursor_epoch() == first
+    assert w2.effective_query().endswith(f"after:{first}")
+
+
+def test_each_client_has_its_own_cursor(db_path):
+    a = GmailWatcher(api_key="k", chat_id=111111, db_path=db_path)
+    b = GmailWatcher(api_key="k", chat_id=222222, db_path=db_path)
+    a.cursor_epoch()
+    b.cursor_epoch()
+    from app.db import connect
+
+    with connect(db_path) as conn:
+        chats = {r[0] for r in conn.execute("SELECT chat_id FROM gmail_cursor")}
+    assert chats == {"111111", "222222"}
+
+
+# --- reconnaissance de facture par le contenu -----------------------------
+
+QUOTE_PDF = (
+    "DEVIS\nN° DEV-2026-010\nDATE DE FACTURE\n21/08/2026\n"
+    " Total HT\n 1 000.00 MAD\n TOTAL TTC\n 1 200.00 MAD\n"
+)
+
+
+def test_a_pdf_that_is_not_an_invoice_is_ignored_without_writing_anything(watcher, db_path):
+    recorder = Recorder()
+    outcomes = _run_cycle(watcher, recorder, text=QUOTE_PDF)
+    assert outcomes == []
+    assert recorder.writes() == []
+    assert get_gmail_message(db_path, MESSAGE["messageId"])["status"] == "skipped"
+
+
+def test_a_non_invoice_pdf_is_not_retried_at_the_next_cycle(watcher):
+    _run_cycle(watcher, Recorder(), text=QUOTE_PDF)
+    second = Recorder()
+    assert _run_cycle(watcher, second, text=QUOTE_PDF) == []
+    assert second.writes() == []
+
+
+# --- reprise idempotente --------------------------------------------------
+
+class DriveDown(Recorder):
+    """Sheets fonctionne, Drive est indisponible."""
+
+    def __call__(self, slug, arguments):
+        if slug.startswith("GOOGLEDRIVE_"):
+            self.calls.append((slug, arguments))
+            raise GmailWatcherError("Drive indisponible")
+        return super().__call__(slug, arguments)
+
+
+def test_a_drive_failure_leaves_the_accounting_row_written_once(watcher, db_path):
+    recorder = DriveDown()
+    outcomes = _run_cycle(watcher, recorder)
+    # La ligne comptable est bien ecrite, une seule fois.
+    assert len(recorder.write_to("05_FACTURES_ACHATS!A14:J14")) == 1
+    # L'import n'est pas declare termine.
+    assert get_gmail_message(db_path, MESSAGE["messageId"])["status"] == "partial"
+    # Le client est informe que la comptabilite est juste, sans bouton a
+    # cliquer : il n'y a rien a decider, seulement un archivage a terminer.
+    assert len(outcomes) == 1
+    assert outcomes[0].needs_buttons is False
+    assert "enregistree dans le classeur" in outcomes[0].message
+    assert "archivage Drive incomplet" in outcomes[0].message
+    # Et surtout : pas de journal d'import tant que le lien Drive manque.
+    assert recorder.write_to("14_IMPORTS_LOG") == []
+
+
+def test_the_next_cycle_finishes_the_archiving_without_a_second_row(watcher, db_path):
+    _run_cycle(watcher, DriveDown())
+    second = Recorder()
+    outcomes = _run_cycle(watcher, second)
+
+    # AUCUNE nouvelle ecriture dans l'onglet des factures.
+    assert second.write_to("05_FACTURES_ACHATS") == [], "une deuxieme ligne a ete ecrite"
+    # Mais l'archivage et le journal sont bien termines.
+    assert [s for s in second.slugs if s == "GOOGLEDRIVE_UPLOAD_FROM_URL"]
+    log = second.write_to("14_IMPORTS_LOG")
+    assert len(log) == 1
+    assert "drive.google.com" in log[0]["values"][0][5]
+    assert get_gmail_message(db_path, MESSAGE["messageId"])["status"] == "confirmed"
+    assert len(outcomes) == 1 and outcomes[0].decision.action == "auto"
+
+
+def test_a_third_cycle_writes_nothing_at_all(watcher):
+    _run_cycle(watcher, DriveDown())
+    _run_cycle(watcher, Recorder())
+    third = Recorder()
+    outcomes = _run_cycle(watcher, third)
+    assert third.writes() == [], "polling suivant : plus aucune ecriture"
+    assert outcomes == []
+
+
+def test_the_detail_lines_are_never_written_twice_on_resume(watcher):
+    _run_cycle(watcher, DriveDown())
+    second = Recorder()
+    _run_cycle(watcher, second)
+    assert second.write_to("16_LIGNES_FACTURES") == []
