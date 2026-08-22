@@ -128,3 +128,62 @@ def test_parse_fr_date(raw, expected):
 @pytest.mark.parametrize("raw", ["", "pas une date", "32/13/2026"])
 def test_parse_fr_date_refuses_invalid_input(raw):
     assert parse_fr_date(raw) is None
+
+
+# --- ICE, lignes de detail, ambiguites ------------------------------------
+# Ajoutes pour l'import automatique : sans ICE fiable, aucun doublon ne peut
+# etre affirme et aucun fournisseur ne peut etre rattache.
+
+def test_the_supplier_ice_is_taken_from_the_issuer_block_not_the_client_one():
+    fields = extract_invoice_fields(REAL_PDF_TEXT)
+    assert fields.ice_fournisseur == "002345678000043"
+    assert fields.ice_client == "003456789000051"
+
+
+def test_no_ice_is_invented_when_the_document_has_none():
+    text = REAL_PDF_TEXT.replace("ICE: 002345678000043   IF: 18765432", "IF: 18765432")
+    fields = extract_invoice_fields(text)
+    assert fields.ice_fournisseur is None
+    assert fields.ice_client == "003456789000051"
+
+
+def test_detail_lines_are_extracted_with_exact_decimals():
+    from decimal import Decimal
+
+    lignes = extract_invoice_fields(REAL_PDF_TEXT).lignes
+    assert len(lignes) == 2
+    assert lignes[0].description == "Ramettes papier A4 premium"
+    assert lignes[0].quantite == Decimal("2")
+    assert lignes[0].prix_unitaire_ht == Decimal("750.00")
+    assert lignes[0].total_ht == Decimal("1500.00")
+    assert lignes[1].total_ht == Decimal("2500.00")
+    # Le total des lignes correspond au total HT annonce : aucune ligne perdue.
+    assert sum(l.total_ht for l in lignes) == Decimal("4000.00")
+
+
+def test_a_product_label_containing_a_digit_is_never_read_as_a_total():
+    # "Ramettes papier A4 premium" ne doit jamais devenir un montant de 4.
+    fields = extract_invoice_fields(REAL_PDF_TEXT)
+    from decimal import Decimal
+
+    assert fields.montant_ht == Decimal("4000.00")
+    assert "montant_ht" not in fields.ambigus
+
+
+def test_two_different_totals_are_reported_as_ambiguous():
+    text = REAL_PDF_TEXT.replace(
+        " TOTAL TTC\n 4 800.00 MAD", " TOTAL TTC\n 4 800.00 MAD\n TOTAL TTC\n 5 000.00 MAD"
+    )
+    assert "montant_ttc" in extract_invoice_fields(text).ambigus
+
+
+def test_a_clean_invoice_has_no_ambiguity_and_is_not_a_credit_note():
+    fields = extract_invoice_fields(REAL_PDF_TEXT)
+    assert fields.ambigus == []
+    assert fields.is_avoir is False
+    assert fields.needs_human_review is False
+
+
+def test_a_credit_note_is_flagged():
+    text = REAL_PDF_TEXT.replace("FACTURE\n", "FACTURE D AVOIR\n")
+    assert extract_invoice_fields(text).is_avoir is True
