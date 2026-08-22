@@ -256,6 +256,11 @@ class MailWorker:
 
     def process_once(self) -> list[MailSummary]:
         """Un tour de boucle : reprises d'abord, puis nouveaux emails."""
+        # Le schema doit exister AVANT la premiere lecture : au tout premier
+        # demarrage sur un volume neuf, la reprise s'executait avant que le
+        # pipeline (qui cree les tables paresseusement) n'ait ete construit,
+        # et le worker mourait sur "no such table: documents".
+        store.ensure_schema(self._db_path)
         summaries: list[MailSummary] = []
         resumed = self.finish_unfinished()
         if resumed:
