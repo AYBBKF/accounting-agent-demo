@@ -283,13 +283,22 @@ def build_import_log_row(
     piece_jointe: str = "",
     drive_lien: str = "",
     type_enregistrement: str = "Facture achat",
+    avertissements: tuple[str, ...] | list[str] = (),
+    en_attente: bool = False,
 ) -> list[object]:
     """Entree complete du journal d'import (6 colonnes reelles de l'onglet).
 
     Les informations Gmail et le lien Drive sont conserves dans le detail :
     l'onglet existant n'a que six colonnes et on ne modifie pas sa structure.
+
+    `en_attente` marque un document archive mais NON comptabilise : le
+    journal doit distinguer "importe" de "depose dans A verifier, ecriture
+    en attente de decision", sinon le client ne peut pas savoir ce qui
+    manque reellement a sa comptabilite.
     """
     detail_parts = [
+        "ECRITURE COMPTABLE EN ATTENTE DE VALIDATION" if en_attente else "",
+        *(f"Avertissement : {w}" for w in avertissements),
         f"Facture {numero}",
         f"Fournisseur {fournisseur} (ICE {ice})" if ice else f"Fournisseur {fournisseur}",
         f"HT {montant_ht} MAD" if montant_ht is not None else "",
