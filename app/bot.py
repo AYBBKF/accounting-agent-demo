@@ -121,9 +121,10 @@ accounting_agent = AccountingAgent(
 # ne puissent jamais diverger des libelles reels des boutons /connect.
 SERVICES_SUMMARY = ", ".join(label for _, _, label in SERVICES)
 
-# Worker Gmail : detecte les factures [XBLASTE] recues par email. Une facture
-# lisible, complete, coherente et non ambigue est importee automatiquement ;
-# seules les factures douteuses passent par les boutons de validation.
+# Worker Gmail : analyse les PDF joints aux emails recus depuis le demarrage
+# (curseur durable) et ne retient que ceux dont le CONTENU est une facture.
+# Une facture lisible, complete, coherente et non ambigue est importee
+# automatiquement ; seules les factures douteuses passent par les boutons.
 gmail_watcher = GmailWatcher(
     api_key=settings.composio_api_key,
     chat_id=settings.gmail_watch_chat_id,
