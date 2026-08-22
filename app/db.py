@@ -54,6 +54,15 @@ CREATE TABLE IF NOT EXISTS gmail_processed_emails (
     decided_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS invoice_fingerprints (
+    fingerprint TEXT PRIMARY KEY,
+    stable_id TEXT,
+    numero TEXT,
+    ice TEXT,
+    message_id TEXT,
+    created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS demo_reconciliations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     chat_id TEXT NOT NULL DEFAULT '',
@@ -226,4 +235,61 @@ def set_gmail_message_status(db_path: str, message_id: str, status: str) -> None
             "UPDATE gmail_processed_emails SET status = ?, decided_at = ? WHERE message_id = ?",
             (status, datetime.now(timezone.utc).isoformat(timespec="seconds"), message_id),
         )
+        conn.commit()
+
+
+# --- Empreintes de factures (anti-doublon metier) -------------------------
+# Cle : (ICE fournisseur + numero de facture). Le message_id Gmail ne suffit
+# pas : la meme facture peut arriver deux fois par deux emails differents
+# (renvoi, transfert), et ce serait alors une double ecriture comptable.
+
+def claim_invoice_fingerprint(
+    db_path: str,
+    fingerprint: str,
+    *,
+    stable_id: str = "",
+    numero: str = "",
+    ice: str = "",
+    message_id: str = "",
+) -> bool:
+    """Reserve une empreinte. True si elle est nouvelle, False si doublon.
+
+    Une empreinte vide (ICE ou numero manquant) n'est jamais reservee : sans
+    ICE, aucun doublon ne peut etre affirme avec certitude.
+    """
+    if not fingerprint:
+        return True
+    from datetime import datetime, timezone
+
+    with connect(db_path) as conn:
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO invoice_fingerprints "
+            "(fingerprint, stable_id, numero, ice, message_id, created_at) "
+            "VALUES (?,?,?,?,?,?)",
+            (
+                fingerprint, stable_id, numero, ice, message_id,
+                datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            ),
+        )
+        conn.commit()
+        return cur.rowcount == 1
+
+
+def get_invoice_fingerprint(db_path: str, fingerprint: str) -> dict[str, Any] | None:
+    if not fingerprint:
+        return None
+    with connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM invoice_fingerprints WHERE fingerprint = ?", (fingerprint,)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def release_invoice_fingerprint(db_path: str, fingerprint: str) -> None:
+    """Libere une empreinte reservee dont l'ecriture a finalement echoue."""
+    if not fingerprint:
+        return
+    with connect(db_path) as conn:
+        conn.execute("DELETE FROM invoice_fingerprints WHERE fingerprint = ?", (fingerprint,))
         conn.commit()
