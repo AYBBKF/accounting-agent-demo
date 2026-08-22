@@ -83,6 +83,29 @@ def parse_fr_date(text: str) -> date | None:
     return None
 
 
+# Une ligne qui ne contient QUE un montant (et eventuellement une devise).
+# Sert a ne jamais confondre un libelle contenant un chiffre ("Ramettes A4")
+# avec la valeur d'un total.
+_PURE_AMOUNT_LINE_RE = re.compile(
+    r"^[\s  ]*-?\d[\d\s  .,]*(?:\s*(?:MAD|EUR|USD|DH|DHS))?[\s]*$", re.I
+)
+
+
+def _is_pure_amount_line(line: str) -> bool:
+    return bool(_PURE_AMOUNT_LINE_RE.match(line))
+
+
+@dataclass
+class InvoiceLine:
+    """Ligne de detail d'une facture. Aucun champ n'est devine."""
+
+    description: str
+    quantite: Decimal
+    prix_unitaire_ht: Decimal
+    taux_tva: Decimal | None
+    total_ht: Decimal
+
+
 @dataclass
 class ExtractedInvoice:
     """Champs extraits d'une facture. Tout champ absent reste None."""
@@ -99,8 +122,15 @@ class ExtractedInvoice:
     devise: str = ""
     statut: str | None = None
     mode_paiement: str | None = None
+    ice_fournisseur: str | None = None
+    ice_client: str | None = None
+    lignes: list[InvoiceLine] = field(default_factory=list)
     missing: list[str] = field(default_factory=list)
     anomalies: list[str] = field(default_factory=list)
+    # Champs pour lesquels le PDF propose PLUSIEURS valeurs differentes :
+    # on ne tranche jamais tout seul, on demande une validation humaine.
+    ambigus: list[str] = field(default_factory=list)
+    is_avoir: bool = False
 
     @property
     def is_complete(self) -> bool:
@@ -108,7 +138,7 @@ class ExtractedInvoice:
 
     @property
     def needs_human_review(self) -> bool:
-        return bool(self.missing or self.anomalies)
+        return bool(self.missing or self.anomalies or self.ambigus or self.is_avoir)
 
 
 # Champs sans lesquels on refuse d'ecrire quoi que ce soit en comptabilite.
@@ -153,9 +183,121 @@ def _amount_after_label(lines: list[str], label: str) -> tuple[Decimal, str] | N
         if parsed and re.search(r"\d", after):
             return parsed
         for nxt in lines[i + 1:]:
-            if nxt.strip():
-                return parse_money(nxt)
+            if not nxt.strip():
+                continue
+            # Uniquement une ligne qui EST un montant : sinon on prendrait
+            # le "4" de "Ramettes papier A4" pour un total.
+            return parse_money(nxt) if _is_pure_amount_line(nxt) else None
     return None
+
+
+def _all_amounts_for_label(lines: list[str], label: str) -> list[Decimal]:
+    """Toutes les valeurs distinctes proposees par le PDF pour un libelle.
+
+    Sert uniquement a detecter l'ambiguite : si un document annonce deux
+    "TOTAL TTC" differents, aucune des deux n'est retenue sans validation.
+    """
+    target = _norm(label)
+    found: list[Decimal] = []
+    for i, line in enumerate(lines):
+        if not _norm(line).startswith(target):
+            continue
+        after = _norm(line)[len(target):]
+        parsed = parse_money(after) if re.search(r"\d", after) else None
+        if parsed is None:
+            for nxt in lines[i + 1:]:
+                if not nxt.strip():
+                    continue
+                parsed = parse_money(nxt) if _is_pure_amount_line(nxt) else None
+                break
+        if parsed is not None and parsed[0] not in found:
+            found.append(parsed[0])
+    return found
+
+
+_ICE_RE = re.compile(r"\bICE\s*[:\-]?\s*([0-9]{6,20})\b", re.I)
+_SUPPLIER_SECTIONS = ("EMETTEUR", "FOURNISSEUR", "VENDEUR")
+_CLIENT_SECTIONS = ("CLIENT", "DESTINATAIRE", "ACHETEUR")
+
+
+def extract_ices(lines: list[str]) -> tuple[str | None, str | None]:
+    """(ICE fournisseur, ICE client), rattaches a la section qui les precede.
+
+    Aucun ICE n'est attribue par defaut : si le document ne comporte pas de
+    section identifiable, les deux valeurs restent None et la facture partira
+    en validation humaine.
+    """
+    section: str | None = None
+    supplier: str | None = None
+    client: str | None = None
+    for line in lines:
+        normalized = _norm(line)
+        if normalized in _SUPPLIER_SECTIONS:
+            section = "supplier"
+            continue
+        if normalized in _CLIENT_SECTIONS:
+            section = "client"
+            continue
+        m = _ICE_RE.search(line)
+        if not m:
+            continue
+        value = m.group(1)
+        if section == "supplier" and supplier is None:
+            supplier = value
+        elif section == "client" and client is None:
+            client = value
+    return supplier, client
+
+
+_TABLE_HEADER_START = "DESCRIPTION"
+_TABLE_TOTALS_LABELS = ("TOTAL HT", "TOTAL", "SOUS TOTAL", "SOUS-TOTAL", "TOTAL TTC", "TVA")
+
+
+def extract_lines(lines: list[str]) -> list[InvoiceLine]:
+    """Lignes de detail du tableau de la facture.
+
+    Format attendu (une valeur par ligne dans la couche texte) :
+    description, quantite, prix unitaire, taux TVA, total HT. Toute ligne
+    qui ne respecte pas ce format arrete la lecture : mieux vaut zero ligne
+    qu'une ligne inventee.
+    """
+    start = None
+    for i, line in enumerate(lines):
+        if _norm(line) == _TABLE_HEADER_START:
+            for j in range(i + 1, min(i + 8, len(lines))):
+                if _norm(lines[j]) == "TOTAL HT":
+                    start = j + 1
+                    break
+            break
+    if start is None:
+        return []
+
+    items: list[InvoiceLine] = []
+    i = start
+    while i + 5 <= len(lines):
+        chunk = [c for c in lines[i:i + 5]]
+        if len(chunk) < 5:
+            break
+        if _norm(chunk[0]) in _TABLE_TOTALS_LABELS or _norm(chunk[0]).startswith("TOTAL"):
+            break
+        qte = parse_money(chunk[1]) if _is_pure_amount_line(chunk[1]) else None
+        pu = parse_money(chunk[2]) if _is_pure_amount_line(chunk[2]) else None
+        rate_match = re.search(r"(\d+(?:[.,]\d+)?)\s*%", chunk[3])
+        total = parse_money(chunk[4]) if _is_pure_amount_line(chunk[4]) else None
+        if qte is None or pu is None or total is None:
+            break
+        rate = parse_money(rate_match.group(1))[0] if rate_match else None
+        items.append(
+            InvoiceLine(
+                description=chunk[0].strip(),
+                quantite=qte[0],
+                prix_unitaire_ht=pu[0],
+                taux_tva=rate,
+                total_ht=total[0],
+            )
+        )
+        i += 5
+    return items
 
 
 def extract_invoice_fields(text: str) -> ExtractedInvoice:
@@ -216,6 +358,32 @@ def extract_invoice_fields(text: str) -> ExtractedInvoice:
     mode = re.search(r"Mode\s*:\s*(.+)", text)
     if mode:
         result.mode_paiement = mode.group(1).strip()
+
+    # --- identifiants fiscaux et lignes de detail -------------------------
+    result.ice_fournisseur, result.ice_client = extract_ices(lines)
+    result.lignes = extract_lines(lines)
+
+    # --- avoir / note de credit ------------------------------------------
+    normalized_text = _norm(text)
+    result.is_avoir = bool(
+        re.search(r"\bAVOIR\b|\bNOTE DE CREDIT\b|\bFACTURE D AVOIR\b", normalized_text)
+        or (result.montant_ttc is not None and result.montant_ttc < 0)
+    )
+
+    # --- ambiguites -------------------------------------------------------
+    # Un document qui annonce deux valeurs differentes pour un meme champ
+    # critique n'est jamais arbitre automatiquement.
+    for label, field_name in (("TOTAL HT", "montant_ht"), ("TOTAL TTC", "montant_ttc")):
+        if len(_all_amounts_for_label(lines, label)) > 1:
+            result.ambigus.append(field_name)
+    numeros = []
+    for pattern in (r"N[°ºo]\s*[:\-]?\s*([A-Z0-9][A-Z0-9\-_/]{3,})", r"\b(FAC[-_][A-Z0-9\-_]+)\b"):
+        for candidate in re.findall(pattern, text, re.I):
+            candidate = candidate.strip().upper()
+            if candidate not in numeros:
+                numeros.append(candidate)
+    if len(numeros) > 1:
+        result.ambigus.append("numero")
 
     # --- controles --------------------------------------------------------
     result.missing = [f for f in REQUIRED_FIELDS if getattr(result, f) is None]
