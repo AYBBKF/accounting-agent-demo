@@ -44,11 +44,14 @@ from app.db import (
     stable_invoice_id,
 )
 from app.demo_data import generate_demo_bank_statement, generate_demo_invoices
-from app.gmail_watcher import (
+from app.mail_worker import (
     CALLBACK_CONFIRM_PREFIX,
+    CALLBACK_KEY_LENGTH,
     CALLBACK_REFUSE_PREFIX,
-    GmailWatcher,
-    GmailWatcherError,
+    MailWorker,
+    MailWorkerError,
+    build_review_message,
+    build_summary,
 )
 from app.excel_report import build_excel_report
 from app.openai_client import OpenAIClientWrapper
@@ -121,11 +124,11 @@ accounting_agent = AccountingAgent(
 # ne puissent jamais diverger des libelles reels des boutons /connect.
 SERVICES_SUMMARY = ", ".join(label for _, _, label in SERVICES)
 
-# Worker Gmail : analyse les PDF joints aux emails recus depuis le demarrage
-# (curseur durable) et ne retient que ceux dont le CONTENU est une facture.
-# Une facture lisible, complete, coherente et non ambigue est importee
-# automatiquement ; seules les factures douteuses passent par les boutons.
-gmail_watcher = GmailWatcher(
+# Worker Gmail multi-documents : analyse toutes les pieces jointes des
+# emails recus depuis le curseur (PDF et ZIP), identifie le TYPE de chaque
+# document par son contenu, et le classe au bon endroit. Seuls les documents
+# reellement ambigus passent par les boutons de validation.
+mail_worker = MailWorker(
     api_key=settings.composio_api_key,
     chat_id=settings.gmail_watch_chat_id,
     db_path=settings.db_path,
@@ -288,7 +291,7 @@ def build_dispatcher() -> Dispatcher:
             "Bienvenue sur le bot de demo comptable.\n"
             "Toutes les donnees sont FICTIVES.\n"
             "Commandes: /help /demo_facture /demo_releve /tva /rapprochement /export "
-            "/demo_extraction /sheet /sync_sheet /dashboard /connect /status"
+            "/demo_extraction /sheet /sync_sheet /dashboard /reprocess /connect /status"
         )
 
     @dp.message(Command("help"))
@@ -303,6 +306,7 @@ def build_dispatcher() -> Dispatcher:
             "/sheet - lien vers le Google Sheet de suivi (si configure)\n"
             "/sync_sheet - resynchronise toutes les donnees de session vers le Sheet\n"
             "/dashboard - resume des KPI de la session en cours\n"
+            "/reprocess - relit les emails des N dernieres heures (defaut 24)\n"
             f"/connect - connecte TES comptes Google ({SERVICES_SUMMARY}) "
             "via un lien d'autorisation individuel\n"
             "/status - etat du bot + statut de tes connexions Google"
@@ -534,6 +538,28 @@ def build_dispatcher() -> Dispatcher:
             f"- needs_human_review: {outcome.needs_human_review}"
         )
 
+    @dp.message(Command("reprocess"))
+    async def cmd_reprocess(message: Message) -> None:
+        """Reprise volontaire : recule le curseur Gmail de N heures.
+
+        Les documents deja traites restent proteges par leur cle
+        d'idempotence : reculer le curseur fait RELIRE des emails, jamais
+        reecrire des lignes.
+        """
+        parts = (message.text or "").split()
+        try:
+            hours = max(1, min(720, int(parts[1]))) if len(parts) > 1 else 24
+        except ValueError:
+            await message.answer("Usage : /reprocess [heures] (defaut 24, maximum 720).")
+            return
+        floor = await asyncio.to_thread(mail_worker.rewind, hours)
+        await message.answer(
+            f"Curseur Gmail recule de {hours} h. Les emails recus depuis cette "
+            "date seront relus au prochain cycle ; les documents deja "
+            "enregistres ne seront pas reecrits.\n"
+            f"Nouvelle borne : {floor}"
+        )
+
     @dp.message(Command("export"))
     async def cmd_export(message: Message) -> None:
         chat_state = _DEMO_STATE.get(message.chat.id, {})
@@ -600,28 +626,28 @@ def build_dispatcher() -> Dispatcher:
         await message.answer(reply)
 
     @dp.callback_query(F.data.startswith(CALLBACK_CONFIRM_PREFIX))
-    async def cb_invoice_confirm(callback: CallbackQuery) -> None:
-        message_id = callback.data[len(CALLBACK_CONFIRM_PREFIX):]
+    async def cb_document_confirm(callback: CallbackQuery) -> None:
+        short_key = callback.data[len(CALLBACK_CONFIRM_PREFIX):]
         await callback.answer("Enregistrement en cours...")
-        logger.info("Confirmation d'ecriture recue (message=%s)", message_id)
+        logger.info("Validation recue (document=%s)", short_key)
         try:
             result = await asyncio.wait_for(
-                asyncio.to_thread(gmail_watcher.confirm, message_id),
+                asyncio.to_thread(mail_worker.confirm, short_key),
                 timeout=AGENT_TIMEOUT_SECONDS,
             )
         except asyncio.TimeoutError:
-            logger.warning("Ecriture trop longue (message=%s)", message_id)
+            logger.warning("Ecriture trop longue (document=%s)", short_key)
             await callback.message.answer(
                 "L'enregistrement a pris trop de temps. Rien n'est garanti ecrit : "
                 "verifie ton classeur avant de reessayer."
             )
             return
-        except GmailWatcherError as exc:
-            logger.warning("Ecriture impossible (message=%s): %s", message_id, exc)
+        except MailWorkerError as exc:
+            logger.warning("Ecriture impossible (document=%s): %s", short_key, exc)
             await callback.message.answer(f"Enregistrement impossible : {exc}")
             return
         except Exception:  # noqa: BLE001 - jamais de silence cote client
-            logger.exception("Erreur inattendue a l'ecriture (message=%s)", message_id)
+            logger.exception("Erreur inattendue a l'ecriture (document=%s)", short_key)
             await callback.message.answer(
                 "Une erreur interne est survenue pendant l'enregistrement. "
                 "L'incident est journalise ; verifie ton classeur avant de reessayer."
@@ -630,13 +656,13 @@ def build_dispatcher() -> Dispatcher:
         await callback.message.answer(result)
 
     @dp.callback_query(F.data.startswith(CALLBACK_REFUSE_PREFIX))
-    async def cb_invoice_refuse(callback: CallbackQuery) -> None:
-        message_id = callback.data[len(CALLBACK_REFUSE_PREFIX):]
-        await callback.answer("Facture refusee.")
-        logger.info("Refus recu (message=%s)", message_id)
+    async def cb_document_refuse(callback: CallbackQuery) -> None:
+        short_key = callback.data[len(CALLBACK_REFUSE_PREFIX):]
+        await callback.answer("Document refuse.")
+        logger.info("Refus recu (document=%s)", short_key)
         try:
-            result = await asyncio.to_thread(gmail_watcher.refuse, message_id)
-        except GmailWatcherError as exc:
+            result = await asyncio.to_thread(mail_worker.refuse, short_key)
+        except MailWorkerError as exc:
             await callback.message.answer(f"Refus impossible : {exc}")
             return
         await callback.message.answer(result)
@@ -644,15 +670,20 @@ def build_dispatcher() -> Dispatcher:
     return dp
 
 
-def invoice_keyboard(message_id: str) -> InlineKeyboardMarkup:
-    """Boutons de validation envoyes avec chaque apercu de facture."""
+def document_keyboard(doc_key: str) -> InlineKeyboardMarkup:
+    """Boutons envoyes avec les seuls documents reellement ambigus.
+
+    Telegram limite `callback_data` a 64 octets : on n'envoie que le prefixe
+    de la cle du document, suffisant pour le retrouver sans ambiguite.
+    """
+    short = doc_key[:CALLBACK_KEY_LENGTH]
     return InlineKeyboardMarkup(
         inline_keyboard=[[
             InlineKeyboardButton(
-                text="Confirmer l'ecriture", callback_data=f"{CALLBACK_CONFIRM_PREFIX}{message_id}"
+                text="Valider et enregistrer", callback_data=f"{CALLBACK_CONFIRM_PREFIX}{short}"
             ),
             InlineKeyboardButton(
-                text="Refuser", callback_data=f"{CALLBACK_REFUSE_PREFIX}{message_id}"
+                text="Refuser", callback_data=f"{CALLBACK_REFUSE_PREFIX}{short}"
             ),
         ]]
     )
@@ -663,7 +694,7 @@ async def _gmail_watch_loop(bot: Bot) -> None:
     factures certaines et notifie le client. Les boutons de validation ne
     sont joints que si un doute subsiste. Ne s'arrete jamais sur une erreur
     ponctuelle."""
-    if not settings.gmail_watch_enabled or not gmail_watcher.is_configured:
+    if not settings.gmail_watch_enabled or not mail_worker.is_configured:
         logger.info(
             "Worker Gmail desactive (GMAIL_WATCH_ENABLED=%s, chat_id=%s).",
             settings.gmail_watch_enabled, settings.gmail_watch_chat_id,
@@ -671,31 +702,32 @@ async def _gmail_watch_loop(bot: Bot) -> None:
         return
     logger.info(
         "Worker Gmail demarre (user=%s, intervalle=%ss, requete=%r).",
-        gmail_watcher.user_id, gmail_watcher.poll_seconds, gmail_watcher.query,
+        mail_worker.user_id, mail_worker.poll_seconds, mail_worker.query,
     )
     while True:
         try:
-            outcomes = await asyncio.to_thread(gmail_watcher.process_once)
-            for outcome in outcomes:
+            summaries = await asyncio.to_thread(mail_worker.process_once)
+            for summary in summaries:
                 await bot.send_message(
-                    chat_id=settings.gmail_watch_chat_id,
-                    text=outcome.message,
-                    reply_markup=(
-                        invoice_keyboard(outcome.pending.message_id)
-                        if outcome.needs_buttons else None
-                    ),
+                    chat_id=settings.gmail_watch_chat_id, text=build_summary(summary)
                 )
+                # Un message dedie, avec boutons, pour CHAQUE document
+                # reellement ambigu - et pour eux seuls.
+                for outcome in summary.to_review:
+                    await bot.send_message(
+                        chat_id=settings.gmail_watch_chat_id,
+                        text=build_review_message(outcome),
+                        reply_markup=document_keyboard(outcome.doc_key),
+                    )
                 logger.info(
-                    "Notification envoyee (message=%s, numero=%s, action=%s)",
-                    outcome.pending.message_id,
-                    outcome.pending.fields.numero,
-                    outcome.decision.action,
+                    "Email %s traite : %d document(s), %d a valider",
+                    summary.message_id, len(summary.outcomes), len(summary.to_review),
                 )
-        except GmailWatcherError as exc:
+        except MailWorkerError as exc:
             logger.warning("Cycle Gmail en echec: %s", exc)
         except Exception:  # noqa: BLE001 - la boucle ne doit jamais mourir
             logger.exception("Erreur inattendue dans le worker Gmail")
-        await asyncio.sleep(gmail_watcher.poll_seconds)
+        await asyncio.sleep(mail_worker.poll_seconds)
 
 
 async def _heartbeat_loop() -> None:
