@@ -101,6 +101,17 @@ logger = logging.getLogger("demo_bot.doc_pipeline")
 REMINDER_HOUR = "09:00:00"
 REMINDER_TIMEZONE = "Africa/Casablanca"
 
+# Dossier Drive ou atterrit tout document qui n'a pas produit d'ecriture
+# comptable : type non reconnu, ou decision humaine en attente. Le client
+# doit pouvoir ouvrir la piece immediatement, meme si sa comptabilisation
+# attend encore.
+REVIEW_DRIVE_FOLDER = "A verifier"
+
+# Marqueur ecrit dans la colonne ICE d'une fiche tiers creee sans ICE. Une
+# valeur explicite vaut mieux qu'une cellule vide : elle se filtre, elle se
+# retrouve, et elle dit ce qu'il reste a faire.
+ICE_TO_COMPLETE = "A completer"
+
 # Saut de ligne ecrit sans sequence d'echappement : le transport JSON des
 # outils de publication reinterprete les sequences d'echappement et
 # corromprait le fichier. Un module sans antislash traverse la chaine intact.
@@ -154,6 +165,11 @@ class DocumentOutcome:
     accounting: bool = False
     error: str = ""
     document: ExtractedDocument | None = None
+    # Signalements non bloquants (ICE a completer, champ secondaire absent).
+    warnings: list[str] = field(default_factory=list)
+    # Renseigne pour un document en attente de decision : il est deja
+    # archive, la seule chose qui manque est l'ecriture comptable.
+    pending_review: bool = False
 
     @property
     def type_label(self) -> str:
@@ -311,7 +327,20 @@ class DocumentPipeline:
             r for r in rows
             if wanted_name and len(r) > 1 and normalize(str(r[1])) == wanted_name
         ]
-        if by_name:
+        if not wanted_ice:
+            # Facture sans ICE. Le nom normalise devient le seul point
+            # d'ancrage : unique, on reutilise la fiche existante ; multiple,
+            # on demande, car imputer au mauvais tiers fausse la comptabilite.
+            if len(by_name) == 1:
+                return PartyMatch(
+                    str(by_name[0][0]).strip(), str(by_name[0][1]).strip(), existing=True
+                )
+            if len(by_name) > 1:
+                return PartyMatch(
+                    ambiguous=True,
+                    reason=f"{len(by_name)} tiers existants portent le nom '{name}'",
+                )
+        elif by_name:
             return PartyMatch(
                 ambiguous=True, reason="un tiers porte deja ce nom avec un autre ICE"
             )
@@ -427,6 +456,9 @@ class DocumentPipeline:
         attachment_id: str,
         source_url: str = "",
         forced: bool = False,
+        parent_attachment_id: str = "",
+        parent_filename: str = "",
+        local_path: str = "",
     ) -> DocumentOutcome:
         """Traite UN document de bout en bout, ou reprend la ou il en etait.
 
@@ -435,7 +467,16 @@ class DocumentPipeline:
         """
         user_id = f"telegram_{self._chat_id}"
         message_id = str(message.get("messageId") or message.get("id") or "")
-        doc_key = idempotency_key(user_id, message_id, attachment_id, file.sha256)
+        doc_key = idempotency_key(user_id, message_id, file.stable_ref, file.sha256)
+
+        # Un document deja connu garde SA cle, meme si la formule a change ou
+        # si Gmail a renvoye un autre `attachmentId` : le couple (email,
+        # empreinte du fichier) identifie la piece une fois pour toutes.
+        # Sans cela, chaque cycle recreait un document neuf, les boutons
+        # pointaient vers des cles mortes et les reprises n'aboutissaient pas.
+        known = store.find_by_message_and_sha(self._db, self._chat_id, message_id, file.sha256)
+        if known is not None:
+            doc_key = known["doc_key"]
         outcome = DocumentOutcome(doc_key=doc_key, filename=file.display_name)
 
         existing = store.get_document(self._db, doc_key)
@@ -455,6 +496,21 @@ class DocumentPipeline:
                 gmail_message_id=message_id, attachment_id=attachment_id,
                 file_sha256=file.sha256, filename=file.filename,
                 container=file.container,
+                parent_attachment_id=parent_attachment_id or attachment_id,
+                parent_filename=parent_filename or file.container or file.filename,
+                member_path=file.member_path, local_path=local_path,
+            )
+        else:
+            # Reprise : on rafraichit ce qui a pu changer cote Gmail
+            # (identifiants volatils) et ce qui a pu manquer aux versions
+            # precedentes du bot (chemin interne, copie locale).
+            store.update_document(
+                self._db, doc_key,
+                attachment_id=attachment_id,
+                parent_attachment_id=parent_attachment_id or attachment_id,
+                parent_filename=parent_filename or file.container or file.filename,
+                member_path=file.member_path,
+                local_path=local_path or existing.get("local_path") or "",
             )
         store.set_state(self._db, doc_key, store.DOWNLOADED)
 
@@ -509,7 +565,10 @@ class DocumentPipeline:
             doc.emetteur_ice if is_purchase_side(doc.doc_type) else doc.destinataire_ice
         )
         party_name = doc.emetteur if is_purchase_side(doc.doc_type) else doc.destinataire
-        if needs_party and party_ice:
+        # La resolution ne depend plus de la presence d'un ICE : un nom
+        # lisible suffit a retrouver ou creer une fiche. Auparavant, une
+        # facture sans ICE n'avait tout simplement pas de tiers.
+        if needs_party and (party_ice or (party_name or "").strip()):
             party = self.resolve_party(party_tab, party_ice, party_name)
 
         # --- rapprochement d'un recu ---------------------------------------
@@ -534,6 +593,7 @@ class DocumentPipeline:
             decision = Decision(action=ACTION_AUTO, reasons=decision.reasons)
         outcome.action = decision.action
         outcome.reasons = list(decision.reasons)
+        outcome.warnings = list(decision.warnings)
         outcome.tiers = party.name or party_name or ""
 
         if decision.action == ACTION_DUPLICATE:
@@ -544,25 +604,18 @@ class DocumentPipeline:
             return outcome
 
         if decision.action == ACTION_REVIEW:
-            store.update_document(
-                self._db, doc_key, state=store.NEEDS_REVIEW,
-                payload=json.dumps({"reasons": decision.reasons}, ensure_ascii=False),
-            )
+            # Le document est ARCHIVE tout de suite, meme si sa
+            # comptabilisation attend une decision : le client doit pouvoir
+            # ouvrir la piece sans rouvrir sa boite mail. Seule la ligne
+            # comptable manque, et le journal le dit.
+            outcome.pending_review = True
+            self._park(outcome, doc, file, message, source_url, store.NEEDS_REVIEW,
+                       payload=json.dumps({"reasons": decision.reasons}, ensure_ascii=False))
             return outcome
 
         if decision.action == ACTION_UNKNOWN:
-            # Aucune ecriture : le document part dans la zone "A verifier".
-            try:
-                outcome.drive_link = self.archive(
-                    file, route.drive_folder, (doc.date_document or date.today()).year,
-                    source_url,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Archivage 'A verifier' impossible: %s", exc)
-            store.update_document(
-                self._db, doc_key, state=store.SKIPPED, drive_link=outcome.drive_link
-            )
-            self._safe_log(outcome, message)
+            # Aucune ecriture comptable : le document part dans "A verifier".
+            self._park(outcome, doc, file, message, source_url, store.SKIPPED)
             return outcome
 
         store.set_state(self._db, doc_key, store.VALIDATED)
@@ -669,8 +722,10 @@ class DocumentPipeline:
         if kind in (PURCHASE_INVOICE, SALES_INVOICE, IMPORT_INVOICE, EXPORT_INVOICE):
             if party.party_id and not party.existing:
                 ice = doc.emetteur_ice if is_purchase_side(kind) else doc.destinataire_ice
-                if ice or forced:
-                    self.create_party(party_tab, party, ice or "")
+                # Fiche provisoire quand l'ICE manque : l'identifiant interne
+                # existe, la comptabilite tient, et la colonne ICE porte ce
+                # qu'il reste a faire au lieu d'une cellule vide muette.
+                self.create_party(party_tab, party, ice or ICE_TO_COMPLETE)
             tab = TAB_PURCHASES if is_purchase_side(kind) else TAB_SALES
             outcome.stable_id, outcome.row_index = self.write_invoice(doc, party, tab)
             outcome.tab = tab
@@ -749,6 +804,57 @@ class DocumentPipeline:
             return
 
         raise PipelineError(f"Type '{kind}' sans regle d'ecriture.")
+
+    def _park(
+        self,
+        outcome: DocumentOutcome,
+        doc: ExtractedDocument,
+        file: DocumentFile,
+        message: dict[str, Any],
+        source_url: str,
+        state: str,
+        *,
+        payload: str = "",
+    ) -> None:
+        """Range un document SANS ecriture comptable : Drive puis journal.
+
+        Archivage et journal sont faits UNE SEULE FOIS. Un document en
+        attente de decision est reexamine a chaque cycle : sans ce garde-fou,
+        chaque tour de boucle deposait une copie de plus dans Drive et une
+        ligne de plus dans le journal d'import.
+        """
+        known = store.get_document(self._db, outcome.doc_key) or {}
+        outcome.drive_link = str(known.get("drive_link") or "")
+        if not outcome.drive_link:
+            outcome.drive_link = self._archive_for_review(
+                file, doc, source_url, outcome.doc_key
+            )
+        fields: dict[str, Any] = {"state": state, "drive_link": outcome.drive_link}
+        if payload:
+            fields["payload"] = payload
+        store.update_document(self._db, outcome.doc_key, **fields)
+        if not known.get("log_row"):
+            log_row = self._safe_log(outcome, message)
+            store.update_document(self._db, outcome.doc_key, log_row=log_row)
+
+    def _archive_for_review(
+        self, file: DocumentFile, doc: ExtractedDocument, source_url: str, doc_key: str
+    ) -> str:
+        """Depose une piece dans Drive / 'A verifier' et renvoie son lien.
+
+        Un echec d'archivage ne doit jamais faire disparaitre la demande de
+        validation : on journalise et on rend un lien vide.
+        """
+        try:
+            return self.archive(
+                file, REVIEW_DRIVE_FOLDER,
+                (doc.date_document or date.today()).year, source_url,
+            )
+        except Exception as exc:  # noqa: BLE001 - archivage non bloquant
+            logger.warning(
+                "Archivage 'A verifier' impossible (%s): %s", doc_key[:12], exc
+            )
+            return ""
 
     def _backfill(self, tab: str, row_index: int, columns: dict[str, str], value: str) -> None:
         """Reporte une valeur (lien Drive, evenement Calendar) dans la ligne
@@ -941,8 +1047,12 @@ class DocumentPipeline:
         row = build_import_log_row(
             horodatage=datetime.now(timezone.utc).isoformat(timespec="seconds"),
             stable_id=outcome.stable_id or outcome.doc_key[:12],
-            action="Cree",
-            statut=f"{outcome.type_label} - {outcome.action}",
+            action="A valider" if outcome.pending_review else "Cree",
+            statut=(
+                "Archive dans Drive / A verifier - ecriture en attente"
+                if outcome.pending_review
+                else f"{outcome.type_label} - {outcome.action}"
+            ),
             numero=outcome.numero or "",
             fournisseur=outcome.tiers,
             ice=(doc.emetteur_ice or doc.destinataire_ice or "") if doc else "",
@@ -957,6 +1067,8 @@ class DocumentPipeline:
             piece_jointe=outcome.filename,
             drive_lien=outcome.drive_link,
             type_enregistrement=outcome.type_label,
+            avertissements=tuple(outcome.warnings),
+            en_attente=outcome.pending_review,
         )
         index = self.next_row(TAB_IMPORTS_LOG)
         self._write(f"{TAB_IMPORTS_LOG}!A{index}:F{index}", [row])
