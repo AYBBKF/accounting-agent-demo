@@ -62,6 +62,81 @@ DEMO_SALES = [
     for i in range(1, 13)
 ]
 
+# Noms d'arguments REELLEMENT acceptes par chaque outil Composio, releves
+# sur les schemas publies. Le double de test les fait respecter : sans cela,
+# il accepte n'importe quel nom, les tests passent au vert, et la production
+# echoue a chaque appel. C'est exactement ce qui s'est produit sur les trois
+# outils Drive (`file_url` au lieu de `source_url`, etc.).
+TOOL_ARGUMENTS: dict[str, tuple[set[str], set[str]]] = {
+    # slug: (arguments obligatoires, arguments optionnels acceptes)
+    "GOOGLESHEETS_GET_SPREADSHEET_INFO": ({"spreadsheet_id"}, {"ranges"}),
+    "GOOGLESHEETS_BATCH_GET": (
+        {"spreadsheet_id", "ranges"},
+        {"valueRenderOption", "value_render_option", "majorDimension"},
+    ),
+    "GOOGLESHEETS_VALUES_UPDATE": (
+        {"spreadsheet_id", "range", "values"}, {"value_input_option"},
+    ),
+    "GOOGLESHEETS_ADD_SHEET": ({"spreadsheet_id", "title"}, {"force_unique"}),
+    "GOOGLESHEETS_FORMAT_CELL": (
+        {"spreadsheet_id"},
+        {"sheet_name", "worksheet_id", "range", "number_format_type",
+         "number_format_pattern", "background_color", "bold", "italic"},
+    ),
+    "GOOGLESHEETS_SET_DATA_VALIDATION_RULE": (
+        {"spreadsheet_id"},
+        {"sheet_id", "mode", "validation_type", "values", "strict",
+         "show_custom_ui", "start_row_index", "end_row_index",
+         "start_column_index", "end_column_index"},
+    ),
+    "GOOGLEDRIVE_FIND_FOLDER": (
+        set(), {"name_exact", "name_contains", "parent_folder_id", "page_size",
+                "page_token", "starred"},
+    ),
+    "GOOGLEDRIVE_CREATE_FOLDER": ({"name"}, {"parent_id"}),
+    "GOOGLEDRIVE_UPLOAD_FROM_URL": (
+        {"source_url", "name"},
+        {"parent_folder_id", "mime_type", "source_headers", "verify_ssl",
+         "supports_all_drives"},
+    ),
+    "GOOGLECALENDAR_CREATE_EVENT": (
+        {"start_datetime"},
+        {"summary", "description", "timezone", "end_datetime", "calendar_id",
+         "event_duration_hour", "event_duration_minutes", "attendees",
+         "create_meeting_room", "location", "visibility", "transparency"},
+    ),
+}
+
+# L'API Calendar refuse une date seule : il lui faut un instant.
+_CALENDAR_DATETIME_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2})?(\.\d+)?(Z|[+-]\d{1,2}:?\d{2})?$"
+)
+
+
+def check_arguments(slug: str, arguments: dict[str, Any]) -> None:
+    """Refuse tout appel qu'un vrai Composio rejetterait."""
+    if slug not in TOOL_ARGUMENTS:
+        raise AssertionError(f"outil non declare dans le double de test : {slug}")
+    required, optional = TOOL_ARGUMENTS[slug]
+    sent = set(arguments)
+    unknown = sent - required - optional
+    if unknown:
+        raise AssertionError(
+            f"{slug} : argument(s) inconnu(s) {sorted(unknown)} - "
+            f"Composio les rejetterait (attendus : {sorted(required | optional)})"
+        )
+    missing = required - sent
+    if missing:
+        raise AssertionError(f"{slug} : argument(s) obligatoire(s) manquant(s) {sorted(missing)}")
+    if slug == "GOOGLECALENDAR_CREATE_EVENT":
+        start = str(arguments.get("start_datetime", ""))
+        if not _CALENDAR_DATETIME_RE.match(start):
+            raise AssertionError(
+                f"GOOGLECALENDAR_CREATE_EVENT : start_datetime={start!r} n'est pas un "
+                "instant ISO 8601 (une date seule est refusee par l'API)"
+            )
+
+
 _RANGE_RE = re.compile(r"^'?([^'!]+)'?!([A-Z]+)(\d+)(?::([A-Z]+)(\d+))?$")
 
 
@@ -90,7 +165,7 @@ class FakeWorkbook:
         self.calls: list[tuple[str, dict]] = []
         self.formats: list[dict] = []
         self.validations: list[dict] = []
-        self.folders: dict[str, str] = {}
+        self.folders: dict[tuple[str, str], str] = {}
         self.uploads: list[dict] = []
         self.events: list[dict] = []
         self.drive_fails = False
@@ -127,6 +202,7 @@ class FakeWorkbook:
             line.append("")
 
     def execute(self, slug: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        check_arguments(slug, arguments)
         self.calls.append((slug, arguments))
 
         if slug == "GOOGLESHEETS_GET_SPREADSHEET_INFO":
@@ -161,16 +237,16 @@ class FakeWorkbook:
             return {}
 
         if slug == "GOOGLEDRIVE_FIND_FOLDER":
-            name = arguments["folder_name"]
-            if name in self.folders:
-                return {"files": [{"id": self.folders[name]}]}
+            key = (arguments.get("parent_folder_id", ""), arguments.get("name_exact", ""))
+            if key in self.folders:
+                return {"files": [{"id": self.folders[key]}]}
             return {"files": []}
 
         if slug == "GOOGLEDRIVE_CREATE_FOLDER":
-            name = arguments["folder_name"]
+            key = (arguments.get("parent_id", ""), arguments["name"])
             folder_id = f"folder-{self._next_folder}"
             self._next_folder += 1
-            self.folders[name] = folder_id
+            self.folders[key] = folder_id
             return {"id": folder_id}
 
         if slug == "GOOGLEDRIVE_UPLOAD_FROM_URL":
