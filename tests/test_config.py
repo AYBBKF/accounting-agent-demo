@@ -67,3 +67,17 @@ def test_every_service_has_a_configured_auth_config():
     }
     for service_key, _, _ in SERVICES:
         assert by_service.get(service_key), f"auth config manquant pour {service_key}"
+
+
+def test_the_gmail_query_no_longer_requires_the_subject_marker():
+    # Le client a explicitement autorise l'elargissement : c'est desormais le
+    # contenu du PDF qui decide s'il s'agit d'une facture.
+    settings = Settings(_env_file=None)
+    assert settings.gmail_watch_query == "in:inbox has:attachment filename:pdf"
+    assert "XBLASTE" not in settings.gmail_watch_query
+    assert "subject:" not in settings.gmail_watch_query
+
+
+def test_the_gmail_query_stays_overridable_by_environment():
+    settings = Settings(_env_file=None, GMAIL_WATCH_QUERY="in:inbox from:compta@example.ma")
+    assert settings.gmail_watch_query == "in:inbox from:compta@example.ma"
