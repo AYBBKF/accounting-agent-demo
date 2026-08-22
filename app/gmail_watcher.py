@@ -1,4 +1,4 @@
-"""Worker Gmail : detection automatique des factures [XBLASTE].
+"""Worker Gmail : detection automatique des factures recues par email.
 
 Boucle de fond demarree avec le bot. Toutes les `poll_seconds` secondes,
 elle interroge Gmail via la connexion Composio DU CLIENT
@@ -33,8 +33,11 @@ from app.db import (
     claim_invoice_fingerprint,
     get_gmail_message,
     get_invoice_fingerprint,
+    get_or_init_gmail_cursor,
+    list_partial_imports,
     release_invoice_fingerprint,
     set_gmail_message_status,
+    update_invoice_fingerprint,
 )
 from app.invoice_pdf import (
     ExtractedInvoice,
@@ -133,6 +136,12 @@ class GmailWatcherError(RuntimeError):
     """Erreur destinee aux logs / au client, jamais porteuse de secret."""
 
 
+class PartialImportError(GmailWatcherError):
+    """La ligne comptable a bien ete ecrite, mais une etape posterieure
+    (archivage Drive, journal) a echoue. Surtout ne pas retenter l'ecriture :
+    le cycle suivant reprendra a l'etape manquante."""
+
+
 @dataclass
 class PendingInvoice:
     message_id: str
@@ -202,7 +211,7 @@ class GmailWatcher:
         chat_id: int,
         db_path: str,
         spreadsheet_id: str = "",
-        query: str = 'subject:"[XBLASTE]" has:attachment filename:pdf',
+        query: str = "in:inbox has:attachment filename:pdf",
         poll_seconds: int = 60,
         company_name: str = "X BLASTE",
         drive_folder: str = "XBLASTE - Factures",
@@ -236,6 +245,25 @@ class GmailWatcher:
         from app.composio_connect import composio_user_id_for_chat
 
         return composio_user_id_for_chat(self._chat_id)
+
+    # -- curseur Gmail durable --------------------------------------------
+
+    def cursor_epoch(self) -> int:
+        """Plancher temporel, fixe au PREMIER demarrage et jamais modifie.
+
+        La requete ne filtrant plus sur un marqueur de sujet, sans ce
+        plancher le premier cycle importerait toute l'historique de la boite
+        de reception. Il est stocke en base : il survit aux redemarrages.
+        """
+        from datetime import datetime, timezone
+
+        return get_or_init_gmail_cursor(
+            self._db_path, self._chat_id, int(datetime.now(timezone.utc).timestamp())
+        )
+
+    def effective_query(self) -> str:
+        """Requete Gmail reellement envoyee, curseur inclus."""
+        return f"{self._query} after:{self.cursor_epoch()}"
 
     # -- transport ---------------------------------------------------------
 
@@ -278,7 +306,8 @@ class GmailWatcher:
 
     def search_messages(self) -> list[dict[str, Any]]:
         data = self._execute(
-            "GMAIL_FETCH_EMAILS", {"query": self._query, "max_results": self._max_per_cycle}
+            "GMAIL_FETCH_EMAILS",
+            {"query": self.effective_query(), "max_results": self._max_per_cycle},
         )
         return data.get("messages") or []
 
@@ -358,6 +387,7 @@ class GmailWatcher:
         validation sinon, information seule si c'est un doublon certain.
         """
         outcomes: list[WatchOutcome] = []
+        outcomes.extend(self.finish_partial_imports())
         messages = self.search_messages()
         logger.info(
             "Cycle Gmail (user=%s): %d message(s) correspondant a la requete",
@@ -373,11 +403,15 @@ class GmailWatcher:
             try:
                 pending = self._process_message(message_id)
             except (GmailWatcherError, InvoicePdfError) as exc:
-                logger.warning("Message %s ignore: %s", message_id, exc)
+                logger.info("Message %s ignore: %s", message_id, exc)
                 claim_gmail_message(
                     self._db_path, message_id, self._chat_id,
                     status="skipped", payload=json.dumps({"raison": str(exc)}),
                 )
+                # Le message avait deja pu etre reserve : INSERT OR IGNORE
+                # n'aurait alors rien mis a jour, et il serait retente a
+                # chaque cycle.
+                set_gmail_message_status(self._db_path, message_id, "skipped")
                 continue
             if pending is None:
                 continue
@@ -385,7 +419,12 @@ class GmailWatcher:
                 outcomes.append(self.handle(pending))
             except (GmailWatcherError, InvoicePdfError) as exc:
                 logger.warning("Import impossible (message=%s): %s", message_id, exc)
-                set_gmail_message_status(self._db_path, message_id, "pending")
+                # Ne jamais ecraser un point de reprise : si la ligne est deja
+                # ecrite, le statut 'partial' doit survivre pour que le cycle
+                # suivant termine l'import au lieu de le recommencer.
+                current = get_gmail_message(self._db_path, message_id) or {}
+                if current.get("status") != "partial":
+                    set_gmail_message_status(self._db_path, message_id, "pending")
                 outcomes.append(
                     WatchOutcome(
                         pending=pending,
@@ -397,6 +436,39 @@ class GmailWatcher:
                         needs_buttons=True,
                     )
                 )
+        return outcomes
+
+    def finish_partial_imports(self) -> list[WatchOutcome]:
+        """Termine les imports interrompus apres l'ecriture comptable.
+
+        Cas typique : Sheets a reussi, Drive a echoue. La ligne existe deja ;
+        cette reprise ne fait QUE l'archivage et le journal manquants.
+        """
+        outcomes: list[WatchOutcome] = []
+        for row in list_partial_imports(self._db_path, self._chat_id):
+            message_id = row["message_id"]
+            try:
+                pending = self._pending_from_row(row)
+                tab = self._pick_invoice_tab(self._list_tabs(), pending.scope)
+                supplier = SupplierMatch()
+                if pending.fields.ice_fournisseur:
+                    supplier = self.resolve_supplier(
+                        pending.fields.ice_fournisseur, pending.fields.fournisseur
+                    )
+                message = self.import_invoice(pending, supplier=supplier, tab=tab)
+            except (GmailWatcherError, InvoicePdfError, ValueError) as exc:
+                logger.warning("Reprise d'import impossible (message=%s): %s", message_id, exc)
+                continue
+            set_gmail_message_status(self._db_path, message_id, "confirmed")
+            logger.info("Import repris et termine (message=%s)", message_id)
+            outcomes.append(
+                WatchOutcome(
+                    pending=pending,
+                    decision=Decision(action=ACTION_AUTO),
+                    message=message,
+                    needs_buttons=False,
+                )
+            )
         return outcomes
 
     def _process_message(self, message_id: str) -> PendingInvoice | None:
@@ -424,6 +496,11 @@ class GmailWatcher:
             "Piece jointe telechargee (message=%s, %d octets)", message_id, len(content)
         )
         fields = extract_from_pdf_bytes(content)
+        if not fields.is_invoice:
+            # La requete Gmail ne filtre plus sur un marqueur de sujet : c'est
+            # le CONTENU du PDF qui decide. Un devis, un bon de livraison ou
+            # une plaquette n'atteint jamais le classeur.
+            raise GmailWatcherError("le PDF n'est pas une facture")
         scope = self.decide_scope(fields)
         logger.info(
             "Extraction terminee (message=%s, numero=%s, complet=%s, anomalies=%d, scope=%s)",
@@ -632,7 +709,19 @@ class GmailWatcher:
                 needs_buttons=True,
             )
 
-        result = self.import_invoice(pending, supplier=supplier, tab=tab)
+        try:
+            result = self.import_invoice(pending, supplier=supplier, tab=tab)
+        except PartialImportError as exc:
+            # La comptabilite est juste ; il ne manque que l'archivage. On
+            # informe sans proposer de bouton : rien n'est a decider.
+            return WatchOutcome(
+                pending=pending,
+                decision=decision,
+                message=(
+                    f"Facture {fields.numero} enregistree dans le classeur.\n{exc}"
+                ),
+                needs_buttons=False,
+            )
         set_gmail_message_status(self._db_path, pending.message_id, "confirmed")
         return WatchOutcome(
             pending=pending, decision=decision, message=result, needs_buttons=False
@@ -647,55 +736,98 @@ class GmailWatcher:
             raise GmailWatcherError("GOOGLE_SHEET_ID manquant : ecriture impossible.")
         fields = pending.fields
         key = fingerprint(fields.ice_fournisseur, fields.numero)
-        if not claim_invoice_fingerprint(
+        state = get_invoice_fingerprint(self._db_path, key) if key else None
+        resuming = bool(state and state.get("stable_id"))
+        if not resuming and not claim_invoice_fingerprint(
             self._db_path, key,
             numero=fields.numero or "", ice=fields.ice_fournisseur or "",
             message_id=pending.message_id,
         ):
             raise GmailWatcherError("Facture deja importee (empreinte ICE + numero).")
 
-        try:
-            if not supplier.existing and supplier.supplier_id and fields.ice_fournisseur:
-                self.create_supplier(supplier, fields.ice_fournisseur)
-
-            ids = [str(r[0]).strip() for r in self._read_range(f"{tab}!A2:A200") if r]
-            row_index = len(ids) + 2
-            stable_id = next_stable_invoice_id(ids, fields.date_facture.year)
-            plan = build_row_plan(
-                tab=tab,
-                row_index=row_index,
-                stable_id=stable_id,
-                supplier_id=supplier.supplier_id,
-                supplier_name=supplier.name or (fields.fournisseur or ""),
-                numero=fields.numero or "",
-                description=f"Import email - {pending.attachment_name}".strip(" -"),
-                date_facture=fields.date_facture,
-                date_echeance=fields.date_echeance,
-                montant_ht=fields.montant_ht,
-                taux_tva=fields.taux_tva,
-                montant_tva=fields.montant_tva,
-                montant_ttc=fields.montant_ttc,
-                statut=fields.statut,
+        # --- etape 1 : la ligne comptable ---------------------------------
+        # Si elle a deja ete ecrite lors d'une tentative precedente, on la
+        # reprend telle quelle : jamais de seconde ligne pour la meme facture.
+        if resuming:
+            plan = self._plan_from_state(state, pending, supplier)
+            logger.info(
+                "Reprise de l'import de %s (%s ligne %s deja ecrite)",
+                fields.numero, plan.tab, plan.row_index,
             )
-            self.write_row_plan(plan)
-            self.write_detail_lines(stable_id, tab, fields)
-            drive_link = ""
+        else:
+            try:
+                if not supplier.existing and supplier.supplier_id and fields.ice_fournisseur:
+                    self.create_supplier(supplier, fields.ice_fournisseur)
+
+                ids = [str(r[0]).strip() for r in self._read_range(f"{tab}!A2:A200") if r]
+                row_index = len(ids) + 2
+                plan = build_row_plan(
+                    tab=tab,
+                    row_index=row_index,
+                    stable_id=next_stable_invoice_id(ids, fields.date_facture.year),
+                    supplier_id=supplier.supplier_id,
+                    supplier_name=supplier.name or (fields.fournisseur or ""),
+                    numero=fields.numero or "",
+                    description=f"Import email - {pending.attachment_name}".strip(" -"),
+                    date_facture=fields.date_facture,
+                    date_echeance=fields.date_echeance,
+                    montant_ht=fields.montant_ht,
+                    taux_tva=fields.taux_tva,
+                    montant_tva=fields.montant_tva,
+                    montant_ttc=fields.montant_ttc,
+                    statut=fields.statut,
+                )
+                self.write_row_plan(plan)
+            except Exception:
+                # Rien n'a ete ecrit en comptabilite : on libere l'empreinte
+                # pour que la facture puisse etre retentee normalement.
+                release_invoice_fingerprint(self._db_path, key)
+                raise
+            # Point de reprise : a partir d'ici la ligne EXISTE dans le
+            # classeur, l'empreinte ne doit plus jamais etre liberee.
+            update_invoice_fingerprint(
+                self._db_path, key,
+                stable_id=plan.stable_id, tab=plan.tab, row_index=plan.row_index,
+            )
+            set_gmail_message_status(self._db_path, pending.message_id, "partial")
+
+        state = get_invoice_fingerprint(self._db_path, key) or {}
+
+        # --- etape 2 : les lignes de detail -------------------------------
+        if not state.get("lines_written"):
+            self.write_detail_lines(plan.stable_id, plan.tab, fields)
+            update_invoice_fingerprint(self._db_path, key, lines_written=1)
+
+        # --- etape 3 : l'archivage Drive ----------------------------------
+        drive_link = str(state.get("drive_link") or "")
+        if not drive_link:
             try:
                 drive_link = self._archive_to_drive(
                     pending.message_id, pending.attachment_name or "facture.pdf"
                 )
+                update_invoice_fingerprint(self._db_path, key, drive_link=drive_link)
             except GmailWatcherError as exc:
-                logger.warning("Archivage Drive impossible (message=%s): %s", pending.message_id, exc)
-            self.append_import_log(
+                # L'ecriture comptable reste valide : on laisse la facture en
+                # 'partial' pour que le cycle suivant termine l'archivage.
+                logger.warning(
+                    "Archivage Drive impossible (message=%s): %s", pending.message_id, exc
+                )
+                set_gmail_message_status(self._db_path, pending.message_id, "partial")
+                raise PartialImportError(
+                    f"Facture ecrite dans {plan.tab} ligne {plan.row_index}, "
+                    "mais archivage Drive incomplet : il sera termine au prochain cycle."
+                ) from exc
+
+        # --- etape 4 : le journal d'import --------------------------------
+        if not state.get("log_row"):
+            log_row = self.append_import_log(
                 plan, pending, fields, supplier, drive_link=drive_link, action="Créé"
             )
-        except Exception:
-            release_invoice_fingerprint(self._db_path, key)
-            raise
+            update_invoice_fingerprint(self._db_path, key, log_row=log_row)
 
         logger.info(
-            "Facture %s importee automatiquement dans %s ligne %d",
-            fields.numero, tab, plan.row_index,
+            "Facture %s importee dans %s ligne %d (Drive: %s)",
+            fields.numero, plan.tab, plan.row_index, "oui" if drive_link else "non",
         )
         return (
             "Facture importée avec succès\n"
@@ -704,8 +836,31 @@ class GmailWatcher:
             f"- HT          : {fields.montant_ht} MAD\n"
             f"- TVA         : {fields.montant_tva} MAD\n"
             f"- TTC         : {fields.montant_ttc} MAD\n"
-            f"- Onglet      : {tab}\n"
+            f"- Onglet      : {plan.tab}\n"
             f"- Ligne       : {plan.row_index}"
+        )
+
+    def _plan_from_state(self, state: dict[str, Any], pending: PendingInvoice,
+                         supplier: SupplierMatch):
+        """Reconstruit le plan d'une ligne DEJA ecrite, a partir des points de
+        reprise. Aucune cellule n'est reecrite : ce plan ne sert qu'a nommer
+        l'onglet, la ligne et l'ID stable pour terminer les etapes suivantes."""
+        fields = pending.fields
+        return build_row_plan(
+            tab=str(state.get("tab") or ""),
+            row_index=int(state.get("row_index") or 2),
+            stable_id=str(state.get("stable_id") or ""),
+            supplier_id=supplier.supplier_id,
+            supplier_name=supplier.name or (fields.fournisseur or ""),
+            numero=fields.numero or "",
+            description=f"Import email - {pending.attachment_name}".strip(" -"),
+            date_facture=fields.date_facture,
+            date_echeance=fields.date_echeance,
+            montant_ht=fields.montant_ht,
+            taux_tva=fields.taux_tva,
+            montant_tva=fields.montant_tva,
+            montant_ttc=fields.montant_ttc,
+            statut=fields.statut,
         )
 
     # -- ecritures elementaires -------------------------------------------
@@ -858,7 +1013,7 @@ class GmailWatcher:
     def append_import_log(
         self, plan, pending: PendingInvoice, fields: ExtractedInvoice,
         supplier: SupplierMatch, *, drive_link: str = "", action: str = "Créé",
-    ) -> None:
+    ) -> int:
         from datetime import datetime, timezone
 
         row = build_import_log_row(
@@ -894,6 +1049,7 @@ class GmailWatcher:
                 "values": [row],
             },
         )
+        return index
 
     # -- apres validation humaine ------------------------------------------
 
