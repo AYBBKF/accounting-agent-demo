@@ -49,7 +49,6 @@ from app.gmail_watcher import (
     CALLBACK_REFUSE_PREFIX,
     GmailWatcher,
     GmailWatcherError,
-    build_preview,
 )
 from app.excel_report import build_excel_report
 from app.openai_client import OpenAIClientWrapper
@@ -122,9 +121,9 @@ accounting_agent = AccountingAgent(
 # ne puissent jamais diverger des libelles reels des boutons /connect.
 SERVICES_SUMMARY = ", ".join(label for _, _, label in SERVICES)
 
-# Worker Gmail : detecte les factures [XBLASTE] recues par email et les
-# soumet a confirmation dans Telegram. Aucune ecriture Sheets/Drive n'a lieu
-# avant le clic sur "Confirmer l'ecriture".
+# Worker Gmail : detecte les factures [XBLASTE] recues par email. Une facture
+# lisible, complete, coherente et non ambigue est importee automatiquement ;
+# seules les factures douteuses passent par les boutons de validation.
 gmail_watcher = GmailWatcher(
     api_key=settings.composio_api_key,
     chat_id=settings.gmail_watch_chat_id,
@@ -659,8 +658,10 @@ def invoice_keyboard(message_id: str) -> InlineKeyboardMarkup:
 
 
 async def _gmail_watch_loop(bot: Bot) -> None:
-    """Boucle de fond : interroge Gmail toutes les N secondes et pousse un
-    apercu dans Telegram. Ne s'arrete jamais sur une erreur ponctuelle."""
+    """Boucle de fond : interroge Gmail toutes les N secondes, importe les
+    factures certaines et notifie le client. Les boutons de validation ne
+    sont joints que si un doute subsiste. Ne s'arrete jamais sur une erreur
+    ponctuelle."""
     if not settings.gmail_watch_enabled or not gmail_watcher.is_configured:
         logger.info(
             "Worker Gmail desactive (GMAIL_WATCH_ENABLED=%s, chat_id=%s).",
@@ -673,16 +674,21 @@ async def _gmail_watch_loop(bot: Bot) -> None:
     )
     while True:
         try:
-            pendings = await asyncio.to_thread(gmail_watcher.process_once)
-            for pending in pendings:
+            outcomes = await asyncio.to_thread(gmail_watcher.process_once)
+            for outcome in outcomes:
                 await bot.send_message(
                     chat_id=settings.gmail_watch_chat_id,
-                    text=build_preview(pending),
-                    reply_markup=invoice_keyboard(pending.message_id),
+                    text=outcome.message,
+                    reply_markup=(
+                        invoice_keyboard(outcome.pending.message_id)
+                        if outcome.needs_buttons else None
+                    ),
                 )
                 logger.info(
-                    "Apercu envoye dans Telegram (message=%s, numero=%s)",
-                    pending.message_id, pending.fields.numero,
+                    "Notification envoyee (message=%s, numero=%s, action=%s)",
+                    outcome.pending.message_id,
+                    outcome.pending.fields.numero,
+                    outcome.decision.action,
                 )
         except GmailWatcherError as exc:
             logger.warning("Cycle Gmail en echec: %s", exc)
