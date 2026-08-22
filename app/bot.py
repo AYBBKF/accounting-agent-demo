@@ -44,6 +44,7 @@ from app.db import (
     stable_invoice_id,
 )
 from app.demo_data import generate_demo_bank_statement, generate_demo_invoices
+from app.doc_policy import ACTION_AUTO, ACTION_REVIEW
 from app.mail_worker import (
     CALLBACK_CONFIRM_PREFIX,
     CALLBACK_KEY_LENGTH,
@@ -58,6 +59,11 @@ from app.openai_client import OpenAIClientWrapper
 from app.reconciliation import reconcile_invoices
 from app.sheets_client import SheetsClient, SheetsSyncError
 from app.vat import simulate_vat
+
+# Saut de ligne sans sequence d'echappement : le transport JSON des outils
+# de publication reinterprete les sequences d'echappement et corromprait le
+# fichier. Un module sans antislash traverse la chaine intact.
+NL = chr(10)
 
 # Onglets dedies a la synchronisation du bot (distincts des onglets du
 # classeur "X BLASTE" qui contiennent le jeu de donnees de demonstration
@@ -241,14 +247,14 @@ def _sync_vat_to_sheet(chat_id: int, invoices: list[Any]) -> None:
         logger.warning("Sync Sheets (TVA) ignoree: %s", exc)
 
 FAKE_INVOICE_TEXT_FOR_EXTRACTION = (
-    "FACTURE (DEMO - donnee fictive)\n"
-    "Fournisseur: Fournitures Atlas SARL (DEMO)\n"
-    "Numero: DEMO-2026-9001\n"
-    "Date: 2026-08-15\n"
-    "Montant HT: 250.00 MAD\n"
-    "TVA: 20%\n"
-    "Montant TTC: 300.00 MAD\n"
-    "Mode de paiement: virement\n"
+    f"FACTURE (DEMO - donnee fictive){NL}"
+    f"Fournisseur: Fournitures Atlas SARL (DEMO){NL}"
+    f"Numero: DEMO-2026-9001{NL}"
+    f"Date: 2026-08-15{NL}"
+    f"Montant HT: 250.00 MAD{NL}"
+    f"TVA: 20%{NL}"
+    f"Montant TTC: 300.00 MAD{NL}"
+    f"Mode de paiement: virement{NL}"
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -288,27 +294,28 @@ def build_dispatcher() -> Dispatcher:
     @dp.message(Command("start"))
     async def cmd_start(message: Message) -> None:
         await message.answer(
-            "Bienvenue sur le bot de demo comptable.\n"
-            "Toutes les donnees sont FICTIVES.\n"
+            f"Bienvenue sur le bot de demo comptable.{NL}"
+            f"Toutes les donnees sont FICTIVES.{NL}"
             "Commandes: /help /demo_facture /demo_releve /tva /rapprochement /export "
-            "/demo_extraction /sheet /sync_sheet /dashboard /reprocess /connect /status"
+            "/demo_extraction /sheet /sync_sheet /dashboard /reprocess /retry_pending /connect /status"
         )
 
     @dp.message(Command("help"))
     async def cmd_help(message: Message) -> None:
         await message.answer(
-            "/demo_facture - genere des factures fictives\n"
-            "/demo_releve - genere un releve bancaire fictif lie aux factures\n"
-            "/tva - simule la TVA sur les factures generees\n"
-            "/rapprochement - rapproche factures et releve bancaire\n"
-            "/export - genere et envoie le rapport Excel\n"
-            "/demo_extraction - teste l'extraction OpenAI sur une facture fictive\n"
-            "/sheet - lien vers le Google Sheet de suivi (si configure)\n"
-            "/sync_sheet - resynchronise toutes les donnees de session vers le Sheet\n"
-            "/dashboard - resume des KPI de la session en cours\n"
-            "/reprocess - relit les emails des N dernieres heures (defaut 24)\n"
+            f"/demo_facture - genere des factures fictives{NL}"
+            f"/demo_releve - genere un releve bancaire fictif lie aux factures{NL}"
+            f"/tva - simule la TVA sur les factures generees{NL}"
+            f"/rapprochement - rapproche factures et releve bancaire{NL}"
+            f"/export - genere et envoie le rapport Excel{NL}"
+            f"/demo_extraction - teste l'extraction OpenAI sur une facture fictive{NL}"
+            f"/sheet - lien vers le Google Sheet de suivi (si configure){NL}"
+            f"/sync_sheet - resynchronise toutes les donnees de session vers le Sheet{NL}"
+            f"/dashboard - resume des KPI de la session en cours{NL}"
+            f"/reprocess - relit les emails des N dernieres heures (defaut 24){NL}"
+            f"/retry_pending - relance les documents restes en attente{NL}"
             f"/connect - connecte TES comptes Google ({SERVICES_SUMMARY}) "
-            "via un lien d'autorisation individuel\n"
+            f"via un lien d'autorisation individuel{NL}"
             "/status - etat du bot + statut de tes connexions Google"
         )
 
@@ -334,7 +341,7 @@ def build_dispatcher() -> Dispatcher:
                 lines.append("Pour connecter ou reconnecter un service: /connect")
             except ComposioConnectError as exc:
                 lines.append(f"- lecture du statut impossible: {exc}")
-        await message.answer("\n".join(lines))
+        await message.answer(f"{NL}".join(lines))
 
     @dp.message(Command("connect"))
     async def cmd_connect(message: Message) -> None:
@@ -359,7 +366,7 @@ def build_dispatcher() -> Dispatcher:
         await message.answer(
             "Clique sur le service a connecter (tu seras redirige vers la page "
             "d'autorisation Google - aucun mot de passe ne transite par ce bot). "
-            "Chaque lien est valable quelques minutes ; relance /connect si besoin.\n"
+            f"Chaque lien est valable quelques minutes ; relance /connect si besoin.{NL}"
             "Une fois autorise, verifie avec /status.",
             reply_markup=keyboard,
         )
@@ -372,7 +379,7 @@ def build_dispatcher() -> Dispatcher:
         _sync_invoices_to_sheet(message.chat.id, invoices, db_ids)
         _sync_vat_to_sheet(message.chat.id, invoices)
         lines = [f"- {i.numero} | {i.fournisseur} | HT {i.montant_ht} | TVA {i.taux_tva}%" for i in invoices]
-        await message.answer("Factures fictives generees:\n" + "\n".join(lines))
+        await message.answer(f"Factures fictives generees:{NL}" + f"{NL}".join(lines))
 
     @dp.message(Command("demo_releve"))
     async def cmd_demo_releve(message: Message) -> None:
@@ -386,7 +393,7 @@ def build_dispatcher() -> Dispatcher:
         db_ids = save_bank_lines(settings.db_path, message.chat.id, bank_lines)
         _sync_bank_lines_to_sheet(message.chat.id, bank_lines, db_ids)
         lines = [f"- {b.date_operation.isoformat()} | {b.libelle} | {b.montant}" for b in bank_lines]
-        await message.answer("Releve bancaire fictif genere:\n" + "\n".join(lines))
+        await message.answer(f"Releve bancaire fictif genere:{NL}" + f"{NL}".join(lines))
 
     @dp.message(Command("tva"))
     async def cmd_tva(message: Message) -> None:
@@ -403,7 +410,7 @@ def build_dispatcher() -> Dispatcher:
                 f"{result.montant_tva} = TTC {result.montant_ttc}"
             )
         _sync_vat_to_sheet(message.chat.id, invoices)
-        await message.answer("Simulation TVA:\n" + "\n".join(lines))
+        await message.answer(f"Simulation TVA:{NL}" + f"{NL}".join(lines))
 
     @dp.message(Command("rapprochement"))
     async def cmd_rapprochement(message: Message) -> None:
@@ -423,7 +430,7 @@ def build_dispatcher() -> Dispatcher:
         save_reconciliations(settings.db_path, message.chat.id, results)
         _sync_reconciliations_to_sheet(message.chat.id, results)
         lines = [f"- {r.invoice.numero}: {r.status} ({r.detail})" for r in results]
-        await message.answer("Rapprochement bancaire:\n" + "\n".join(lines))
+        await message.answer(f"Rapprochement bancaire:{NL}" + f"{NL}".join(lines))
 
     @dp.message(Command("sheet"))
     async def cmd_sheet(message: Message) -> None:
@@ -434,7 +441,7 @@ def build_dispatcher() -> Dispatcher:
                 "(GOOGLE_SHEET_ID manquant)."
             )
             return
-        await message.answer(f"Google Sheet de suivi:\n{url}")
+        await message.answer(f"Google Sheet de suivi:{NL}{url}")
 
     async def _run_sync_sheet(chat_id: int) -> str:
         """Synchronisation idempotente SQLite -> Google Sheets, partagee
@@ -499,7 +506,7 @@ def build_dispatcher() -> Dispatcher:
         url = sheets_client.sheet_url()
         if url:
             lines.append(f"- Google Sheet: {url}")
-        await message.answer("\n".join(lines), reply_markup=_sync_sheet_keyboard)
+        await message.answer(f"{NL}".join(lines), reply_markup=_sync_sheet_keyboard)
 
     @dp.message(Command("demo_extraction"))
     async def cmd_demo_extraction(message: Message) -> None:
@@ -528,13 +535,13 @@ def build_dispatcher() -> Dispatcher:
             return
         d = outcome.data
         await message.answer(
-            "Extraction reussie (facture fictive):\n"
-            f"- Fournisseur: {d.get('fournisseur')}\n"
-            f"- Numero: {d.get('numero')}\n"
-            f"- Date: {d.get('date_facture')}\n"
-            f"- HT: {d.get('montant_ht')}\n"
-            f"- Taux TVA: {d.get('taux_tva')}\n"
-            f"- TTC: {d.get('montant_ttc')}\n"
+            f"Extraction reussie (facture fictive):{NL}"
+            f"- Fournisseur: {d.get('fournisseur')}{NL}"
+            f"- Numero: {d.get('numero')}{NL}"
+            f"- Date: {d.get('date_facture')}{NL}"
+            f"- HT: {d.get('montant_ht')}{NL}"
+            f"- Taux TVA: {d.get('taux_tva')}{NL}"
+            f"- TTC: {d.get('montant_ttc')}{NL}"
             f"- needs_human_review: {outcome.needs_human_review}"
         )
 
@@ -556,9 +563,48 @@ def build_dispatcher() -> Dispatcher:
         await message.answer(
             f"Curseur Gmail recule de {hours} h. Les emails recus depuis cette "
             "date seront relus au prochain cycle ; les documents deja "
-            "enregistres ne seront pas reecrits.\n"
+            f"enregistres ne seront pas reecrits.{NL}"
             f"Nouvelle borne : {floor}"
         )
+
+    @dp.message(Command("retry_pending"))
+    async def cmd_retry_pending(message: Message) -> None:
+        """Relance les documents restes en plan, sans jamais rien dupliquer.
+
+        Reservee au proprietaire du suivi Gmail : un autre utilisateur
+        autorise ne doit pas pouvoir declencher la reprise des documents
+        d'autrui. Les lignes deja ecrites sont protegees par l'etat de chaque
+        document ; la reprise ne fait que terminer ce qui manque et redonner
+        des boutons vivants aux documents en attente de decision.
+        """
+        if message.chat.id != settings.gmail_watch_chat_id:
+            await message.answer("Commande reservee au proprietaire du suivi Gmail.")
+            return
+        await message.answer("Reprise des documents en attente...")
+        try:
+            outcomes = await asyncio.to_thread(mail_worker.retry_pending)
+        except MailWorkerError as exc:
+            await message.answer(f"Reprise impossible : {exc}")
+            return
+        if not outcomes:
+            await message.answer("Aucun document en attente. Rien a reprendre.")
+            return
+        finished = [o for o in outcomes if o.action == ACTION_AUTO and not o.error]
+        waiting = [o for o in outcomes if o.action == ACTION_REVIEW and not o.error]
+        failed = [o for o in outcomes if o.error]
+        await message.answer(
+            f"Reprise terminee.{NL}"
+            f"- Termines sans intervention : {len(finished)}{NL}"
+            f"- En attente de ta decision  : {len(waiting)}{NL}"
+            f"- En echec                   : {len(failed)}"
+        )
+        for outcome in waiting:
+            await message.answer(
+                build_review_message(outcome),
+                reply_markup=document_keyboard(outcome.doc_key),
+            )
+        for outcome in failed:
+            await message.answer(f"{outcome.filename} : {outcome.error}")
 
     @dp.message(Command("export"))
     async def cmd_export(message: Message) -> None:
