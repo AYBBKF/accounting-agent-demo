@@ -4,13 +4,19 @@ Boucle de fond demarree avec le bot. Toutes les `poll_seconds` secondes,
 elle interroge Gmail via la connexion Composio DU CLIENT
 (user_id = "telegram_<chat_id>"), telecharge les pieces jointes PDF,
 extrait les champs de facon DETERMINISTE (app/invoice_pdf.py, aucun
-modele de langage) et envoie un apercu dans Telegram.
+modele de langage) et applique la politique d'import (app/invoice_policy.py).
+
+Comportement :
+  - facture lisible, complete, coherente et non ambigue -> import
+    AUTOMATIQUE, sans confirmation, suivi d'une notification Telegram ;
+  - doute (champ illisible, HT + TVA != TTC, ICE manquant, fournisseur
+    ambigu, plusieurs valeurs possibles, avoir, doublon incertain) ->
+    apercu + boutons de validation, et AUCUNE ecriture ;
+  - doublon certain -> aucune ecriture, information seule.
 
 Garde-fous :
-  - anti-doublon durable : le message_id Gmail est reserve dans SQLite
-    avant tout traitement (voir db.claim_gmail_message) ;
-  - AUCUNE ecriture Google Sheets ni Drive avant confirmation explicite
-    du client via les boutons Telegram ;
+  - anti-doublon durable a deux niveaux : le message_id Gmail (technique)
+    et le couple (ICE fournisseur + numero de facture) (metier) ;
   - Gmail reste en lecture : aucun envoi, aucune suppression ;
   - aucun token ni cle API n'est journalise.
 """
@@ -22,8 +28,46 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
 
-from app.db import claim_gmail_message, get_gmail_message, set_gmail_message_status
-from app.invoice_pdf import ExtractedInvoice, InvoicePdfError, extract_from_pdf_bytes
+from app.db import (
+    claim_gmail_message,
+    claim_invoice_fingerprint,
+    get_gmail_message,
+    get_invoice_fingerprint,
+    release_invoice_fingerprint,
+    set_gmail_message_status,
+)
+from app.invoice_pdf import (
+    ExtractedInvoice,
+    InvoiceLine,
+    InvoicePdfError,
+    extract_from_pdf_bytes,
+)
+from app.invoice_policy import (
+    ACTION_AUTO,
+    ACTION_DUPLICATE,
+    ACTION_REVIEW,
+    Decision,
+    DuplicateState,
+    decide_invoice,
+    fingerprint,
+)
+from app.invoice_sheet import (
+    DATE_COLUMNS,
+    DATE_PATTERN,
+    IMPORTS_LOG_TAB,
+    LIGNES_HEADERS,
+    LIGNES_TAB,
+    MONEY_COLUMNS,
+    MONEY_PATTERN,
+    RATE_COLUMN,
+    RATE_PATTERN,
+    STATUS_VALUES,
+    build_import_log_row,
+    build_line_rows,
+    build_row_plan,
+    next_stable_invoice_id,
+    next_supplier_id,
+)
 
 logger = logging.getLogger("demo_bot.gmail_watcher")
 
@@ -31,6 +75,9 @@ COMPOSIO_BASE_URL = "https://backend.composio.dev"
 COMPOSIO_TOOLS_EXECUTE_PATH = "/api/v3.1/tools/execute/{tool_slug}"
 _REQUEST_TIMEOUT_SECONDS = 60.0
 _MAX_ATTACHMENT_BYTES = 15 * 1024 * 1024
+
+SUPPLIERS_TAB = "03_FOURNISSEURS"
+DEFAULT_ROW_BACKGROUND = "#ffffff"
 
 CALLBACK_CONFIRM_PREFIX = "xbok:"
 CALLBACK_REFUSE_PREFIX = "xbno:"
@@ -49,6 +96,37 @@ _SALES_HEADERS = [
     if h in ("ID Fournisseur", "Fournisseur") else h
     for h in _INVOICE_HEADERS
 ]
+
+
+def _norm_name(value: str | None) -> str:
+    """Comparaison de raisons sociales : casse, accents et ponctuation ignores."""
+    import re as _re
+    import unicodedata as _ud
+
+    text = _ud.normalize("NFD", value or "")
+    text = "".join(c for c in text if _ud.category(c) != "Mn")
+    return _re.sub(r"[^A-Z0-9]", "", text.upper())
+
+
+@dataclass
+class SupplierMatch:
+    """Fournisseur resolu par ICE (ou a creer)."""
+
+    supplier_id: str = ""
+    name: str = ""
+    existing: bool = False
+    ambiguous: bool = False
+    reason: str = ""
+
+
+@dataclass
+class WatchOutcome:
+    """Ce que le bot doit faire d'une facture detectee."""
+
+    pending: "PendingInvoice"
+    decision: Decision
+    message: str
+    needs_buttons: bool
 
 
 class GmailWatcherError(RuntimeError):
@@ -95,6 +173,7 @@ def build_preview(pending: PendingInvoice) -> str:
         f"- Date        : {_fmt(f.date_facture)}",
         f"- Echeance    : {_fmt(f.date_echeance)}",
         f"- Fournisseur : {_fmt(f.fournisseur)}",
+        f"- ICE         : {_fmt(f.ice_fournisseur)}",
         f"- Client      : {_fmt(f.client)}",
         f"- HT          : {_fmt(f.montant_ht)} {devise}".rstrip(),
         f"- TVA {_fmt(f.taux_tva)} %    : {_fmt(f.montant_tva)} {devise}".rstrip(),
@@ -108,7 +187,9 @@ def build_preview(pending: PendingInvoice) -> str:
         lines += ["", f"Champs introuvables : {', '.join(f.missing)} (non devines)."]
     if f.anomalies:
         lines += ["", "Anomalies detectees :"] + [f"- {a}" for a in f.anomalies]
-    lines += ["", "Rien n'a encore ete ecrit. Confirme pour enregistrer."]
+    if f.ambigus:
+        lines += ["", f"Champs a plusieurs valeurs possibles : {', '.join(f.ambigus)}."]
+    lines += ["", "Rien n'a encore ete ecrit."]
     return "\n".join(lines)
 
 
@@ -269,10 +350,14 @@ class GmailWatcher:
 
     # -- cycle -------------------------------------------------------------
 
-    def process_once(self) -> list[PendingInvoice]:
-        """Un tour de boucle. Retourne les factures nouvellement detectees,
-        deja enregistrees en base avec le statut 'pending'."""
-        pendings: list[PendingInvoice] = []
+    def process_once(self) -> list[WatchOutcome]:
+        """Un tour de boucle.
+
+        Chaque facture detectee est immediatement soumise a la politique
+        d'import : ecriture automatique si elle est certaine, demande de
+        validation sinon, information seule si c'est un doublon certain.
+        """
+        outcomes: list[WatchOutcome] = []
         messages = self.search_messages()
         logger.info(
             "Cycle Gmail (user=%s): %d message(s) correspondant a la requete",
@@ -294,9 +379,25 @@ class GmailWatcher:
                     status="skipped", payload=json.dumps({"raison": str(exc)}),
                 )
                 continue
-            if pending is not None:
-                pendings.append(pending)
-        return pendings
+            if pending is None:
+                continue
+            try:
+                outcomes.append(self.handle(pending))
+            except (GmailWatcherError, InvoicePdfError) as exc:
+                logger.warning("Import impossible (message=%s): %s", message_id, exc)
+                set_gmail_message_status(self._db_path, message_id, "pending")
+                outcomes.append(
+                    WatchOutcome(
+                        pending=pending,
+                        decision=Decision(action=ACTION_REVIEW, reasons=[str(exc)]),
+                        message=(
+                            build_preview(pending)
+                            + f"\n\nValidation humaine demandee car :\n- {exc}"
+                        ),
+                        needs_buttons=True,
+                    )
+                )
+        return outcomes
 
     def _process_message(self, message_id: str) -> PendingInvoice | None:
         message = self.fetch_message(message_id)
@@ -361,8 +462,22 @@ class GmailWatcher:
                 "mode_paiement": pending.fields.mode_paiement,
                 "scope": pending.scope,
                 "attachment_name": pending.attachment_name,
+                "ice_fournisseur": pending.fields.ice_fournisseur,
+                "ice_client": pending.fields.ice_client,
+                "lignes": [
+                    {
+                        "description": l.description,
+                        "quantite": str(l.quantite),
+                        "prix_unitaire_ht": str(l.prix_unitaire_ht),
+                        "taux_tva": str(l.taux_tva) if l.taux_tva is not None else None,
+                        "total_ht": str(l.total_ht),
+                    }
+                    for l in pending.fields.lignes
+                ],
                 "missing": pending.fields.missing,
                 "anomalies": pending.fields.anomalies,
+                "ambigus": pending.fields.ambigus,
+                "is_avoir": pending.fields.is_avoir,
             },
             ensure_ascii=False,
         )
@@ -374,11 +489,416 @@ class GmailWatcher:
             )
             conn.commit()
 
-    # -- apres confirmation du client --------------------------------------
+    # -- resolution du fournisseur (par ICE) -------------------------------
+
+    def _read_range(self, a1_range: str) -> list[list[Any]]:
+        data = self._execute(
+            "GOOGLESHEETS_BATCH_GET",
+            {
+                "spreadsheet_id": self._spreadsheet_id,
+                "ranges": [a1_range],
+                "valueRenderOption": "UNFORMATTED_VALUE",
+            },
+        )
+        ranges = data.get("valueRanges") or []
+        if not ranges:
+            return []
+        return ranges[0].get("values") or []
+
+    def resolve_supplier(self, ice: str | None, name: str | None) -> SupplierMatch:
+        """Cherche le fournisseur PAR ICE dans 03_FOURNISSEURS.
+
+        L'ICE est l'identifiant fiscal unique : c'est la seule cle fiable.
+        Le nom ne sert qu'a detecter une ambiguite (meme raison sociale sous
+        un autre ICE), jamais a decider tout seul.
+        """
+        rows = self._read_range(f"{SUPPLIERS_TAB}!A2:C200")
+        wanted_ice = (ice or "").strip()
+        wanted_name = _norm_name(name)
+        by_ice = [r for r in rows if len(r) > 2 and str(r[2]).strip() == wanted_ice and wanted_ice]
+        if len(by_ice) == 1:
+            return SupplierMatch(
+                supplier_id=str(by_ice[0][0]).strip(),
+                name=str(by_ice[0][1]).strip(),
+                existing=True,
+            )
+        if len(by_ice) > 1:
+            return SupplierMatch(ambiguous=True, reason="plusieurs fournisseurs avec le meme ICE")
+        by_name = [
+            r for r in rows
+            if wanted_name and len(r) > 1 and _norm_name(str(r[1])) == wanted_name
+        ]
+        if by_name:
+            # Meme raison sociale mais ICE different : on ne tranche pas.
+            return SupplierMatch(
+                ambiguous=True,
+                reason="un fournisseur porte deja ce nom avec un autre ICE",
+            )
+        existing_ids = [str(r[0]).strip() for r in rows if r]
+        return SupplierMatch(supplier_id=next_supplier_id(existing_ids), name=(name or "").strip())
+
+    def create_supplier(self, match: SupplierMatch, ice: str, delai_paiement: int = 30) -> str:
+        """Cree le fournisseur dans 03_FOURNISSEURS. Appele uniquement quand
+        les donnees sont certaines (ICE present, nom lisible)."""
+        rows = self._read_range(f"{SUPPLIERS_TAB}!A2:C200")
+        row_index = len(rows) + 2
+        self._execute(
+            "GOOGLESHEETS_VALUES_UPDATE",
+            {
+                "spreadsheet_id": self._spreadsheet_id,
+                "range": f"{SUPPLIERS_TAB}!A{row_index}:G{row_index}",
+                "value_input_option": "RAW",
+                "values": [[match.supplier_id, match.name, ice, "", "", "", delai_paiement]],
+            },
+        )
+        logger.info("Fournisseur %s cree dans %s (ICE present)", match.supplier_id, SUPPLIERS_TAB)
+        return match.supplier_id
+
+    # -- doublons ----------------------------------------------------------
+
+    def duplicate_state(self, fields: ExtractedInvoice, supplier_id: str, tab: str) -> DuplicateState:
+        """Doublon garanti par (ICE fournisseur + numero de facture).
+
+        Deux sources sont consultees : la base locale (empreintes) et le
+        classeur lui-meme, pour rester juste meme apres une saisie manuelle.
+        """
+        state = DuplicateState()
+        key = fingerprint(fields.ice_fournisseur, fields.numero)
+        known = get_invoice_fingerprint(self._db_path, key) if key else None
+        if known:
+            state.certain = True
+            state.existing_ref = str(known.get("stable_id") or "")
+            return state
+
+        numero = (fields.numero or "").strip().upper()
+        if not numero:
+            return state
+        rows = self._read_range(f"{tab}!A2:D200")
+        for row in rows:
+            if len(row) < 3 or str(row[2]).strip().upper() != numero:
+                continue
+            existing_supplier = str(row[3]).strip() if len(row) > 3 else ""
+            if supplier_id and existing_supplier == supplier_id:
+                state.certain = True
+            else:
+                state.uncertain = True
+            state.existing_ref = str(row[0]).strip()
+            break
+        return state
+
+    # -- import automatique ------------------------------------------------
+
+    def handle(self, pending: PendingInvoice) -> WatchOutcome:
+        """Applique la politique d'import a une facture detectee.
+
+        Import automatique si la facture est lisible, complete, coherente et
+        non ambigue. Sinon, validation humaine. Un doublon certain n'est
+        jamais ecrit.
+        """
+        fields = pending.fields
+        tab = self._pick_invoice_tab(self._list_tabs(), pending.scope)
+
+        supplier = SupplierMatch()
+        if fields.ice_fournisseur:
+            supplier = self.resolve_supplier(fields.ice_fournisseur, fields.fournisseur)
+        duplicates = self.duplicate_state(fields, supplier.supplier_id, tab)
+        decision = decide_invoice(
+            fields, duplicates=duplicates, supplier_ambiguous=supplier.ambiguous
+        )
+
+        if decision.action == ACTION_DUPLICATE:
+            set_gmail_message_status(self._db_path, pending.message_id, "duplicate")
+            ref = f" (deja enregistree sous {decision.existing_ref})" if decision.existing_ref else ""
+            return WatchOutcome(
+                pending=pending,
+                decision=decision,
+                message=(
+                    f"Facture {fields.numero} deja importee{ref}. "
+                    "Rien n'a ete ecrit : aucun doublon n'est cree."
+                ),
+                needs_buttons=False,
+            )
+
+        if decision.action == ACTION_REVIEW:
+            reasons = "\n".join(f"- {r}" for r in decision.reasons)
+            return WatchOutcome(
+                pending=pending,
+                decision=decision,
+                message=(
+                    build_preview(pending)
+                    + "\n\nValidation humaine demandee car :\n"
+                    + reasons
+                ),
+                needs_buttons=True,
+            )
+
+        result = self.import_invoice(pending, supplier=supplier, tab=tab)
+        set_gmail_message_status(self._db_path, pending.message_id, "confirmed")
+        return WatchOutcome(
+            pending=pending, decision=decision, message=result, needs_buttons=False
+        )
+
+    def import_invoice(
+        self, pending: PendingInvoice, *, supplier: SupplierMatch, tab: str
+    ) -> str:
+        """Ecrit reellement la facture. Ne doit etre appelee qu'apres une
+        decision d'import (automatique) ou une confirmation humaine."""
+        if not self._spreadsheet_id:
+            raise GmailWatcherError("GOOGLE_SHEET_ID manquant : ecriture impossible.")
+        fields = pending.fields
+        key = fingerprint(fields.ice_fournisseur, fields.numero)
+        if not claim_invoice_fingerprint(
+            self._db_path, key,
+            numero=fields.numero or "", ice=fields.ice_fournisseur or "",
+            message_id=pending.message_id,
+        ):
+            raise GmailWatcherError("Facture deja importee (empreinte ICE + numero).")
+
+        try:
+            if not supplier.existing and supplier.supplier_id and fields.ice_fournisseur:
+                self.create_supplier(supplier, fields.ice_fournisseur)
+
+            ids = [str(r[0]).strip() for r in self._read_range(f"{tab}!A2:A200") if r]
+            row_index = len(ids) + 2
+            stable_id = next_stable_invoice_id(ids, fields.date_facture.year)
+            plan = build_row_plan(
+                tab=tab,
+                row_index=row_index,
+                stable_id=stable_id,
+                supplier_id=supplier.supplier_id,
+                supplier_name=supplier.name or (fields.fournisseur or ""),
+                numero=fields.numero or "",
+                description=f"Import email - {pending.attachment_name}".strip(" -"),
+                date_facture=fields.date_facture,
+                date_echeance=fields.date_echeance,
+                montant_ht=fields.montant_ht,
+                taux_tva=fields.taux_tva,
+                montant_tva=fields.montant_tva,
+                montant_ttc=fields.montant_ttc,
+                statut=fields.statut,
+            )
+            self.write_row_plan(plan)
+            self.write_detail_lines(stable_id, tab, fields)
+            drive_link = ""
+            try:
+                drive_link = self._archive_to_drive(
+                    pending.message_id, pending.attachment_name or "facture.pdf"
+                )
+            except GmailWatcherError as exc:
+                logger.warning("Archivage Drive impossible (message=%s): %s", pending.message_id, exc)
+            self.append_import_log(
+                plan, pending, fields, supplier, drive_link=drive_link, action="Créé"
+            )
+        except Exception:
+            release_invoice_fingerprint(self._db_path, key)
+            raise
+
+        logger.info(
+            "Facture %s importee automatiquement dans %s ligne %d",
+            fields.numero, tab, plan.row_index,
+        )
+        return (
+            "Facture importée avec succès\n"
+            f"- Numéro      : {fields.numero}\n"
+            f"- Fournisseur : {supplier.name or fields.fournisseur}\n"
+            f"- HT          : {fields.montant_ht} MAD\n"
+            f"- TVA         : {fields.montant_tva} MAD\n"
+            f"- TTC         : {fields.montant_ttc} MAD\n"
+            f"- Onglet      : {tab}\n"
+            f"- Ligne       : {plan.row_index}"
+        )
+
+    # -- ecritures elementaires -------------------------------------------
+
+    def write_row_plan(self, plan) -> None:
+        """Ecrit la ligne : valeurs natives en RAW, formules en USER_ENTERED,
+        puis formats et validation recopies du modele du classeur."""
+        for a1_range, values, option in (
+            (plan.range_a_j, plan.values_a_j, "RAW"),
+            (plan.range_n_p, plan.values_n_p, "RAW"),
+            (plan.range_k_m, plan.formulas_k_m, "USER_ENTERED"),
+            (plan.range_q, [plan.formula_q], "USER_ENTERED"),
+        ):
+            self._execute(
+                "GOOGLESHEETS_VALUES_UPDATE",
+                {
+                    "spreadsheet_id": self._spreadsheet_id,
+                    "range": a1_range,
+                    "value_input_option": option,
+                    "values": [values],
+                },
+            )
+        self.apply_row_formats(plan.tab, plan.row_index)
+
+    def apply_row_formats(self, tab: str, row_index: int) -> None:
+        """Reapplique les formats reels du classeur (MAD, %, dates) et la
+        liste de validation du statut."""
+        background = self._row_background(tab, row_index)
+        specs = [
+            (MONEY_COLUMNS, "CURRENCY", MONEY_PATTERN),
+            (DATE_COLUMNS, "DATE", DATE_PATTERN),
+            ((RATE_COLUMN,), "NUMBER", RATE_PATTERN),
+        ]
+        for columns, kind, pattern in specs:
+            for column in columns:
+                try:
+                    self._execute(
+                        "GOOGLESHEETS_FORMAT_CELL",
+                        {
+                            "spreadsheet_id": self._spreadsheet_id,
+                            "sheet_name": tab,
+                            "range": f"{column}{row_index}",
+                            "number_format_type": kind,
+                            "number_format_pattern": pattern,
+                            "background_color": background,
+                        },
+                    )
+                except GmailWatcherError as exc:
+                    logger.warning("Format %s%d non applique: %s", column, row_index, exc)
+        try:
+            self._execute(
+                "GOOGLESHEETS_SET_DATA_VALIDATION_RULE",
+                {
+                    "spreadsheet_id": self._spreadsheet_id,
+                    "sheet_id": self._sheet_id(tab),
+                    "mode": "SET",
+                    "validation_type": "ONE_OF_LIST",
+                    "values": list(STATUS_VALUES),
+                    "strict": True,
+                    "show_custom_ui": True,
+                    "start_row_index": row_index - 1,
+                    "end_row_index": row_index,
+                    "start_column_index": 15,
+                    "end_column_index": 16,
+                },
+            )
+        except GmailWatcherError as exc:
+            logger.warning("Validation du statut non appliquee ligne %d: %s", row_index, exc)
+
+    def _row_background(self, tab: str, row_index: int) -> str:
+        """Couleur de fond REELLE de la ligne, pour ne jamais la repeindre en
+        appliquant un format de nombre."""
+        try:
+            data = self._execute(
+                "GOOGLESHEETS_GET_SPREADSHEET_INFO",
+                {
+                    "spreadsheet_id": self._spreadsheet_id,
+                    "ranges": [f"{tab}!A{row_index}:A{row_index}"],
+                    "fields": "sheets.data.rowData.values(effectiveFormat.backgroundColor)",
+                },
+            )
+            cell = data["sheets"][0]["data"][0]["rowData"][0]["values"][0]
+            color = cell["effectiveFormat"]["backgroundColor"]
+        except Exception:  # noqa: BLE001 - format inconnu : on reste en blanc
+            return DEFAULT_ROW_BACKGROUND
+        return "#" + "".join(
+            f"{round(float(color.get(channel, 1)) * 255):02x}"
+            for channel in ("red", "green", "blue")
+        )
+
+    def _sheet_id(self, tab: str) -> int:
+        data = self._execute(
+            "GOOGLESHEETS_GET_SPREADSHEET_INFO", {"spreadsheet_id": self._spreadsheet_id}
+        )
+        for sheet in data.get("sheets", []):
+            props = sheet.get("properties") or {}
+            if props.get("title") == tab:
+                return int(props.get("sheetId", 0))
+        raise GmailWatcherError(f"Onglet '{tab}' introuvable.")
+
+    def write_detail_lines(self, stable_id: str, tab: str, fields: ExtractedInvoice) -> int:
+        """Conserve les lignes detaillees dans un onglet dedie.
+
+        Les onglets factures n'ont pas de colonnes pour le detail : on ajoute
+        proprement 16_LIGNES_FACTURES, lie a l'ID de facture, sans toucher aux
+        formules ni au tableau de bord.
+        """
+        if not fields.lignes:
+            return 0
+        rows = build_line_rows(
+            stable_id=stable_id, tab=tab, numero=fields.numero or "", lignes=fields.lignes
+        )
+        self._ensure_lines_tab()
+        existing = self._read_range(f"{LIGNES_TAB}!A2:A2000")
+        start = len(existing) + 2
+        end = start + len(rows) - 1
+        self._execute(
+            "GOOGLESHEETS_VALUES_UPDATE",
+            {
+                "spreadsheet_id": self._spreadsheet_id,
+                "range": f"{LIGNES_TAB}!A{start}:I{end}",
+                "value_input_option": "RAW",
+                "values": rows,
+            },
+        )
+        return len(rows)
+
+    def _ensure_lines_tab(self) -> None:
+        if LIGNES_TAB in self._list_tabs():
+            return
+        self._execute(
+            "GOOGLESHEETS_ADD_SHEET",
+            {
+                "spreadsheet_id": self._spreadsheet_id,
+                "title": LIGNES_TAB,
+                "force_unique": False,
+            },
+        )
+        self._execute(
+            "GOOGLESHEETS_VALUES_UPDATE",
+            {
+                "spreadsheet_id": self._spreadsheet_id,
+                "range": f"{LIGNES_TAB}!A1:I1",
+                "value_input_option": "RAW",
+                "values": [LIGNES_HEADERS],
+            },
+        )
+        logger.info("Onglet %s cree (lignes de detail des factures)", LIGNES_TAB)
+
+    def append_import_log(
+        self, plan, pending: PendingInvoice, fields: ExtractedInvoice,
+        supplier: SupplierMatch, *, drive_link: str = "", action: str = "Créé",
+    ) -> None:
+        from datetime import datetime, timezone
+
+        row = build_import_log_row(
+            horodatage=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            stable_id=plan.stable_id,
+            action=action,
+            statut="Importée automatiquement",
+            numero=fields.numero or "",
+            fournisseur=supplier.name or (fields.fournisseur or ""),
+            ice=fields.ice_fournisseur or "",
+            montant_ht=fields.montant_ht,
+            montant_tva=fields.montant_tva,
+            montant_ttc=fields.montant_ttc,
+            tab=plan.tab,
+            row_index=plan.row_index,
+            gmail_message_id=pending.message_id,
+            gmail_expediteur=pending.sender,
+            gmail_objet=pending.subject,
+            piece_jointe=pending.attachment_name,
+            drive_lien=drive_link,
+            type_enregistrement=(
+                "Facture achat" if plan.tab.upper().find("ACHAT") >= 0 else "Facture vente"
+            ),
+        )
+        existing = self._read_range(f"{IMPORTS_LOG_TAB}!A2:A2000")
+        index = len(existing) + 2
+        self._execute(
+            "GOOGLESHEETS_VALUES_UPDATE",
+            {
+                "spreadsheet_id": self._spreadsheet_id,
+                "range": f"{IMPORTS_LOG_TAB}!A{index}:F{index}",
+                "value_input_option": "RAW",
+                "values": [row],
+            },
+        )
+
+    # -- apres validation humaine ------------------------------------------
 
     def confirm(self, message_id: str) -> str:
-        """Ecrit reellement la facture dans Sheets puis archive le PDF dans
-        Drive. Appele UNIQUEMENT apres clic sur 'Confirmer l'ecriture'."""
+        """Ecrit la facture apres validation humaine (cas douteux uniquement)."""
         row = get_gmail_message(self._db_path, message_id)
         if row is None:
             raise GmailWatcherError("Facture introuvable (message inconnu).")
@@ -386,24 +906,74 @@ class GmailWatcher:
             return "Cette facture a deja ete enregistree. Rien n'a ete duplique."
         if row["status"] == "refused":
             return "Cette facture avait ete refusee. Rien n'a ete ecrit."
+        pending = self._pending_from_row(row)
+        tab = self._pick_invoice_tab(self._list_tabs(), pending.scope)
+        supplier = SupplierMatch()
+        if pending.fields.ice_fournisseur:
+            supplier = self.resolve_supplier(
+                pending.fields.ice_fournisseur, pending.fields.fournisseur
+            )
+        if not supplier.supplier_id:
+            existing = [str(r[0]).strip() for r in self._read_range(f"{SUPPLIERS_TAB}!A2:C200") if r]
+            supplier = SupplierMatch(
+                supplier_id=next_supplier_id(existing), name=pending.fields.fournisseur or ""
+            )
+        message = self.import_invoice(pending, supplier=supplier, tab=tab)
+        set_gmail_message_status(self._db_path, message_id, "confirmed")
+        return message
+
+    def _pending_from_row(self, row: dict[str, Any]) -> PendingInvoice:
+        from datetime import date as _date
+
         data = json.loads(row["payload"] or "{}")
 
-        steps: list[str] = []
-        tab = self._write_to_sheet(data)
-        steps.append(f"ecrite dans l'onglet {tab}")
-        logger.info("Facture %s ecrite dans %s (message=%s)", data.get("numero"), tab, message_id)
+        def as_decimal(key: str) -> Decimal | None:
+            value = data.get(key)
+            return Decimal(value) if value is not None else None
 
-        try:
-            archived = self._archive_to_drive(message_id, row["attachment_name"] or "facture.pdf")
-            steps.append(f"PDF archive dans Drive ({archived})")
-            logger.info("PDF archive dans Drive (message=%s)", message_id)
-        except GmailWatcherError as exc:
-            steps.append(f"archivage Drive impossible : {exc}")
-            logger.warning("Archivage Drive impossible (message=%s): %s", message_id, exc)
+        def as_date(key: str) -> _date | None:
+            value = data.get(key)
+            return _date.fromisoformat(value) if value else None
 
-        set_gmail_message_status(self._db_path, message_id, "confirmed")
-        return "Facture {} enregistree :\n- {}".format(
-            data.get("numero") or message_id, "\n- ".join(steps)
+        fields = ExtractedInvoice(
+            numero=data.get("numero"),
+            date_facture=as_date("date_facture"),
+            date_echeance=as_date("date_echeance"),
+            fournisseur=data.get("fournisseur"),
+            client=data.get("client"),
+            montant_ht=as_decimal("montant_ht"),
+            taux_tva=as_decimal("taux_tva"),
+            montant_tva=as_decimal("montant_tva"),
+            montant_ttc=as_decimal("montant_ttc"),
+            devise=data.get("devise") or "",
+            statut=data.get("statut"),
+            mode_paiement=data.get("mode_paiement"),
+            ice_fournisseur=data.get("ice_fournisseur"),
+            ice_client=data.get("ice_client"),
+            missing=list(data.get("missing") or []),
+            anomalies=list(data.get("anomalies") or []),
+            ambigus=list(data.get("ambigus") or []),
+            is_avoir=bool(data.get("is_avoir")),
+        )
+        fields.lignes = [
+            InvoiceLine(
+                description=l.get("description", ""),
+                quantite=Decimal(l["quantite"]),
+                prix_unitaire_ht=Decimal(l["prix_unitaire_ht"]),
+                taux_tva=Decimal(l["taux_tva"]) if l.get("taux_tva") is not None else None,
+                total_ht=Decimal(l["total_ht"]),
+            )
+            for l in (data.get("lignes") or [])
+        ]
+        return PendingInvoice(
+            message_id=row["message_id"],
+            thread_id=row["thread_id"] or "",
+            subject=row["subject"] or "",
+            sender=row["sender"] or "",
+            received_at=row["received_at"] or "",
+            attachment_name=row["attachment_name"] or "",
+            fields=fields,
+            scope=data.get("scope", "purchases"),
         )
 
     def refuse(self, message_id: str) -> str:
@@ -418,49 +988,6 @@ class GmailWatcher:
             f"Facture {row['numero'] or message_id} refusee. "
             "Rien n'a ete ecrit dans Sheets ni dans Drive."
         )
-
-    def _write_to_sheet(self, data: dict[str, Any]) -> str:
-        if not self._spreadsheet_id:
-            raise GmailWatcherError("GOOGLE_SHEET_ID manquant : ecriture impossible.")
-        scope = data.get("scope", "purchases")
-        tabs = self._list_tabs()
-        tab = self._pick_invoice_tab(tabs, scope)
-        headers = _INVOICE_HEADERS if scope == "purchases" else _SALES_HEADERS
-        numero = data.get("numero") or ""
-        devise = data.get("devise") or ""
-
-        def money(key: str) -> str:
-            value = data.get(key)
-            return f"{value} {devise}".strip() if value is not None else ""
-
-        row = [
-            numero,                                   # ID (cle d'idempotence)
-            data.get("date_facture") or "",
-            numero,
-            "",                                       # ID tiers : inconnu depuis le PDF
-            data.get("fournisseur") if scope == "purchases" else data.get("client") or "",
-            f"Import email - {data.get('attachment_name') or ''}".strip(" -"),
-            money("montant_ht"),
-            f"{data.get('taux_tva')}%" if data.get("taux_tva") is not None else "",
-            money("montant_tva"),
-            money("montant_ttc"),
-            "", "", "",                               # colonnes formules du Sheet
-            data.get("date_echeance") or "",
-            "",                                       # montant paye : inconnu
-            data.get("statut") or "",
-            "",                                       # jours de retard : formule
-        ]
-        self._execute(
-            "GOOGLESHEETS_UPSERT_ROWS",
-            {
-                "spreadsheetId": self._spreadsheet_id,
-                "sheetName": tab,
-                "headers": headers,
-                "rows": [row],
-                "keyColumn": headers[0],
-            },
-        )
-        return tab
 
     def _list_tabs(self) -> list[str]:
         data = self._execute(
@@ -486,6 +1013,7 @@ class GmailWatcher:
         )
 
     def _archive_to_drive(self, message_id: str, filename: str) -> str:
+        """Archive le PDF et retourne son lien Drive (conserve dans le journal)."""
         folder_id = self._ensure_drive_folder()
         message = self.fetch_message(message_id)
         attachment = self.first_pdf_attachment(message)
@@ -510,8 +1038,8 @@ class GmailWatcher:
         args: dict[str, Any] = {"file_url": url, "file_name": filename}
         if folder_id:
             args["folder_id"] = folder_id
-        self._execute("GOOGLEDRIVE_UPLOAD_FROM_URL", args)
-        return self._drive_folder
+        uploaded = self._execute("GOOGLEDRIVE_UPLOAD_FROM_URL", args)
+        return _drive_link(uploaded) or self._drive_folder
 
     def _ensure_drive_folder(self) -> str:
         try:
@@ -530,3 +1058,20 @@ class GmailWatcher:
         except GmailWatcherError:
             logger.info("Dossier Drive non cree, archivage a la racine")
             return ""
+
+
+def _drive_link(uploaded: dict[str, Any]) -> str:
+    """Lien consultable du fichier archive, quelle que soit la forme de la
+    reponse Drive."""
+    candidates = [uploaded, uploaded.get("file") or {}, uploaded.get("response_data") or {}]
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        for key in ("webViewLink", "webContentLink", "display_url", "link"):
+            value = candidate.get(key)
+            if value:
+                return str(value)
+        file_id = candidate.get("id")
+        if file_id:
+            return f"https://drive.google.com/file/d/{file_id}/view"
+    return ""
