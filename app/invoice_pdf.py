@@ -131,6 +131,10 @@ class ExtractedInvoice:
     # on ne tranche jamais tout seul, on demande une validation humaine.
     ambigus: list[str] = field(default_factory=list)
     is_avoir: bool = False
+    # Le document ressemble-t-il reellement a une facture ? Determine par le
+    # CONTENU du PDF, pas par l'objet de l'email : la requete Gmail ne filtre
+    # plus sur un marqueur de sujet.
+    is_invoice: bool = False
 
     @property
     def is_complete(self) -> bool:
@@ -249,6 +253,56 @@ def extract_ices(lines: list[str]) -> tuple[str | None, str | None]:
     return supplier, client
 
 
+# Un document n'est traite comme une facture que si son texte porte un
+# marqueur explicite ET des donnees comptables exploitables. Un contrat, un
+# releve, une plaquette commerciale ou un bon de livraison sont ainsi ignores
+# sans jamais atteindre le classeur.
+# Les marqueurs sont cherches en MOTS ENTIERS : sans cela "DEVIS" matcherait
+# "DEVISE", present dans le pied de page de toute facture en MAD.
+_INVOICE_MARKERS = (
+    "FACTURE", "FACTURES", "INVOICE", "NOTE DE CREDIT", "AVOIR", "FATURA",
+    "RECHNUNG",
+)
+_NON_INVOICE_MARKERS = (
+    "BON DE COMMANDE", "BON DE LIVRAISON", "DEVIS", "PROFORMA", "CONTRAT",
+    "RELEVE BANCAIRE", "PURCHASE ORDER", "DELIVERY NOTE", "QUOTATION",
+)
+
+
+def _has_marker(normalized_text: str, markers: tuple[str, ...]) -> bool:
+    return any(
+        re.search(rf"\b{re.escape(marker)}\b", normalized_text) for marker in markers
+    )
+
+
+def looks_like_invoice(
+    result: "ExtractedInvoice", normalized_text: str, lines: list[str]
+) -> bool:
+    """Vrai si le PDF est bien une facture (ou un avoir).
+
+    Conditions cumulatives, toutes deterministes :
+      - le document se declare facture, soit par une ligne de titre ("FACTURE"
+        seule sur sa ligne), soit par un marqueur dans le texte ;
+      - au moins un montant total exploitable ;
+      - au moins un element d'identification (numero ou date de facture).
+
+    Un marqueur de document NON comptable (devis, bon de commande, contrat)
+    l'emporte, sauf si le document porte un vrai titre de facture. Le simple
+    libelle "DATE DE FACTURE" ne suffit alors pas : un devis en comporte un
+    aussi. Mieux vaut ignorer une vraie facture que d'ecrire un devis dans
+    la comptabilite.
+    """
+    titles = {_norm(line) for line in lines}
+    declared_invoice = bool(titles & set(_INVOICE_MARKERS))
+    if _has_marker(normalized_text, _NON_INVOICE_MARKERS) and not declared_invoice:
+        return False
+    if not declared_invoice and not _has_marker(normalized_text, _INVOICE_MARKERS):
+        return False
+    if result.montant_ttc is None and result.montant_ht is None:
+        return False
+    return result.numero is not None or result.date_facture is not None
+
+
 _TABLE_HEADER_START = "DESCRIPTION"
 _TABLE_TOTALS_LABELS = ("TOTAL HT", "TOTAL", "SOUS TOTAL", "SOUS-TOTAL", "TOTAL TTC", "TVA")
 
@@ -363,8 +417,9 @@ def extract_invoice_fields(text: str) -> ExtractedInvoice:
     result.ice_fournisseur, result.ice_client = extract_ices(lines)
     result.lignes = extract_lines(lines)
 
-    # --- avoir / note de credit ------------------------------------------
+    # --- nature du document et avoir --------------------------------------
     normalized_text = _norm(text)
+    result.is_invoice = looks_like_invoice(result, normalized_text, lines)
     result.is_avoir = bool(
         re.search(r"\bAVOIR\b|\bNOTE DE CREDIT\b|\bFACTURE D AVOIR\b", normalized_text)
         or (result.montant_ttc is not None and result.montant_ttc < 0)
