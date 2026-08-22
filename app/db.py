@@ -60,6 +60,17 @@ CREATE TABLE IF NOT EXISTS invoice_fingerprints (
     numero TEXT,
     ice TEXT,
     message_id TEXT,
+    tab TEXT,
+    row_index INTEGER,
+    lines_written INTEGER NOT NULL DEFAULT 0,
+    drive_link TEXT,
+    log_row INTEGER,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS gmail_cursor (
+    chat_id TEXT PRIMARY KEY,
+    since_epoch INTEGER NOT NULL,
     created_at TEXT NOT NULL
 );
 
@@ -77,6 +88,12 @@ CREATE TABLE IF NOT EXISTS demo_reconciliations (
 _MIGRATIONS = [
     "ALTER TABLE demo_invoices ADD COLUMN chat_id TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE demo_bank_lines ADD COLUMN chat_id TEXT NOT NULL DEFAULT ''",
+    # Points de reprise de l'import (bases creees avant l'import idempotent).
+    "ALTER TABLE invoice_fingerprints ADD COLUMN tab TEXT",
+    "ALTER TABLE invoice_fingerprints ADD COLUMN row_index INTEGER",
+    "ALTER TABLE invoice_fingerprints ADD COLUMN lines_written INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE invoice_fingerprints ADD COLUMN drive_link TEXT",
+    "ALTER TABLE invoice_fingerprints ADD COLUMN log_row INTEGER",
 ]
 
 
@@ -293,3 +310,67 @@ def release_invoice_fingerprint(db_path: str, fingerprint: str) -> None:
     with connect(db_path) as conn:
         conn.execute("DELETE FROM invoice_fingerprints WHERE fingerprint = ?", (fingerprint,))
         conn.commit()
+
+
+def update_invoice_fingerprint(db_path: str, fingerprint: str, **fields: Any) -> None:
+    """Met a jour les points de reprise d'un import (onglet, ligne, Drive...).
+
+    Chaque etape reussie est enregistree immediatement : une relance apres
+    panne reprend exactement la ou l'import s'etait arrete, sans jamais
+    reecrire une ligne deja ecrite.
+    """
+    if not fingerprint or not fields:
+        return
+    allowed = ("stable_id", "tab", "row_index", "lines_written", "drive_link", "log_row")
+    columns = [k for k in fields if k in allowed]
+    if not columns:
+        return
+    assignments = ", ".join(f"{c} = ?" for c in columns)
+    with connect(db_path) as conn:
+        conn.execute(
+            f"UPDATE invoice_fingerprints SET {assignments} WHERE fingerprint = ?",
+            (*(fields[c] for c in columns), fingerprint),
+        )
+        conn.commit()
+
+
+def list_partial_imports(db_path: str, chat_id: int) -> list[dict[str, Any]]:
+    """Emails dont l'ecriture comptable a reussi mais dont l'archivage ou le
+    journal n'a pas abouti : a terminer au prochain cycle."""
+    with connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM gmail_processed_emails WHERE chat_id = ? AND status = 'partial' "
+            "ORDER BY created_at",
+            (str(chat_id),),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+# --- Curseur Gmail durable -----------------------------------------------
+# Fixe au PREMIER demarrage : le worker n'importera jamais un email anterieur.
+# Sans lui, elargir la requete a toute la boite de reception ferait remonter
+# des annees d'anciennes pieces jointes.
+
+def get_or_init_gmail_cursor(db_path: str, chat_id: int, now_epoch: int) -> int:
+    """Retourne le curseur (epoch en secondes), en le creant au besoin.
+
+    Le curseur n'est JAMAIS avance ni recule ensuite : c'est un plancher
+    stable. L'anti-doublon par message_id se charge du reste.
+    """
+    from datetime import datetime, timezone
+
+    with connect(db_path) as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO gmail_cursor (chat_id, since_epoch, created_at) "
+            "VALUES (?,?,?)",
+            (
+                str(chat_id), int(now_epoch),
+                datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            ),
+        )
+        conn.commit()
+        row = conn.execute(
+            "SELECT since_epoch FROM gmail_cursor WHERE chat_id = ?", (str(chat_id),)
+        ).fetchone()
+        return int(row[0])
