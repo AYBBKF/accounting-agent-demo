@@ -335,12 +335,44 @@ def test_a_foreign_currency_invoice_without_a_rate_asks_for_validation(pipeline,
 
 # === 10. avoir envoye en validation ======================================
 
-def test_a_credit_note_requires_human_validation(pipeline, workbook):
+def test_a_credit_note_that_names_its_invoice_is_written_automatically(pipeline, workbook):
+    """Un avoir dont la facture d'origine est citee n'a rien d'incertain.
+
+    L'ancienne regle envoyait TOUS les avoirs en validation. Ce qui engage
+    la comptabilite dans les deux sens, c'est l'imputation ; quand la facture
+    d'origine est nommee et que les montants sont coherents, l'imputation est
+    certaine et l'ecriture n'a pas a etre confirmee.
+    """
+    doc = extract_document([text_of(AVOIR)])
+    assert doc.facture_liee == "FAC-TEST-2026-002"
+
     outcome = run(pipeline, AVOIR)
-    assert outcome.action == ACTION_REVIEW
-    assert any("avoir" in r for r in outcome.reasons)
+    assert outcome.action == ACTION_AUTO
+    row = workbook.row("17_AVOIRS", outcome.row_index)
+    assert row[2] == "AV-2026-003"
+    assert row[6] == "FAC-TEST-2026-002"
+    assert row[7] == -600.0 and row[9] == -120.0 and row[10] == -720.0
     assert workbook.writes_to("05_FACTURES_ACHATS") == []
-    assert workbook.writes_to("17_AVOIRS") == []
+
+
+def test_a_credit_note_without_a_known_invoice_still_asks(pipeline, workbook):
+    """Sans facture d'origine, l'imputation redevient une decision humaine."""
+    from app.doc_policy import DecisionContext, decide
+
+    doc = extract_document([text_of(AVOIR)])
+    doc.facture_liee = None
+    decision = decide(doc, DecisionContext())
+    assert decision.action == ACTION_REVIEW
+    assert any("facture d'origine" in r for r in decision.reasons)
+
+
+def test_a_credit_note_matching_several_invoices_asks(pipeline, workbook):
+    from app.doc_policy import DecisionContext, decide
+
+    doc = extract_document([text_of(AVOIR)])
+    decision = decide(doc, DecisionContext(credit_note_targets=2))
+    assert decision.action == ACTION_REVIEW
+    assert any("peuvent correspondre a cet avoir" in r for r in decision.reasons)
 
 
 def test_a_validated_credit_note_is_written_with_negative_amounts(pipeline, workbook):
@@ -374,13 +406,61 @@ def test_the_tolerance_is_explicit_and_absorbs_a_rounding_cent():
     assert decide(doc, DecisionContext()).action == ACTION_REVIEW
 
 
-# === 12. ICE manquant ===================================================
+# === 12. ICE manquant : signale, jamais bloquant =========================
 
-def test_a_missing_ice_goes_to_validation_without_creating_the_supplier(pipeline, workbook):
+def test_a_missing_ice_alone_is_imported_automatically(pipeline, workbook):
+    """RECETTE 2 : l'absence d'ICE seule ne demande plus rien.
+
+    FAC-TEST-2026-004 : montants coherents, fournisseur EXPRESS SERVICE
+    lisible. Il n'y a aucune decision comptable a prendre, donc aucune
+    raison de reveiller le client. Une fiche provisoire est creee, son ICE
+    porte "A completer", et l'avertissement voyage avec le document.
+    """
+    outcome = run(pipeline, SANS_ICE)
+    assert outcome.action == ACTION_AUTO
+    assert outcome.tab == "05_FACTURES_ACHATS"
+    assert outcome.reasons == []
+
+    row = workbook.row("05_FACTURES_ACHATS", outcome.row_index)
+    assert row[2] == "FAC-TEST-2026-004"
+    assert row[4] == "EXPRESS SERVICE"
+
+    created = workbook.rows("03_FOURNISSEURS")[-1]
+    assert created[0] == "FRS-007"                 # identifiant interne provisoire
+    assert created[1] == "EXPRESS SERVICE"
+    assert created[2] == "A completer"             # ni vide ni invente
+
+    assert any("ICE absent" in w for w in outcome.warnings)
+
+
+def test_the_missing_ice_warning_reaches_the_import_log(pipeline, workbook):
+    outcome = run(pipeline, SANS_ICE)
+    detail = workbook.rows("14_IMPORTS_LOG")[-1][5]
+    assert "Avertissement" in detail and "ICE absent" in detail
+    assert outcome.stable_id
+
+
+def test_a_known_supplier_without_ice_is_reused_not_duplicated(pipeline, workbook):
+    """Regle 1 : nom normalise unique -> on reutilise la fiche existante."""
+    before = len(workbook.rows("03_FOURNISSEURS"))
+    workbook.tabs["03_FOURNISSEURS"].append(
+        ["FRS-099", "EXPRESS SERVICE", "", "", "", "", 30]
+    )
+    outcome = run(pipeline, SANS_ICE)
+    assert outcome.action == ACTION_AUTO
+    assert workbook.row("05_FACTURES_ACHATS", outcome.row_index)[3] == "FRS-099"
+    assert len(workbook.rows("03_FOURNISSEURS")) == before + 1   # la seule ajoutee ici
+
+
+def test_several_suppliers_with_the_same_name_do_require_a_decision(pipeline, workbook):
+    """Regle 5 : c'est l'AMBIGUITE qui demande, pas l'absence d'ICE."""
+    for identifier in ("FRS-098", "FRS-099"):
+        workbook.tabs["03_FOURNISSEURS"].append(
+            [identifier, "EXPRESS SERVICE", "", "", "", "", 30]
+        )
     outcome = run(pipeline, SANS_ICE)
     assert outcome.action == ACTION_REVIEW
-    assert any("ICE" in r for r in outcome.reasons)
-    assert workbook.writes_to("03_FOURNISSEURS") == []
+    assert any("EXPRESS SERVICE" in r for r in outcome.reasons)
     assert workbook.writes_to("05_FACTURES_ACHATS") == []
 
 
