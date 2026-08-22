@@ -3,13 +3,23 @@
 Module PUR : aucun I/O, aucun appel reseau, aucun modele de langage. La
 decision est donc reproductible et entierement testable.
 
-Import automatique (aucun bouton) uniquement si TOUT est vrai :
-  type certain, champs obligatoires presents, montants lisibles,
-  HT + TVA = TTC dans la tolerance, devise connue, tiers identifie sans
-  ambiguite, pas de doublon, aucun conflit avec l'existant.
+Regle de conduite : un document LISIBLE et COHERENT part en comptabilite
+sans rien demander. La validation humaine est reservee aux situations ou
+aucune decision comptable fiable n'est possible :
 
-Validation humaine dans les seuls cas de doute reels enumeres par le
-client. Un doublon CERTAIN n'est jamais ecrit : on informe, sans bouton.
+  - contradiction entre HT, TVA et TTC ;
+  - plusieurs montants possibles pour un meme champ ;
+  - type de document incertain ;
+  - plusieurs tiers existants peuvent correspondre ;
+  - doublon probable mais non certain ;
+  - recu pouvant solder plusieurs factures ;
+  - devise etrangere sans taux de change exploitable ;
+  - avoir dont la facture d'origine est inconnue ou multiple.
+
+Tout le reste est un AVERTISSEMENT : signale dans le journal d'import et
+dans la notification, sans jamais retenir l'ecriture. L'ICE absent en est
+le cas type. Un doublon CERTAIN n'est jamais ecrit : on informe, sans
+bouton.
 """
 from __future__ import annotations
 
@@ -70,6 +80,8 @@ class DecisionContext:
     party_reason: str = ""
     # Nombre de factures candidates pour un recu de paiement.
     receipt_matches: int = 0
+    # Nombre de factures candidates pour l'imputation d'un avoir.
+    credit_note_targets: int = 1
     # Taux de change disponible pour une facture en devise etrangere.
     exchange_rate: Decimal | None = None
     tolerance: Decimal = DEFAULT_TOLERANCE
@@ -80,6 +92,11 @@ class Decision:
     action: str
     reasons: list[str] = field(default_factory=list)
     existing_ref: str = ""
+    # Ce qui merite d'etre SIGNALE sans empecher l'ecriture. Un champ
+    # secondaire absent n'a jamais justifie de reveiller le client : il
+    # apparait dans le journal d'import et dans la notification, et
+    # l'ecriture comptable a lieu quand meme.
+    warnings: list[str] = field(default_factory=list)
 
     @property
     def is_auto(self) -> bool:
@@ -127,6 +144,7 @@ def decide(doc: ExtractedDocument, context: DecisionContext | None = None) -> De
         )
 
     reasons: list[str] = []
+    warnings: list[str] = []
 
     if doc.classification.confidence < MIN_TYPE_CONFIDENCE:
         reasons.append(
@@ -161,7 +179,15 @@ def decide(doc: ExtractedDocument, context: DecisionContext | None = None) -> De
                     f"facture en {doc.devise} sans taux de change exploitable"
                 )
 
-    # 7. Tiers.
+    # 7. Tiers. SEULE l'ambiguite bloque : plusieurs fiches existantes
+    #    peuvent correspondre au meme nom, et choisir a la place du client
+    #    reviendrait a imputer une charge au mauvais fournisseur.
+    #
+    #    L'ICE absent, lui, ne bloque plus. Une facture dont les montants
+    #    sont coherents et dont le fournisseur est lisible reste parfaitement
+    #    comptabilisable : on cree une fiche provisoire, on laisse l'ICE a
+    #    completer, et on le SIGNALE. Bloquer la-dessus transformait une
+    #    comptabilite automatique en file d'attente de confirmations.
     if ctx.party_ambiguous:
         reasons.append(ctx.party_reason or "tiers ambigu (plusieurs correspondances)")
     if doc.doc_type in NEEDS_PARTY_ID:
@@ -169,13 +195,31 @@ def decide(doc: ExtractedDocument, context: DecisionContext | None = None) -> De
             doc.emetteur_ice if doc.doc_type in (PURCHASE_INVOICE, SUPPLIER_CREDIT_NOTE)
             else doc.destinataire_ice
         )
+        party_name = (
+            doc.emetteur if doc.doc_type in (PURCHASE_INVOICE, SUPPLIER_CREDIT_NOTE)
+            else doc.destinataire
+        )
         if not needed_ice:
-            reasons.append("ICE du tiers absent du document")
+            if not (party_name or "").strip():
+                # Ni ICE ni raison sociale : plus rien n'identifie le tiers.
+                reasons.append("tiers non identifiable (ni ICE ni raison sociale)")
+            else:
+                warnings.append(
+                    f"ICE absent du document : fiche tiers '{party_name}' a completer"
+                )
 
-    # 8. Avoirs : l'imputation sur la facture d'origine engage la
-    #    comptabilite dans les deux sens. Jamais sans accord humain.
+    # 8. Avoirs : ce qui engage la comptabilite dans les deux sens, c'est
+    #    l'imputation sur une facture d'origine. Quand cette facture est
+    #    citee et que les montants sont coherents, l'ecriture est certaine
+    #    et n'a pas besoin d'accord humain ; c'est l'incertitude sur
+    #    l'origine ou sur l'effet comptable qui exige une decision.
     if doc.doc_type in (SUPPLIER_CREDIT_NOTE, CLIENT_CREDIT_NOTE):
-        reasons.append("avoir : imputation a confirmer avant comptabilisation")
+        if not (doc.facture_liee or "").strip():
+            reasons.append("avoir sans facture d'origine identifiable")
+        elif ctx.credit_note_targets > 1:
+            reasons.append(
+                f"{ctx.credit_note_targets} factures peuvent correspondre a cet avoir"
+            )
 
     # 9. Recu de paiement : ne jamais solder une facture sur une simple
     #    ressemblance de montant.
@@ -207,9 +251,10 @@ def decide(doc: ExtractedDocument, context: DecisionContext | None = None) -> De
 
     if reasons:
         return Decision(
-            action=ACTION_REVIEW, reasons=reasons, existing_ref=ctx.duplicates.existing_ref
+            action=ACTION_REVIEW, reasons=reasons,
+            existing_ref=ctx.duplicates.existing_ref, warnings=warnings,
         )
-    return Decision(action=ACTION_AUTO)
+    return Decision(action=ACTION_AUTO, warnings=warnings)
 
 
 def fingerprint(party_id: str | None, numero: str | None) -> str:
