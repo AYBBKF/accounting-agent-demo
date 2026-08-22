@@ -60,6 +60,10 @@ CREATE TABLE IF NOT EXISTS documents (
     file_sha256 TEXT NOT NULL,
     filename TEXT,
     container TEXT,
+    parent_attachment_id TEXT,
+    parent_filename TEXT,
+    member_path TEXT,
+    local_path TEXT,
     doc_type TEXT,
     numero TEXT,
     state TEXT NOT NULL,
@@ -107,9 +111,24 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+# Colonnes ajoutees apres la mise en production. `CREATE TABLE IF NOT EXISTS`
+# ne les ajoute PAS a une table deja creee : sans cette migration, un volume
+# existant garderait l'ancienne table et toute ecriture echouerait.
+_ADDED_COLUMNS = (
+    ("parent_attachment_id", "TEXT"),
+    ("parent_filename", "TEXT"),
+    ("member_path", "TEXT"),
+    ("local_path", "TEXT"),
+)
+
+
 def ensure_schema(db_path: str) -> None:
     with connect(db_path) as conn:
         conn.executescript(SCHEMA)
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(documents)")}
+        for column, kind in _ADDED_COLUMNS:
+            if column not in existing:
+                conn.execute(f"ALTER TABLE documents ADD COLUMN {column} {kind}")
         conn.commit()
 
 
@@ -125,6 +144,10 @@ def claim_document(
     file_sha256: str,
     filename: str = "",
     container: str = "",
+    parent_attachment_id: str = "",
+    parent_filename: str = "",
+    member_path: str = "",
+    local_path: str = "",
 ) -> bool:
     """Reserve un document. True s'il est nouveau, False s'il est deja connu.
 
@@ -135,10 +158,12 @@ def claim_document(
         cur = conn.execute(
             "INSERT OR IGNORE INTO documents "
             "(doc_key, chat_id, gmail_message_id, attachment_id, file_sha256, "
-            " filename, container, state, created_at, updated_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            " filename, container, parent_attachment_id, parent_filename, "
+            " member_path, local_path, state, created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (doc_key, str(chat_id), gmail_message_id, attachment_id, file_sha256,
-             filename, container, DETECTED, _now(), _now()),
+             filename, container, parent_attachment_id, parent_filename,
+             member_path, local_path, DETECTED, _now(), _now()),
         )
         conn.commit()
         return cur.rowcount == 1
@@ -160,7 +185,8 @@ def update_document(db_path: str, doc_key: str, **fields: Any) -> None:
     allowed = (
         "state", "doc_type", "numero", "stable_id", "tab", "row_index",
         "lines_written", "drive_link", "calendar_event", "log_row", "payload",
-        "error",
+        "error", "attachment_id", "parent_attachment_id", "parent_filename",
+        "member_path", "local_path",
     )
     columns = [k for k in fields if k in allowed]
     if not columns:
@@ -247,6 +273,43 @@ def find_by_key_prefix(db_path: str, chat_id: int, prefix: str) -> dict[str, Any
             (str(chat_id), prefix),
         ).fetchone()
         return dict(row) if row else None
+
+
+def find_by_message_and_sha(
+    db_path: str, chat_id: int, gmail_message_id: str, file_sha256: str
+) -> dict[str, Any] | None:
+    """Le MEME fichier, dans le MEME email : c'est le meme document.
+
+    Point d'ancrage stable du pipeline. La cle d'idempotence a d'abord ete
+    calculee a partir de l'`attachmentId` de Gmail, qui change d'une lecture
+    a l'autre : chaque cycle recreait alors un document neuf pour une piece
+    deja traitee. Ce couple (email, empreinte), lui, ne bouge jamais.
+    """
+    import sqlite3
+
+    if not gmail_message_id or not file_sha256:
+        return None
+    with connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM documents WHERE chat_id = ? AND gmail_message_id = ? "
+            "AND file_sha256 = ? ORDER BY created_at LIMIT 1",
+            (str(chat_id), gmail_message_id, file_sha256),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def list_pending_review(db_path: str, chat_id: int) -> list[dict[str, Any]]:
+    """Documents qui attendent reellement une decision humaine."""
+    import sqlite3
+
+    with connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM documents WHERE chat_id = ? AND state = ? ORDER BY created_at",
+            (str(chat_id), NEEDS_REVIEW),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
 
 def list_unfinished(db_path: str, chat_id: int) -> list[dict[str, Any]]:
