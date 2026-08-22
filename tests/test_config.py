@@ -71,11 +71,23 @@ def test_every_service_has_a_configured_auth_config():
 
 def test_the_gmail_query_no_longer_requires_the_subject_marker():
     # Le client a explicitement autorise l'elargissement : c'est desormais le
-    # contenu du PDF qui decide s'il s'agit d'une facture.
+    # contenu du document qui decide de son type.
     settings = Settings(_env_file=None)
-    assert settings.gmail_watch_query == "in:inbox has:attachment filename:pdf"
+    assert settings.gmail_watch_query == "in:inbox has:attachment {filename:pdf filename:zip}"
     assert "XBLASTE" not in settings.gmail_watch_query
     assert "subject:" not in settings.gmail_watch_query
+
+
+def test_the_gmail_query_covers_zip_archives_as_well_as_pdf():
+    """Le code sait ouvrir les ZIP : la requete doit aussi les ramener.
+
+    Sans le groupe OU, un email ne portant que le pack ZIP n'etait jamais
+    vu par le worker - le classifieur le plus soigne n'y pouvait rien.
+    """
+    query = Settings(_env_file=None).gmail_watch_query
+    assert "filename:pdf" in query
+    assert "filename:zip" in query
+    assert "{" in query and "}" in query, "sans accolade, Gmail exigerait les DEUX extensions"
 
 
 def test_the_gmail_query_stays_overridable_by_environment():

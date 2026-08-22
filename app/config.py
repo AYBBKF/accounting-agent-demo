@@ -89,15 +89,22 @@ class Settings(BaseSettings):
     # exactement comme avant.
     #
     # La requete ne filtre plus sur un marqueur de sujet : c'est le CONTENU
-    # du PDF qui decide s'il s'agit d'une facture (voir looks_like_invoice
-    # dans app/invoice_pdf.py). Deux garde-fous rendent cet elargissement
-    # fiable : un curseur Gmail durable, fixe au premier demarrage, qui empeche
-    # d'importer l'historique de la boite ; et l'anti-doublon par message_id
-    # puis par (ICE fournisseur + numero de facture).
+    # du document qui decide de son type (voir app/doc_types.py). Deux
+    # garde-fous rendent cet elargissement fiable : un curseur Gmail durable,
+    # fixe au premier demarrage, qui empeche d'importer l'historique de la
+    # boite ; et l'anti-doublon par empreinte du fichier puis par
+    # (identifiant du tiers + numero du document).
+    #
+    # L'accolade forme un OU : `{filename:pdf filename:zip}` retient aussi
+    # bien un email ne portant que des PDF, qu'un email ne portant qu'une
+    # archive ZIP, que les deux a la fois. Sans elle, un pack envoye en ZIP
+    # seul n'etait jamais vu par le worker, alors meme que le code sait
+    # depuis toujours ouvrir les archives.
     gmail_watch_enabled: bool = Field(default=True, alias="GMAIL_WATCH_ENABLED")
     gmail_watch_chat_id: int = Field(default=0, alias="GMAIL_WATCH_CHAT_ID")
     gmail_watch_query: str = Field(
-        default="in:inbox has:attachment filename:pdf", alias="GMAIL_WATCH_QUERY"
+        default="in:inbox has:attachment {filename:pdf filename:zip}",
+        alias="GMAIL_WATCH_QUERY",
     )
     gmail_watch_interval_seconds: int = Field(default=60, alias="GMAIL_WATCH_INTERVAL_SECONDS")
     gmail_watch_max_per_cycle: int = Field(default=5, alias="GMAIL_WATCH_MAX_PER_CYCLE")
