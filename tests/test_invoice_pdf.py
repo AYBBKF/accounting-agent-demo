@@ -187,3 +187,47 @@ def test_a_clean_invoice_has_no_ambiguity_and_is_not_a_credit_note():
 def test_a_credit_note_is_flagged():
     text = REAL_PDF_TEXT.replace("FACTURE\n", "FACTURE D AVOIR\n")
     assert extract_invoice_fields(text).is_avoir is True
+
+
+# --- reconnaissance du type de document -----------------------------------
+# La requete Gmail ne filtre plus sur l'objet : c'est le contenu du PDF qui
+# decide. Un document non comptable ne doit jamais atteindre le classeur.
+
+def test_a_real_invoice_is_recognised():
+    assert extract_invoice_fields(REAL_PDF_TEXT).is_invoice is True
+
+
+QUOTE = (
+    "DEVIS\nN° DEV-2026-010\nDATE DE FACTURE\n21/08/2026\n"
+    " Total HT\n 1 000.00 MAD\n TOTAL TTC\n 1 200.00 MAD\n"
+)
+
+
+@pytest.mark.parametrize(
+    "titre", ["DEVIS", "BON DE COMMANDE", "BON DE LIVRAISON", "CONTRAT", "PROFORMA"]
+)
+def test_a_non_accounting_document_is_rejected(titre):
+    text = QUOTE.replace("DEVIS", titre, 1)
+    assert extract_invoice_fields(text).is_invoice is False
+
+
+def test_the_word_devise_never_makes_an_invoice_look_like_a_quote():
+    # "DEVISE / MAD" figure sur toute facture marocaine : la recherche doit
+    # se faire en mots entiers, sinon aucune facture ne passerait.
+    assert "DEVISE" in REAL_PDF_TEXT.upper()
+    assert extract_invoice_fields(REAL_PDF_TEXT).is_invoice is True
+
+
+def test_a_document_without_any_amount_is_not_an_invoice():
+    assert extract_invoice_fields("FACTURE\nN° FAC-1\nMerci de votre confiance.").is_invoice is False
+
+
+def test_an_unrelated_document_is_not_an_invoice():
+    assert extract_invoice_fields("Compte rendu de reunion\nPoints abordes\nfin").is_invoice is False
+
+
+def test_a_credit_note_is_still_treated_as_an_accounting_document():
+    text = REAL_PDF_TEXT.replace("FACTURE\n", "AVOIR\n", 1)
+    fields = extract_invoice_fields(text)
+    assert fields.is_invoice is True
+    assert fields.is_avoir is True
