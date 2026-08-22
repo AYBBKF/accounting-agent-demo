@@ -95,6 +95,17 @@ from app.invoice_sheet import (
 
 logger = logging.getLogger("demo_bot.doc_pipeline")
 
+# Heure et fuseau des rappels d'echeance. Une echeance est une DATE ; le
+# calendrier veut un instant. On pose donc le rappel en debut de matinee
+# ouvrable plutot que d'inventer une heure au milieu de la nuit UTC.
+REMINDER_HOUR = "09:00:00"
+REMINDER_TIMEZONE = "Africa/Casablanca"
+
+# Saut de ligne ecrit sans sequence d'echappement : le transport JSON des
+# outils de publication reinterprete les sequences d'echappement et
+# corromprait le fichier. Un module sans antislash traverse la chaine intact.
+NEWLINE = chr(10)
+
 
 class PipelineError(RuntimeError):
     """Erreur destinee aux logs et au client, jamais porteuse de secret."""
@@ -320,26 +331,32 @@ class DocumentPipeline:
     # -- Drive -------------------------------------------------------------
 
     def ensure_folder(self, name: str, parent: str = "") -> str:
+        """Retrouve ou cree UN dossier, toujours dans son parent.
+
+        La recherche est bornee au parent et au nom EXACT. Une recherche non
+        bornee renverrait le premier dossier venu du Drive : les pieces
+        seraient archivees dans un dossier arbitraire, ce qui est pire qu'un
+        echec franc.
+        """
         cache_key = f"{parent}/{name}"
         if cache_key in self._folder_cache:
             return self._folder_cache[cache_key]
         folder_id = ""
         try:
-            found = self._gw.execute("GOOGLEDRIVE_FIND_FOLDER", {"folder_name": name})
-            for key in ("files", "folders", "items"):
-                items = found.get(key) or []
-                if items:
-                    folder_id = items[0].get("id", "")
-                    break
+            query: dict[str, Any] = {"name_exact": name, "page_size": 10}
+            if parent:
+                query["parent_folder_id"] = parent
+            found = self._gw.execute("GOOGLEDRIVE_FIND_FOLDER", query)
+            folder_id = first_folder_id(found)
         except Exception:  # noqa: BLE001 - dossier absent
             folder_id = ""
         if not folder_id:
             try:
-                args: dict[str, Any] = {"folder_name": name}
+                args: dict[str, Any] = {"name": name}
                 if parent:
                     args["parent_id"] = parent
                 created = self._gw.execute("GOOGLEDRIVE_CREATE_FOLDER", args)
-                folder_id = created.get("id", "") or (created.get("file") or {}).get("id", "")
+                folder_id = first_folder_id(created)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Dossier Drive '%s' non cree: %s", name, exc)
                 return ""
@@ -351,9 +368,13 @@ class DocumentPipeline:
         root = self.ensure_folder(self._drive_root)
         category = self.ensure_folder(folder, root)
         target = self.ensure_folder(str(year), category) or category or root
-        args: dict[str, Any] = {"file_url": source_url, "file_name": file.filename}
+        args: dict[str, Any] = {
+            "source_url": source_url,
+            "name": file.filename,
+            "mime_type": "application/pdf",
+        }
         if target:
-            args["folder_id"] = target
+            args["parent_folder_id"] = target
         uploaded = self._gw.execute("GOOGLEDRIVE_UPLOAD_FROM_URL", args)
         return drive_link(uploaded)
 
@@ -373,9 +394,14 @@ class DocumentPipeline:
                 {
                     "summary": title,
                     "description": description,
-                    "start_datetime": due.isoformat(),
+                    # L'API exige une heure : une date seule ("2026-08-31") est
+                    # refusee par le format ISO attendu. Le rappel est pose en
+                    # debut de matinee, dans le fuseau de la societe.
+                    "start_datetime": f"{due.isoformat()}T{REMINDER_HOUR}",
+                    "timezone": REMINDER_TIMEZONE,
                     "event_duration_hour": 0,
                     "event_duration_minutes": 30,
+                    "create_meeting_room": False,
                 },
             )
         except Exception as exc:  # noqa: BLE001 - Calendar non bloquant
@@ -614,8 +640,8 @@ class DocumentPipeline:
                 title=f"{LABELS.get(doc.doc_type)} {doc.numero} - {outcome.montant_ttc} {doc.devise}",
                 due=doc.date_echeance,
                 description=(
-                    f"Document {doc.numero} a payer avant le {doc.date_echeance}.\n"
-                    f"Piece archivee : {outcome.drive_link}"
+                    f"Document {doc.numero} a payer avant le {doc.date_echeance}."
+                    f"{NEWLINE}Piece archivee : {outcome.drive_link}"
                 ),
             )
             store.update_document(
@@ -649,8 +675,10 @@ class DocumentPipeline:
             outcome.stable_id, outcome.row_index = self.write_invoice(doc, party, tab)
             outcome.tab = tab
             if kind in (IMPORT_INVOICE, EXPORT_INVOICE):
-                customs_id = self.next_prefixed_id(TAB_CUSTOMS, "DOU", year) \
+                customs_id = (
+                    self.next_prefixed_id(TAB_CUSTOMS, "DOU", year)
                     if TAB_CUSTOMS in self.tabs() else f"DOU-{year}-001"
+                )
                 self.append_row(
                     TAB_CUSTOMS,
                     build_customs_row(
@@ -933,6 +961,22 @@ class DocumentPipeline:
         index = self.next_row(TAB_IMPORTS_LOG)
         self._write(f"{TAB_IMPORTS_LOG}!A{index}:F{index}", [row])
         return index
+
+
+def first_folder_id(payload: dict[str, Any]) -> str:
+    """Identifiant du premier dossier d'une reponse Drive, quelle que soit sa forme."""
+    if not isinstance(payload, dict):
+        return ""
+    for key in ("files", "folders", "items"):
+        items = payload.get(key) or []
+        if isinstance(items, list) and items and isinstance(items[0], dict):
+            found = items[0].get("id")
+            if found:
+                return str(found)
+    for candidate in (payload, payload.get("file") or {}, payload.get("folder") or {}):
+        if isinstance(candidate, dict) and candidate.get("id"):
+            return str(candidate["id"])
+    return ""
 
 
 def drive_link(uploaded: dict[str, Any]) -> str:
