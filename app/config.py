@@ -86,12 +86,18 @@ class Settings(BaseSettings):
 
     # --- Worker Gmail (detection automatique des factures) ---------------
     # Desactive tant que GMAIL_WATCH_CHAT_ID vaut 0 : le bot demarre alors
-    # exactement comme avant. La requete est celle du marqueur [XBLASTE] ;
-    # elle reste surchargeable si la convention de sujet change.
+    # exactement comme avant.
+    #
+    # La requete ne filtre plus sur un marqueur de sujet : c'est le CONTENU
+    # du PDF qui decide s'il s'agit d'une facture (voir looks_like_invoice
+    # dans app/invoice_pdf.py). Deux garde-fous rendent cet elargissement
+    # fiable : un curseur Gmail durable, fixe au premier demarrage, qui empeche
+    # d'importer l'historique de la boite ; et l'anti-doublon par message_id
+    # puis par (ICE fournisseur + numero de facture).
     gmail_watch_enabled: bool = Field(default=True, alias="GMAIL_WATCH_ENABLED")
     gmail_watch_chat_id: int = Field(default=0, alias="GMAIL_WATCH_CHAT_ID")
     gmail_watch_query: str = Field(
-        default='subject:"[XBLASTE]" has:attachment filename:pdf', alias="GMAIL_WATCH_QUERY"
+        default="in:inbox has:attachment filename:pdf", alias="GMAIL_WATCH_QUERY"
     )
     gmail_watch_interval_seconds: int = Field(default=60, alias="GMAIL_WATCH_INTERVAL_SECONDS")
     gmail_watch_max_per_cycle: int = Field(default=5, alias="GMAIL_WATCH_MAX_PER_CYCLE")
