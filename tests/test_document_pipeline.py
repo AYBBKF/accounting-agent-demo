@@ -287,7 +287,9 @@ def test_a_penalty_is_recorded_with_its_due_date_and_a_reminder(pipeline, workbo
     assert row[8] == "A payer"
     assert row[7] != ""                            # echeance renseignee
     assert len(workbook.events) == 1
-    assert workbook.events[0]["start_datetime"] == "2026-08-31"
+    # L'API Calendar refuse une date seule : le rappel porte un INSTANT.
+    assert workbook.events[0]["start_datetime"] == "2026-08-31T09:00:00"
+    assert workbook.events[0]["timezone"] == "Africa/Casablanca"
     assert outcome.calendar_event
     # La penalite n'est pas une facture fournisseur ordinaire.
     assert workbook.writes_to("05_FACTURES_ACHATS") == []
@@ -566,7 +568,9 @@ def test_the_import_log_records_drive_and_gmail_for_every_document(pipeline, wor
 
 def test_an_unknown_document_is_filed_for_review_without_accounting(pipeline, workbook):
     content = b"%PDF-inconnu"
-    pipeline.registry[content] = "Compte rendu de reunion\nPoints abordes\nfin"
+    pipeline.registry[content] = chr(10).join(
+        ["Compte rendu de reunion", "Points abordes", "fin"]
+    )
     file = DocumentFile(filename="note.pdf", content=content, source="attachment")
     outcome = pipeline.process_document(
         file, {"messageId": "m1"}, attachment_id="a1", source_url="u"
