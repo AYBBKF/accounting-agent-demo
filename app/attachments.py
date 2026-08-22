@@ -48,13 +48,21 @@ class ZipLimits:
 
 @dataclass
 class DocumentFile:
-    """Un PDF pret a etre analyse, et d'ou il vient."""
+    """Un PDF pret a etre analyse, et d'ou il vient.
+
+    `member_path` est le chemin INTERNE du fichier dans l'archive parente
+    ("factures/2026/achat.pdf"), vide pour une piece jointe directe. C'est
+    lui, et non un identifiant Gmail, qui permet de retrouver plus tard
+    exactement ce PDF dans le ZIP d'origine : les `attachmentId` renvoyes
+    par Gmail changent d'une lecture a l'autre, le chemin interne jamais.
+    """
 
     filename: str
     content: bytes
     source: str                 # "attachment" ou "zip"
     container: str = ""         # nom du ZIP d'origine, le cas echeant
     depth: int = 0
+    member_path: str = ""
 
     @property
     def sha256(self) -> str:
@@ -63,6 +71,18 @@ class DocumentFile:
     @property
     def display_name(self) -> str:
         return f"{self.container}:{self.filename}" if self.container else self.filename
+
+    @property
+    def stable_ref(self) -> str:
+        """Reference STABLE du document a l'interieur de son email.
+
+        Elle ne depend que de noms de fichiers : deux lectures du meme email
+        donnent la meme reference, donc la meme cle d'idempotence, donc la
+        reprise retrouve son document au lieu d'en creer un nouveau.
+        """
+        if self.member_path:
+            return f"{self.container}/{self.member_path}"
+        return self.filename
 
 
 @dataclass
@@ -90,18 +110,25 @@ def is_zip(content: bytes) -> bool:
 
 
 def idempotency_key(
-    telegram_user_id: str, gmail_message_id: str, attachment_id: str, file_sha256: str
+    telegram_user_id: str, gmail_message_id: str, attachment_ref: str, file_sha256: str
 ) -> str:
     """Cle d'idempotence d'UN document.
 
-    Elle inclut le client, l'email, la piece jointe ET le contenu : cinq PDF
-    dans un meme email donnent cinq cles distinctes, et le meme PDF renvoye
-    dans un autre email est reconnu par son empreinte.
+    Elle inclut le client, l'email, la reference de la piece jointe ET le
+    contenu : cinq PDF dans un meme email donnent cinq cles distinctes, et
+    le meme PDF renvoye dans un autre email est reconnu par son empreinte.
+
+    `attachment_ref` doit etre STABLE dans le temps (nom de fichier, chemin
+    interne du ZIP). Elle a longtemps recu l'`attachmentId` de Gmail, qui
+    change a chaque lecture du message : la meme piece jointe recevait alors
+    une cle differente a chaque cycle, la reprise ne retrouvait plus son
+    document et les boutons de validation repondaient "piece jointe
+    introuvable".
     """
     raw = "|".join((
         (telegram_user_id or "").strip(),
         (gmail_message_id or "").strip(),
-        (attachment_id or "").strip(),
+        (attachment_ref or "").strip(),
         (file_sha256 or "").strip(),
     ))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -128,6 +155,7 @@ def extract_pdfs_from_zip(
     limits: ZipLimits | None = None,
     depth: int = 0,
     report: ExtractionReport | None = None,
+    member_prefix: str = "",
 ) -> ExtractionReport:
     """Extrait les PDF d'un ZIP, en refusant tout ce qui est dangereux."""
     limits = limits or ZipLimits()
@@ -183,10 +211,12 @@ def extract_pdfs_from_zip(
         total += len(data)
         base = posixpath.basename(name.replace("\\", "/"))
 
+        member_path = f"{member_prefix}{name.replace(chr(92), '/')}"
+
         if is_zip(data):
             extract_pdfs_from_zip(
                 data, container=f"{container}:{base}", limits=limits,
-                depth=depth + 1, report=report,
+                depth=depth + 1, report=report, member_prefix=f"{member_path}/",
             )
             continue
         if not is_pdf(data):
@@ -197,7 +227,7 @@ def extract_pdfs_from_zip(
         report.files.append(
             DocumentFile(
                 filename=base, content=data, source="zip",
-                container=container, depth=depth + 1,
+                container=container, depth=depth + 1, member_path=member_path,
             )
         )
     return report
@@ -215,3 +245,42 @@ def collect_documents(
         return report
     report.reject(filename, "piece jointe ignoree : ni PDF ni archive ZIP")
     return report
+
+
+def extract_member(content: bytes, member_path: str) -> bytes | None:
+    """Extrait UN SEUL membre d'une archive, par son chemin interne.
+
+    Sert a la validation humaine : plutot que de redecompresser tout le pack
+    pour retrouver un PDF, on ne sort que celui qui est demande. Traverse les
+    archives imbriquees ("pack.zip/2026/facture.pdf" ou le premier segment
+    est lui-meme une archive). Renvoie None si le chemin n'existe pas, sans
+    jamais lever : l'appelant decidera quoi faire.
+    """
+    wanted = (member_path or "").replace("\\", "/").strip("/")
+    if not wanted or not is_zip(content):
+        return None
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(content))
+    except zipfile.BadZipFile:
+        return None
+    names = {info.filename.replace("\\", "/"): info for info in archive.infolist()}
+
+    info = names.get(wanted)
+    if info is not None and not info.is_dir() and _is_safe_member_name(info.filename):
+        with archive.open(info) as handle:
+            return handle.read(MAX_FILE_BYTES + 1)
+
+    # Archive imbriquee : le chemin demande commence par un membre ZIP.
+    for name, entry in names.items():
+        if entry.is_dir() or not wanted.startswith(f"{name}/"):
+            continue
+        if not _is_safe_member_name(entry.filename):
+            continue
+        with archive.open(entry) as handle:
+            nested = handle.read(MAX_FILE_BYTES + 1)
+        if not is_zip(nested):
+            continue
+        found = extract_member(nested, wanted[len(name) + 1:])
+        if found is not None:
+            return found
+    return None
