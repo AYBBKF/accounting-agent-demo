@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
@@ -105,6 +106,7 @@ class MailWorker:
         drive_folder: str = "XBLASTE - Factures",
         max_per_cycle: int = 5,
         zip_limits: ZipLimits | None = None,
+        calendar_check: str = "",
     ) -> None:
         self._api_key = api_key
         self._chat_id = chat_id
@@ -118,6 +120,11 @@ class MailWorker:
         self._zip_limits = zip_limits or ZipLimits()
         self._client = None
         self._pipeline: DocumentPipeline | None = None
+        self._startup_done = False
+        # Evenement d'echeance a relire au demarrage, en lecture seule.
+        self._calendar_check = calendar_check or os.environ.get(
+            "CALENDAR_CHECK_EVENT_ID", ""
+        )
 
     # -- proprietes --------------------------------------------------------
 
@@ -324,6 +331,7 @@ class MailWorker:
         # pipeline (qui cree les tables paresseusement) n'ait ete construit,
         # et le worker mourait sur "no such table: documents".
         store.ensure_schema(self._db_path)
+        self.run_startup_tasks()
         summaries: list[MailSummary] = []
         resumed = self.finish_unfinished()
         if resumed:
@@ -352,6 +360,71 @@ class MailWorker:
         if newest:
             store.advance_cursor(self._db_path, self._chat_id, newest)
         return summaries
+
+    def run_startup_tasks(self) -> None:
+        """Taches ponctuelles au demarrage, protegees par un marqueur.
+
+        L'API de l'hebergeur ne permet aucun `docker exec` : une correction
+        de donnees doit donc voyager avec l'image et se declencher seule, une
+        seule fois, dans le processus de production. Un echec ici ne doit
+        jamais empecher le cycle Gmail de tourner.
+        """
+        if self._startup_done:
+            return
+        self._startup_done = True
+        try:
+            from app import drive_repair
+
+            report = drive_repair.run(self)
+        except Exception as exc:  # noqa: BLE001 - jamais bloquant
+            logger.exception("Tache de demarrage en echec: %s", type(exc).__name__)
+            return
+        if report.get("skipped"):
+            logger.info("Migration des archives : %s", report.get("reason"))
+        else:
+            for entry in report.get("repaired", []):
+                logger.info(
+                    "Archive reparee %s : %s -> %s (%s, %s octets, %s)",
+                    entry["fichier"], entry["ancien_id"], entry["nouveau_id"],
+                    entry["dossier"], entry["taille"], entry["controle"],
+                )
+            for entry in report.get("failed", []):
+                logger.warning(
+                    "Archive non reparee %s : %s", entry["doc_key"], entry["erreur"]
+                )
+            for entry in report.get("quarantined", []):
+                logger.info("Ancien fichier %s : %s", entry["id"], entry["etat"])
+        self.check_calendar_event()
+
+    def check_calendar_event(self) -> None:
+        """Verification EN LECTURE SEULE de l'evenement d'echeance.
+
+        Le classeur porte un identifiant d'evenement ; un identifiant stocke
+        ne prouve pas qu'un evenement existe. On relit donc l'evenement avec
+        la connexion de production, sans rien creer ni modifier.
+        """
+        event_id = str(self._calendar_check or "").strip()
+        if not event_id:
+            return
+        try:
+            from app import drive_repair
+
+            found = drive_repair.read_calendar_event(self, event_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Controle Calendar impossible: %s", type(exc).__name__)
+            return
+        if found.get("found"):
+            logger.info(
+                "Calendar (lecture seule) %s : titre=%r debut=%s fuseau=%s "
+                "statut=%s agenda=%s",
+                found["id"], found["summary"], found["start"], found["timezone"],
+                found["status"], found["calendar"],
+            )
+        else:
+            logger.warning(
+                "Calendar (lecture seule) %s : evenement introuvable (%s)",
+                event_id, found.get("error", ""),
+            )
 
     def process_message(self, message_id: str) -> tuple[MailSummary, int]:
         """Traite toutes les pieces jointes d'un email, independamment."""
