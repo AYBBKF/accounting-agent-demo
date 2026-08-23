@@ -44,6 +44,11 @@ _CURRENCY_ONLY_RE = re.compile(rf"^\s*({'|'.join(CURRENCIES)})\s*$", re.I)
 _AMOUNT_RE = re.compile(
     rf"(-?\d[\d\s  .,]*\d|-?\d)\s*({'|'.join(CURRENCIES)})?\b", re.I
 )
+# Un montant suivi d'un code devise, n'importe ou dans le document :
+# un prix unitaire en USD sous un total en MAD reste une devise etrangere.
+_MONEY_CODE_RE = re.compile(
+    rf"\d[\d\s  .,]*\s*({'|'.join(CURRENCIES)})\b", re.I
+)
 _PURE_AMOUNT_RE = re.compile(
     rf"^[\s  ]*-?\d[\d\s  .,]*(?:\s*(?:{'|'.join(CURRENCIES)}))?[\s]*$",
     re.I,
@@ -147,6 +152,11 @@ class ExtractedDocument:
     statut: str | None = None
     mode_paiement: str | None = None
     facture_liee: str | None = None
+    # Valeur BRUTE du champ "facture d'origine", conservee pour le journal
+    # meme quand elle n'est pas une reference exploitable.
+    facture_liee_brute: str = ""
+    # Codes devise reellement lus sur les montants du document.
+    devises_detectees: list[str] = field(default_factory=list)
     motif: str = ""
 
     # Commerce international
@@ -621,6 +631,39 @@ _TTC_LABELS = {
     "recu_paiement": ("Montant paye",),
 }
 _DEFAULT_TTC_LABELS = ("Total TTC", "Total toutes taxes", "Net a payer")
+
+# Tous les libelles sous lesquels un TTC ou un HT peut apparaitre. Sert
+# UNIQUEMENT a reperer deux valeurs contradictoires : si deux de ces
+# libelles annoncent deux montants differents, aucun choix automatique
+# n'est legitime.
+_AMBIGUITY_TTC_LABELS = (
+    "Total TTC", "Total toutes taxes", "Net a payer", "Montant TTC",
+    "Total a payer", "Total du", "Total general", "Total amount", "Amount due",
+    "Grand total",
+)
+_AMBIGUITY_HT_LABELS = (
+    "Total HT", "Total hors taxes", "Montant HT", "Sous-total", "Sous total",
+    "Subtotal", "Total net", "Net commercial",
+)
+
+# Valeurs qui, dans un champ "facture d'origine", signifient explicitement
+# QU'IL N'Y EN A PAS. Les retenir comme reference revenait a croire l'avoir
+# rattache a une facture nommee "NON".
+_NO_REFERENCE = frozenset({
+    "NON", "AUCUNE", "AUCUN", "NEANT", "N/A", "NA", "ND", "-", "--",
+    "INCONNUE", "INCONNU", "NONE", "UNKNOWN", "SANS",
+})
+
+
+def plausible_reference(value: str) -> bool:
+    """Une reference de document contient au moins un chiffre et n'est pas
+    un mot signifiant l'absence."""
+    candidate = normalize(value).strip(" .:;,")
+    if not candidate or candidate in _NO_REFERENCE:
+        return False
+    if len(candidate) < 3:
+        return False
+    return bool(re.search(r"\d", candidate))
 _HT_LABELS = {
     "facture_import": ("Goods value", "Total HT", "Total hors taxes"),
     "facture_export": ("Total hors taxes", "Total HT"),
@@ -721,7 +764,9 @@ def extract_document(
     doc.motif = motif[0] if motif else ""
     linked = _first_value(lines, ("Facture reglee", "Facture d'origine", "Facture liee"))
     if linked:
-        doc.facture_liee = linked[0].split()[0]
+        candidate = (linked[0].split() or [""])[0]
+        doc.facture_liee_brute = linked[0]
+        doc.facture_liee = candidate if plausible_reference(candidate) else None
 
     incoterm = _first_value(lines, ("Incoterm",))
     doc.incoterm = incoterm[0] if incoterm else ""
@@ -752,8 +797,19 @@ def extract_document(
     doc.missing = [
         f for f in REQUIRED_FIELDS.get(kind, ()) if getattr(doc, f, None) is None
     ]
-    for label, attr in (("Total HT", "montant_ht"), ("Total TTC", "montant_ttc")):
-        if len(all_amounts_for(lines, label)) > 1:
+    # Ambiguite de montant : un document reel ne repete pas le meme libelle,
+    # il propose DEUX libelles differents ("Total TTC" et "Net a payer") avec
+    # deux valeurs differentes. Ne regarder qu'une etiquette laissait passer
+    # exactement ce cas : la facture partait en comptabilite avec l'un des
+    # deux montants, choisi par l'ordre des lignes.
+    for attr, labels in (
+        ("montant_ht", _AMBIGUITY_HT_LABELS + _HT_LABELS.get(kind, ())),
+        ("montant_ttc", _AMBIGUITY_TTC_LABELS + _TTC_LABELS.get(kind, ())),
+    ):
+        proposees: list[Decimal] = []
+        for label in labels:
+            proposees.extend(all_amounts_for(lines, label))
+        if len({abs(v) for v in proposees}) > 1:
             doc.ambigus.append(attr)
 
     if doc.montant_ht and doc.montant_tva and doc.montant_ttc:
@@ -775,6 +831,14 @@ def extract_document(
         doc.anomalies.append("la date d'echeance precede la date du document")
 
     currencies = {a.currency for a in doc.amounts if a.currency}
+    # Balayage complet : les lignes de detail et les prix unitaires ne
+    # portent pas de libelle de total et echappaient a doc.amounts.
+    for line in lines:
+        for code in _MONEY_CODE_RE.findall(line.text):
+            currencies.add(code.upper())
+    doc.devises_detectees = sorted(
+        {"MAD" if c in ("DH", "DHS") else c for c in currencies}
+    )
     if len(currencies) > 1:
         doc.anomalies.append(f"plusieurs devises dans le meme document : {sorted(currencies)}")
 
