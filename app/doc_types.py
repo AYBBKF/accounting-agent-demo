@@ -74,6 +74,17 @@ LABELS = {
 }
 
 
+# Marqueurs de contrat. Un contrat cite des montants, des echeances et des
+# modalites de paiement : sans cette liste, il etait absorbe par la regle
+# du recu de paiement.
+CONTRACT_MARKERS = (
+    "CONTRAT", "CONTRAT DE PRESTATION", "CONTRAT DE MAINTENANCE",
+    "CONTRAT DE SERVICE", "CONTRAT CADRE", "CONVENTION", "AVENANT",
+    "SERVICE AGREEMENT", "AGREEMENT", "CONTRACT", "MANDAT", "BAIL",
+    "CONDITIONS GENERALES",
+)
+
+
 def strip_accents(value: str) -> str:
     return "".join(
         c for c in unicodedata.normalize("NFD", value or "")
@@ -164,23 +175,33 @@ def classify(text: str, *, company: str = "X BLASTE") -> Classification:
                    "AVIS DE TAXE", "MISE EN DEMEURE", "AVIS A PAYER")):
         return Classification(PENALTY_NOTICE, 0.97, "AVIS DE PENALITE", [])
 
-    # 3. Recu / preuve de paiement : contient "Facture reglee", d'ou la
+    # 3. Contrats et conventions. Ils parlent de paiement, d'echeances et de
+    #    montants, et tombaient donc dans la regle "recu de paiement" : un
+    #    contrat de prestation etait classe "Recu de paiement" a 96 % de
+    #    confiance. Un contrat n'est PAS une piece comptable : il est classe,
+    #    archive, et n'ecrit rien.
+    if has_any(t, CONTRACT_MARKERS):
+        return Classification(UNKNOWN, 0.30, "CONTRAT", [
+            "contrat ou convention : aucune ecriture comptable, classement seul"
+        ])
+
+    # 4. Recu / preuve de paiement : contient "Facture reglee", d'ou la
     #    priorite avant toute regle "FACTURE".
     if has_any(t, ("RECU DE PAIEMENT", "PREUVE DE PAIEMENT", "ACCUSE DE PAIEMENT",
                    "PAYMENT RECEIPT", "QUITTANCE")):
         return Classification(PAYMENT_RECEIPT, 0.96, "RECU DE PAIEMENT", [])
 
-    # 4. Bons : documents logistiques, jamais comptabilises.
+    # 5. Bons : documents logistiques, jamais comptabilises.
     if has_phrase(t, "BON DE COMMANDE") or has_phrase(t, "PURCHASE ORDER"):
         return Classification(PURCHASE_ORDER, 0.96, "BON DE COMMANDE", [])
     if has_phrase(t, "BON DE LIVRAISON") or has_phrase(t, "DELIVERY NOTE"):
         return Classification(DELIVERY_NOTE, 0.96, "BON DE LIVRAISON", [])
 
-    # 5. Devis. "DEVISE" ne matche pas : la recherche est en mots entiers.
+    # 6. Devis. "DEVISE" ne matche pas : la recherche est en mots entiers.
     if has_any(t, ("DEVIS", "PROFORMA", "QUOTATION", "PRO FORMA")):
         return Classification(QUOTE, 0.95, "DEVIS", [])
 
-    # 6. Avoirs, avant les factures : un avoir contient le mot facture
+    # 7. Avoirs, avant les factures : un avoir contient le mot facture
     #    (facture d'origine).
     if has_any(t, ("AVOIR FOURNISSEUR", "NOTE DE CREDIT FOURNISSEUR")):
         return Classification(SUPPLIER_CREDIT_NOTE, 0.96, "AVOIR FOURNISSEUR", [])
@@ -200,7 +221,7 @@ def classify(text: str, *, company: str = "X BLASTE") -> Classification:
             "avoir non qualifie et parties non identifiees"
         ])
 
-    # 7. Commerce international, avant les factures nationales.
+    # 8. Commerce international, avant les factures nationales.
     if has_any(t, ("COMMERCIAL INVOICE", "FACTURE D IMPORTATION",
                    "FACTURE IMPORT")):
         return Classification(IMPORT_INVOICE, 0.95, "COMMERCIAL INVOICE", [])
@@ -208,13 +229,13 @@ def classify(text: str, *, company: str = "X BLASTE") -> Classification:
                    "FACTURE EXPORT", "EXPORT INVOICE")):
         return Classification(EXPORT_INVOICE, 0.95, "FACTURE EXPORT", [])
 
-    # 8. Factures explicitement qualifiees.
+    # 9. Factures explicitement qualifiees.
     if has_any(t, ("FACTURE DE VENTE", "FACTURE CLIENT", "SALES INVOICE")):
         return Classification(SALES_INVOICE, 0.95, "FACTURE DE VENTE", [])
     if has_any(t, ("FACTURE FOURNISSEUR", "FACTURE D ACHAT", "PURCHASE INVOICE")):
         return Classification(PURCHASE_INVOICE, 0.95, "FACTURE FOURNISSEUR", [])
 
-    # 9. Facture generique : le sens vient de la position de notre societe.
+    # 10. Facture generique : le sens vient de la position de notre societe.
     if has_any(t, ("FACTURE", "INVOICE", "FATURA", "RECHNUNG")):
         if role == "destinataire":
             return Classification(PURCHASE_INVOICE, 0.85, "FACTURE", [
