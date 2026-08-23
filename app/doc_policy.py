@@ -57,6 +57,25 @@ MIN_TYPE_CONFIDENCE = 0.90
 # change exploitable avant la moindre ecriture.
 BOOKKEEPING_CURRENCY = "MAD"
 
+# Un nom de tiers doit etre exploitable. "EN" - deux lettres captees dans un
+# document anglophone - a suffi a creer une fiche fournisseur et a ecrire une
+# charge. Sans nom credible, aucune ecriture.
+MIN_PARTY_NAME_LENGTH = 3
+PARTY_NAME_STOPWORDS = frozenset({
+    "EN", "FR", "DE", "ES", "IT", "TVA", "VAT", "HT", "TTC", "NON", "OUI",
+    "N/A", "NA", "SA", "SARL", "SAS", "LTD", "GMBH", "INC", "CO", "TOTAL",
+    "FACTURE", "INVOICE", "CLIENT", "FOURNISSEUR", "SUPPLIER", "CUSTOMER",
+})
+
+
+def usable_party_name(name: str | None) -> bool:
+    """Le nom identifie-t-il reellement un tiers ?"""
+    candidate = (name or "").strip().strip(":;,.").strip()
+    if len(candidate) < MIN_PARTY_NAME_LENGTH:
+        return False
+    return candidate.upper() not in PARTY_NAME_STOPWORDS
+
+
 # Types pour lesquels l'ICE du tiers est indispensable : ce sont ceux qui
 # creent ou completent une fiche tiers et une ecriture comptable.
 NEEDS_PARTY_ID = frozenset({
@@ -155,6 +174,13 @@ def decide(doc: ExtractedDocument, context: DecisionContext | None = None) -> De
     for name in doc.missing:
         reasons.append(f"{_label(name)} illisible ou absent")
 
+    # 3bis. Un TTC lu comme ZERO n'est pas un TTC : c'est un total absent que
+    #       l'extraction a transforme en nombre. Il ne doit jamais devenir une
+    #       ecriture a 0,00, avec un ecart egal a tout le montant de la facture.
+    if doc.doc_type in ACCOUNTING_TYPES and doc.doc_type != BANK_STATEMENT:
+        if doc.montant_ttc is not None and doc.montant_ttc.value == 0:
+            reasons.append("montant TTC absent ou nul")
+
     # 4. Coherence HT + TVA = TTC, avec tolerance explicite.
     if doc.montant_ht and doc.montant_tva and doc.montant_ttc:
         ecart = abs(doc.montant_ht.value + doc.montant_tva.value - doc.montant_ttc.value)
@@ -167,16 +193,31 @@ def decide(doc: ExtractedDocument, context: DecisionContext | None = None) -> De
     for name in doc.ambigus:
         reasons.append(f"plusieurs valeurs possibles pour {_label(name)}")
 
-    # 6. Devise.
+    # 6. Devise. La regle est une DETECTION POSITIVE : tant que le document
+    #    n'affirme pas sa devise, aucune ecriture. Se contenter d'une valeur
+    #    vide revenait a supposer MAD et a comptabiliser 1 000 USD comme
+    #    1 000 MAD.
     if doc.amounts:
+        etrangeres = [
+            c for c in (doc.devises_detectees or [])
+            if c in CURRENCIES and c != BOOKKEEPING_CURRENCY
+        ]
         if not doc.devise:
             reasons.append("devise absente ou non reconnue")
         elif doc.devise not in CURRENCIES:
             reasons.append(f"devise inconnue : {doc.devise}")
-        elif doc.devise != BOOKKEEPING_CURRENCY and doc.doc_type in ACCOUNTING_TYPES:
-            if ctx.exchange_rate is None:
+        elif doc.doc_type in ACCOUNTING_TYPES:
+            if doc.devise != BOOKKEEPING_CURRENCY and ctx.exchange_rate is None:
                 reasons.append(
                     f"facture en {doc.devise} sans taux de change exploitable"
+                )
+            elif etrangeres and ctx.exchange_rate is None:
+                # Le total retenu est en MAD, mais le document porte aussi des
+                # montants en devise etrangere : convertir ou ignorer serait
+                # une decision comptable, pas une lecture.
+                reasons.append(
+                    "montants en {} dans le document sans taux de change "
+                    "exploitable".format(", ".join(etrangeres))
                 )
 
     # 7. Tiers. SEULE l'ambiguite bloque : plusieurs fiches existantes
@@ -199,7 +240,14 @@ def decide(doc: ExtractedDocument, context: DecisionContext | None = None) -> De
             doc.emetteur if doc.doc_type in (PURCHASE_INVOICE, SUPPLIER_CREDIT_NOTE)
             else doc.destinataire
         )
-        if not needed_ice:
+        if not usable_party_name(party_name):
+            # Un nom de deux lettres, un mot-outil ou un libelle de colonne
+            # n'est pas une raison sociale : sans tiers credible, l'ecriture
+            # imputerait une charge a n'importe qui.
+            reasons.append(
+                f"raison sociale du tiers inexploitable : {party_name!r}"
+            )
+        elif not needed_ice:
             if not (party_name or "").strip():
                 # Ni ICE ni raison sociale : plus rien n'identifie le tiers.
                 reasons.append("tiers non identifiable (ni ICE ni raison sociale)")
@@ -215,7 +263,14 @@ def decide(doc: ExtractedDocument, context: DecisionContext | None = None) -> De
     #    l'origine ou sur l'effet comptable qui exige une decision.
     if doc.doc_type in (SUPPLIER_CREDIT_NOTE, CLIENT_CREDIT_NOTE):
         if not (doc.facture_liee or "").strip():
-            reasons.append("avoir sans facture d'origine identifiable")
+            brute = (getattr(doc, "facture_liee_brute", "") or "").strip()
+            if brute:
+                reasons.append(
+                    f"avoir sans facture d'origine identifiable "
+                    f"(champ lu : {brute!r})"
+                )
+            else:
+                reasons.append("avoir sans facture d'origine identifiable")
         elif ctx.credit_note_targets > 1:
             reasons.append(
                 f"{ctx.credit_note_targets} factures peuvent correspondre a cet avoir"
