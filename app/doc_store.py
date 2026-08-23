@@ -225,12 +225,21 @@ def release_document(db_path: str, doc_key: str) -> None:
 
     Ne doit jamais etre appelee une fois la ligne comptable ecrite : ce
     serait rouvrir la porte a une seconde ligne.
+
+    Une fiche qui porte deja une archive Drive ou une ligne de journal n'est
+    PAS "sans ecriture" : la supprimer faisait oublier le document, et le
+    cycle suivant le recreait de zero - nouvelle cle, nouvelle copie dans
+    Drive, nouvelle ligne dans 14_IMPORTS_LOG, nouvelle fiche tiers. C'est
+    exactement ce qui s'est produit en production quand une validation
+    humaine a echoue sur un document en attente. On protege donc aussi
+    'needs_review' et toute fiche deja archivee ou journalisee.
     """
     with connect(db_path) as conn:
         conn.execute(
             "DELETE FROM documents WHERE doc_key = ? AND state NOT IN "
             "('sheet_written','details_written','drive_archived','calendar_created',"
-            "'logged','completed','partial')",
+            "'logged','completed','partial','needs_review','skipped','duplicate') "
+            "AND COALESCE(drive_link, '') = '' AND COALESCE(log_row, 0) = 0",
             (doc_key,),
         )
         conn.commit()
