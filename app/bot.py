@@ -297,7 +297,8 @@ def build_dispatcher() -> Dispatcher:
             f"Bienvenue sur le bot de demo comptable.{NL}"
             f"Toutes les donnees sont FICTIVES.{NL}"
             "Commandes: /help /demo_facture /demo_releve /tva /rapprochement /export "
-            "/demo_extraction /sheet /sync_sheet /dashboard /reprocess /retry_pending /connect /status"
+            "/demo_extraction /sheet /sync_sheet /dashboard /reprocess /retry_pending"
+            " /resend_pending /connect /status"
         )
 
     @dp.message(Command("help"))
@@ -314,6 +315,7 @@ def build_dispatcher() -> Dispatcher:
             f"/dashboard - resume des KPI de la session en cours{NL}"
             f"/reprocess - relit les emails des N dernieres heures (defaut 24){NL}"
             f"/retry_pending - relance les documents restes en attente{NL}"
+            f"/resend_pending - renvoie les validations encore en attente{NL}"
             f"/connect - connecte TES comptes Google ({SERVICES_SUMMARY}) "
             f"via un lien d'autorisation individuel{NL}"
             "/status - etat du bot + statut de tes connexions Google"
@@ -599,12 +601,49 @@ def build_dispatcher() -> Dispatcher:
             f"- En echec                   : {len(failed)}"
         )
         for outcome in waiting:
-            await message.answer(
+            sent = await message.answer(
                 build_review_message(outcome),
                 reply_markup=document_keyboard(outcome.doc_key),
             )
+            await asyncio.to_thread(
+                mail_worker.mark_notified, outcome,
+                telegram_message_id=getattr(sent, "message_id", 0) or 0,
+            )
         for outcome in failed:
             await message.answer(f"{outcome.filename} : {outcome.error}")
+
+    @dp.message(Command("resend_pending"))
+    async def cmd_resend_pending(message: Message) -> None:
+        """Renvoie VOLONTAIREMENT les validations encore en attente.
+
+        C'est la seule facon de recevoir a nouveau une demande de decision :
+        le worker, lui, ne renvoie plus jamais automatiquement un message
+        deja delivre. Aucune ecriture Sheets, Drive ou Calendar n'est
+        declenchee ici.
+        """
+        if message.chat.id != settings.gmail_watch_chat_id:
+            await message.answer("Commande reservee au proprietaire du suivi Gmail.")
+            return
+        try:
+            outcomes = await asyncio.to_thread(mail_worker.pending_validations)
+        except MailWorkerError as exc:
+            await message.answer(f"Renvoi impossible : {exc}")
+            return
+        if not outcomes:
+            await message.answer("Aucune validation en attente.")
+            return
+        await message.answer(
+            f"Validations en attente renvoyees : {len(outcomes)}."
+        )
+        for outcome in outcomes:
+            sent = await message.answer(
+                build_review_message(outcome),
+                reply_markup=document_keyboard(outcome.doc_key),
+            )
+            await asyncio.to_thread(
+                mail_worker.mark_notified, outcome,
+                telegram_message_id=getattr(sent, "message_id", 0) or 0,
+            )
 
     @dp.message(Command("export"))
     async def cmd_export(message: Message) -> None:
@@ -754,20 +793,36 @@ async def _gmail_watch_loop(bot: Bot) -> None:
         try:
             summaries = await asyncio.to_thread(mail_worker.process_once)
             for summary in summaries:
+                if not summary.should_notify:
+                    continue
                 await bot.send_message(
                     chat_id=settings.gmail_watch_chat_id, text=build_summary(summary)
                 )
                 # Un message dedie, avec boutons, pour CHAQUE document
                 # reellement ambigu - et pour eux seuls.
                 for outcome in summary.to_review:
-                    await bot.send_message(
+                    sent = await bot.send_message(
                         chat_id=settings.gmail_watch_chat_id,
                         text=build_review_message(outcome),
                         reply_markup=document_keyboard(outcome.doc_key),
                     )
+                    await asyncio.to_thread(
+                        mail_worker.mark_notified, outcome,
+                        telegram_message_id=getattr(sent, "message_id", 0) or 0,
+                    )
+                # L'etat notifie n'est enregistre qu'APRES un envoi reussi :
+                # un echec Telegram doit pouvoir etre retente, jamais etre
+                # confondu avec un message deja delivre.
+                for outcome in summary.notified_outcomes:
+                    if outcome in summary.to_review:
+                        continue
+                    await asyncio.to_thread(mail_worker.mark_notified, outcome)
                 logger.info(
-                    "Email %s traite : %d document(s), %d a valider",
-                    summary.message_id, len(summary.outcomes), len(summary.to_review),
+                    "Email %s traite : %d document(s), %d notifie(s), "
+                    "%d sans changement, %d a valider",
+                    summary.message_id, len(summary.outcomes),
+                    len(summary.notified_outcomes), summary.silenced,
+                    len(summary.to_review),
                 )
         except MailWorkerError as exc:
             logger.warning("Cycle Gmail en echec: %s", exc)
