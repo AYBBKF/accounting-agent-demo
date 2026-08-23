@@ -97,6 +97,14 @@ CREATE TABLE IF NOT EXISTS calendar_events (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS email_notifications (
+    chat_id TEXT NOT NULL,
+    gmail_message_id TEXT NOT NULL,
+    signature TEXT NOT NULL,
+    sent_at TEXT NOT NULL,
+    PRIMARY KEY (chat_id, gmail_message_id)
+);
+
 CREATE TABLE IF NOT EXISTS gmail_sync_state (
     chat_id TEXT PRIMARY KEY,
     history_id TEXT,
@@ -120,6 +128,13 @@ _ADDED_COLUMNS = (
     ("member_path", "TEXT"),
     ("local_path", "TEXT"),
     ("review_archive", "INTEGER DEFAULT 0"),
+    # Idempotence des NOTIFICATIONS. Sans ces colonnes, chaque cycle Gmail
+    # renvoyait les memes messages : l'etat du document etait connu, mais
+    # jamais l'etat DEJA NOTIFIE.
+    ("last_notified_state", "TEXT"),
+    ("notified_at", "TEXT"),
+    ("validation_notification_sent_at", "TEXT"),
+    ("telegram_message_id", "INTEGER DEFAULT 0"),
 )
 
 
@@ -313,6 +328,20 @@ def list_pending_review(db_path: str, chat_id: int) -> list[dict[str, Any]]:
         return [dict(r) for r in rows]
 
 
+def list_documents(db_path: str, chat_id: int) -> list[dict[str, Any]]:
+    """Toutes les fiches d'un client, du plus ancien au plus recent."""
+    import sqlite3
+
+    ensure_schema(db_path)
+    with connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM documents WHERE chat_id = ? ORDER BY created_at",
+            (str(chat_id),),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
 def list_unfinished(db_path: str, chat_id: int) -> list[dict[str, Any]]:
     """Documents dont l'ecriture comptable a abouti mais pas la suite."""
     import sqlite3
@@ -447,3 +476,77 @@ def rewind_cursor(db_path: str, chat_id: int, seconds: int) -> int:
 def query_floor(cursor: dict[str, Any]) -> int:
     """Borne `after:` a envoyer a Gmail, recouvrement compris."""
     return max(0, int(cursor["last_internal_date"]) - OVERLAP_SECONDS)
+
+
+# --- idempotence des notifications ---------------------------------------
+#
+# Un document connait son etat metier ; il ne connaissait pas l'etat DEJA
+# ANNONCE au client. C'est exactement ce qui produisait un message identique
+# a chaque cycle Gmail. On memorise donc, durablement, le dernier etat
+# notifie - et, pour une demande de validation, l'instant de l'envoi et
+# l'identifiant du message Telegram, afin qu'un redemarrage ne provoque
+# aucun renvoi.
+
+def notification_state(db_path: str, doc_key: str) -> str:
+    """Dernier etat REELLEMENT annonce au client, '' si jamais notifie."""
+    ensure_schema(db_path)
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT last_notified_state FROM documents WHERE doc_key = ?", (doc_key,)
+        ).fetchone()
+    if not row:
+        return ""
+    return str(row[0] or "")
+
+
+def mark_notified(
+    db_path: str, doc_key: str, state: str, *, telegram_message_id: int = 0
+) -> None:
+    """Enregistre qu'un etat a ete annonce. Appele APRES l'envoi reussi."""
+    ensure_schema(db_path)
+    now = _now()
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT validation_notification_sent_at FROM documents WHERE doc_key = ?",
+            (doc_key,),
+        ).fetchone()
+        if row is None:
+            return
+        fields = {"last_notified_state": state, "notified_at": now}
+        if state == "waiting_validation" and not (row[0] or ""):
+            fields["validation_notification_sent_at"] = now
+        if telegram_message_id:
+            fields["telegram_message_id"] = int(telegram_message_id)
+        assignments = ", ".join(f"{name} = ?" for name in fields)
+        conn.execute(
+            f"UPDATE documents SET {assignments}, updated_at = ? WHERE doc_key = ?",
+            (*fields.values(), now, doc_key),
+        )
+        conn.commit()
+
+
+def email_notification_signature(db_path: str, chat_id: int, message_id: str) -> str:
+    """Signature du dernier resume envoye pour cet email ('' si aucun)."""
+    ensure_schema(db_path)
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT signature FROM email_notifications WHERE chat_id = ? "
+            "AND gmail_message_id = ?",
+            (str(chat_id), str(message_id)),
+        ).fetchone()
+    return str(row[0]) if row else ""
+
+
+def remember_email_notification(
+    db_path: str, chat_id: int, message_id: str, signature: str
+) -> None:
+    ensure_schema(db_path)
+    now = _now()
+    with connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO email_notifications (chat_id, gmail_message_id, signature, "
+            "sent_at) VALUES (?, ?, ?, ?) ON CONFLICT(chat_id, gmail_message_id) "
+            "DO UPDATE SET signature = excluded.signature, sent_at = excluded.sent_at",
+            (str(chat_id), str(message_id), signature, now),
+        )
+        conn.commit()
