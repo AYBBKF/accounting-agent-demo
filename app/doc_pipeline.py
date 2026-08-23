@@ -112,6 +112,11 @@ REVIEW_DRIVE_FOLDER = "A verifier"
 # retrouve, et elle dit ce qu'il reste a faire.
 ICE_TO_COMPLETE = "A completer"
 
+# Fond bleu clair des lignes REELLEMENT creees par le bot. Repere visuel
+# seulement : aucune valeur comptable n'en depend, et les regles de mise en
+# forme conditionnelle du classeur restent prioritaires.
+NEW_ROW_COLOR = "#DDEBF7"
+
 # Saut de ligne ecrit sans sequence d'echappement : le transport JSON des
 # outils de publication reinterprete les sequences d'echappement et
 # corromprait le fichier. Un module sans antislash traverse la chaine intact.
@@ -312,6 +317,38 @@ class DocumentPipeline:
     def next_row(self, tab: str) -> int:
         return len(self._read(f"{tab}!A2:A2000")) + 2
 
+    def mark_new_row(self, tab: str, row_index: int, width: str = "Q") -> None:
+        """Teinte en bleu clair UNE ligne reellement creee par le bot.
+
+        SEUL le fond est ecrit : le masque de champs envoye par l'API se
+        limite a userEnteredFormat.backgroundColor, donc les formats de
+        date et de devise, les formules, les liens Drive, les bordures et
+        les validations de la ligne restent intacts. Les regles de mise en
+        forme conditionnelle du classeur (rouge doublon, orange anomalie,
+        jaune impaye) sont evaluees APRES le fond de cellule : la couleur
+        metier garde donc naturellement la priorite sur ce bleu.
+
+        Jamais appele sur un doublon ignore, sur une reprise idempotente ni
+        sur la mise a jour d'une ligne existante : ces cas ne creent pas de
+        ligne.
+        """
+        if row_index < 2:
+            return
+        try:
+            self._gw.execute(
+                "GOOGLESHEETS_FORMAT_CELL",
+                {
+                    "spreadsheet_id": self._sheet,
+                    "sheet_name": tab,
+                    "range": f"A{row_index}:{width}{row_index}",
+                    "background_color": NEW_ROW_COLOR,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - le fond n'est pas comptable
+            logger.warning(
+                "Fond de ligne %s!%d non applique: %s", tab, row_index, exc
+            )
+
     # -- tiers -------------------------------------------------------------
 
     def resolve_party(self, tab: str, ice: str | None, name: str | None) -> PartyMatch:
@@ -356,6 +393,7 @@ class DocumentPipeline:
             f"{tab}!A{row_index}:G{row_index}",
             [[match.party_id, match.name, ice, "", "", "", 30]],
         )
+        self.mark_new_row(tab, row_index, "G")
         logger.info("Tiers %s cree dans %s", match.party_id, tab)
         return match.party_id
 
@@ -1036,6 +1074,7 @@ class DocumentPipeline:
         ):
             self._write(a1, [values], raw=raw)
         self._apply_invoice_formats(tab, row_index)
+        self.mark_new_row(tab, row_index, "Q")
         return stable_id, row_index
 
     def _apply_invoice_formats(self, tab: str, row_index: int) -> None:
@@ -1102,6 +1141,8 @@ class DocumentPipeline:
             self._tabs_cache = None
         start = self.next_row(LIGNES_TAB)
         self._write(f"{LIGNES_TAB}!A{start}:I{start + len(rows) - 1}", rows)
+        for offset in range(len(rows)):
+            self.mark_new_row(LIGNES_TAB, start + offset, "I")
         return len(rows)
 
     def write_bank_statement(self, doc: ExtractedDocument) -> tuple[int, int]:
@@ -1121,12 +1162,15 @@ class DocumentPipeline:
         start = self.next_row(TAB_BANK)
         rows = build_bank_rows(start_index=start - 1, doc=subset)
         self._write(f"{TAB_BANK}!A{start}:M{start + len(rows) - 1}", rows)
+        for offset in range(len(rows)):
+            self.mark_new_row(TAB_BANK, start + offset, "M")
         return len(rows), start
 
     def append_row(self, tab: str, values: list[Any], width: str) -> int:
         self.ensure_tab(tab)
         row_index = self.next_row(tab)
         self._write(f"{tab}!A{row_index}:{width}{row_index}", [values])
+        self.mark_new_row(tab, row_index, width)
         return row_index
 
     def next_prefixed_id(self, tab: str, prefix: str, year: int) -> str:
@@ -1167,6 +1211,11 @@ class DocumentPipeline:
         )
         index = row_index or self.next_row(TAB_IMPORTS_LOG)
         self._write(f"{TAB_IMPORTS_LOG}!A{index}:F{index}", [row])
+        if not row_index:
+            # row_index non nul = REECRITURE d'une ligne de journal deja
+            # existante (decision prise apres validation). Une mise a jour
+            # n'est pas une creation : elle ne se colore pas.
+            self.mark_new_row(TAB_IMPORTS_LOG, index, "F")
         return index
 
 
