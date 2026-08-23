@@ -52,6 +52,31 @@ CLEANUP_KEY = "cleanup_duplicate_records"
 CLEANUP_VERSION = 1
 DUPLICATE_KEY_PREFIXES = ("29dee48b317c", "4b6ea8b8a6e3", "af8348a31d13")
 
+# --- rattachement des fiches vivantes a leur ligne d'origine --------------
+# L'inspection a montre que les fiches canoniques cfa6d9b526eb et
+# d5331e88d32b n'existent plus : ce sont les fiches recreees qui portent
+# aujourd'hui l'etat, les boutons et l'archive. On les rattache donc a la
+# ligne de journal et a l'archive Drive d'origine. DEUX champs seulement
+# sont touches : `log_row` et `drive_link`. L'etat, l'empreinte, la
+# reference stable, l'identifiant du message Telegram et tous les etats de
+# notification restent intacts.
+RESTORE_KEY = "restore_canonical_links"
+RESTORE_VERSION = 1
+CANONICAL_LINKS = (
+    {
+        "prefix": "4b6ea8b8a6e3",
+        "numero": "CI-2026-045",
+        "log_row": 9,
+        "drive_id": "1k4OhGRE-Plpr6IkQD5X95nVzR2NVxDBP",
+    },
+    {
+        "prefix": "af8348a31d13",
+        "numero": "EXP-2026-019",
+        "log_row": 10,
+        "drive_id": "17ahnRBx0Nnr4EYKkeN5rl4ZSbT7LSM2v",
+    },
+)
+
 
 class RepairError(RuntimeError):
     """Echec d'une reparation. Jamais porteur de secret."""
@@ -507,6 +532,84 @@ def cleanup_duplicates(worker) -> dict[str, Any]:
     return report
 
 
+def restore_canonical_links(worker) -> dict[str, Any]:
+    """Rattache les fiches vivantes a leur ligne de journal et a leur
+    archive d'origine. Ne touche QUE `log_row` et `drive_link`."""
+    db = worker._db_path
+    chat = worker._chat_id
+    store.ensure_schema(db)
+    ensure_schema(db)
+    if migration_state(db, RESTORE_KEY, RESTORE_VERSION) == "done":
+        return {"skipped": True, "reason": "deja executee"}
+
+    rows = inventory(db, chat)
+    saved = backup(db)
+    report: dict[str, Any] = {"backup": saved["db"], "corrigees": [], "ignorees": []}
+
+    for cible in CANONICAL_LINKS:
+        fiche = next(
+            (r for r in rows if str(r["doc_key"]).startswith(cible["prefix"])), None
+        )
+        if fiche is None:
+            report["ignorees"].append(
+                {"cle": cible["prefix"], "motif": "fiche absente de la base"}
+            )
+            continue
+        if str(fiche.get("numero") or "") != cible["numero"]:
+            report["ignorees"].append({
+                "cle": cible["prefix"],
+                "motif": f"numero inattendu {fiche.get('numero')!r}, attendu {cible['numero']!r}",
+            })
+            continue
+
+        lien = f"https://drive.google.com/file/d/{cible['drive_id']}/view"
+        avant = {
+            "log_row": fiche.get("log_row"),
+            "drive_link": fiche.get("drive_link"),
+            "state": fiche.get("state"),
+            "file_sha256": fiche.get("file_sha256"),
+            "last_notified_state": fiche.get("last_notified_state"),
+        }
+        sql = (
+            "UPDATE documents SET log_row = {row}, drive_link = '{lien}', "
+            "updated_at = '{when}' WHERE doc_key = '{cle}'"
+        ).format(
+            row=cible["log_row"], lien=lien, when=_now(), cle=str(fiche["doc_key"])
+        )
+        with connect(db) as conn:
+            conn.execute(
+                "UPDATE documents SET log_row = ?, drive_link = ?, updated_at = ? "
+                "WHERE doc_key = ?",
+                (int(cible["log_row"]), lien, _now(), str(fiche["doc_key"])),
+            )
+            conn.commit()
+
+        relu = store.get_document(db, str(fiche["doc_key"])) or {}
+        apres = {
+            "log_row": relu.get("log_row"),
+            "drive_link": relu.get("drive_link"),
+            "state": relu.get("state"),
+            "file_sha256": relu.get("file_sha256"),
+            "last_notified_state": relu.get("last_notified_state"),
+            "telegram_message_id": relu.get("telegram_message_id"),
+            "member_path": relu.get("member_path"),
+        }
+        conforme = (
+            int(apres["log_row"] or 0) == int(cible["log_row"])
+            and drive_file_id(str(apres["drive_link"] or "")) == cible["drive_id"]
+            and apres["state"] == avant["state"]
+            and apres["file_sha256"] == avant["file_sha256"]
+            and apres["last_notified_state"] == avant["last_notified_state"]
+        )
+        report["corrigees"].append({
+            "cle": cible["prefix"], "numero": cible["numero"],
+            "sql": sql, "avant": avant, "apres": apres, "conforme": conforme,
+        })
+
+    set_migration(db, RESTORE_KEY, RESTORE_VERSION, "done", "")
+    return report
+
+
 def run(worker) -> dict[str, Any]:
     """Repare les archives, puis met les faux fichiers en quarantaine."""
     db = worker._db_path
@@ -548,6 +651,40 @@ def run(worker) -> dict[str, Any]:
                 len(menage["supprimes"]), len(menage["conserves"]),
                 len(menage["absents"]),
             )
+
+    # Rattachement des fiches vivantes a leur ligne et a leur archive
+    # d'origine, sur decision explicite du client.
+    try:
+        remise = restore_canonical_links(worker)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Rattachement canonique impossible : %s", type(exc).__name__)
+    else:
+        if remise.get("skipped"):
+            logger.info("Rattachement canonique : %s", remise.get("reason"))
+        else:
+            logger.info("Sauvegarde avant rattachement : %s", remise["backup"])
+            for entree in remise["corrigees"]:
+                logger.info("SQL execute : %s", entree["sql"])
+                logger.info(
+                    "Fiche %s (%s) avant : log_row=%s drive=%s | apres : "
+                    "log_row=%s drive=%s etat=%s sha=%s notifie=%s telegram=%s "
+                    "member_path=%s | conforme=%s",
+                    entree["cle"], entree["numero"],
+                    entree["avant"]["log_row"],
+                    drive_file_id(str(entree["avant"]["drive_link"] or "")),
+                    entree["apres"]["log_row"],
+                    drive_file_id(str(entree["apres"]["drive_link"] or "")),
+                    entree["apres"]["state"],
+                    str(entree["apres"]["file_sha256"] or "")[:16],
+                    entree["apres"]["last_notified_state"],
+                    entree["apres"]["telegram_message_id"],
+                    entree["apres"]["member_path"],
+                    entree["conforme"],
+                )
+            for entree in remise["ignorees"]:
+                logger.warning(
+                    "Fiche %s non rattachee : %s", entree["cle"], entree["motif"]
+                )
 
     state = migration_state(db, MIGRATION_KEY, MIGRATION_VERSION)
     if state == "done":
