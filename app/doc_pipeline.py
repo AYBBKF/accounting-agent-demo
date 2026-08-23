@@ -131,6 +131,8 @@ class Gateway(Protocol):
 
     def execute(self, slug: str, arguments: dict[str, Any]) -> dict[str, Any]: ...
 
+    def upload(self, *, name: str, mimetype: str, content: bytes) -> str: ...
+
 
 @dataclass
 class PartyMatch:
@@ -393,10 +395,23 @@ class DocumentPipeline:
         return folder_id
 
     def archive(self, file: DocumentFile, folder: str, year: int, source_url: str) -> str:
-        """Archive le PDF dans <racine>/<categorie>/<annee> et retourne son lien."""
-        root = self.ensure_folder(self._drive_root)
-        category = self.ensure_folder(folder, root)
-        target = self.ensure_folder(str(year), category) or category or root
+        """Archive le PDF dans <racine>/<categorie>/<annee> et retourne son lien.
+
+        Le contenu archive est celui du document lui-meme. Pour un PDF
+        contenu dans un ZIP, l'URL Gmail designe l'archive entiere : s'en
+        servir stockerait le ZIP sous le nom du PDF. L'URL n'est donc un
+        repli que pour une piece jointe autonome.
+        """
+        target = self.archive_folder(folder, year)
+        if file.content:
+            uploaded = self._upload_content(file, target)
+            if uploaded:
+                return uploaded
+        if file.source != "attachment" or not source_url:
+            raise PipelineError(
+                f"Archivage impossible pour {file.display_name} : "
+                "le contenu du document n'est pas disponible."
+            )
         args: dict[str, Any] = {
             "source_url": source_url,
             "name": file.filename,
@@ -406,6 +421,61 @@ class DocumentPipeline:
             args["parent_folder_id"] = target
         uploaded = self._gw.execute("GOOGLEDRIVE_UPLOAD_FROM_URL", args)
         return drive_link(uploaded)
+
+    def archive_folder(self, folder: str, year: int) -> str:
+        root = self.ensure_folder(self._drive_root)
+        category = self.ensure_folder(folder, root)
+        return self.ensure_folder(str(year), category) or category or root
+
+    def _upload_content(self, file: DocumentFile, target: str) -> str:
+        """Depot des octets reels. Retourne "" si la passerelle ne sait pas
+        deposer de contenu : l'appelant decide alors du repli."""
+        upload = getattr(self._gw, "upload", None)
+        if upload is None:
+            return ""
+        try:
+            key = upload(
+                name=file.filename, mimetype="application/pdf", content=file.content
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Depot du contenu de %s impossible: %s", file.display_name, exc)
+            return ""
+        if not key:
+            return ""
+        args: dict[str, Any] = {
+            "file_to_upload": {
+                "name": file.filename,
+                "mimetype": "application/pdf",
+                "s3key": key,
+            }
+        }
+        if target:
+            args["folder_to_upload_to"] = target
+        return drive_link(self._gw.execute("GOOGLEDRIVE_UPLOAD_FILE", args))
+
+    def relocate(self, link: str, folder: str, year: int) -> bool:
+        """Deplace une piece archivee dans 'A verifier' vers son dossier
+        definitif, une fois la decision humaine prise."""
+        file_id = drive_file_id(link)
+        target = self.archive_folder(folder, year)
+        if not file_id or not target:
+            return False
+        try:
+            meta = self._gw.execute(
+                "GOOGLEDRIVE_GET_FILE_METADATA",
+                {"fileId": file_id, "fields": "id,parents"},
+            )
+            parents = [str(p) for p in (meta.get("parents") or []) if p]
+            if parents == [target]:
+                return True
+            args: dict[str, Any] = {"file_id": file_id, "add_parents": target}
+            if parents:
+                args["remove_parents"] = ",".join(parents)
+            self._gw.execute("GOOGLEDRIVE_MOVE_FILE", args)
+        except Exception as exc:  # noqa: BLE001 - classement non bloquant
+            logger.warning("Deplacement Drive de %s impossible: %s", file_id, exc)
+            return False
+        return True
 
     # -- Calendar ----------------------------------------------------------
 
@@ -667,6 +737,16 @@ class DocumentPipeline:
 
         # --- etape 3 : archivage Drive -------------------------------------
         outcome.drive_link = str(state.get("drive_link") or "")
+        parked = bool(state.get("review_archive"))
+        if outcome.drive_link and parked:
+            # La piece attendait dans 'A verifier'. La decision est prise :
+            # elle rejoint son dossier definitif et la ligne comptable
+            # recoit enfin son lien.
+            if self.relocate(outcome.drive_link, route.drive_folder,
+                             (doc.date_document or date.today()).year):
+                store.update_document(self._db, doc_key, review_archive=0)
+            self._backfill(outcome.tab, outcome.row_index,
+                           DRIVE_LINK_COLUMN, outcome.drive_link)
         if not outcome.drive_link:
             try:
                 outcome.drive_link = self.archive(
@@ -705,9 +785,14 @@ class DocumentPipeline:
                            CALENDAR_EVENT_COLUMN, outcome.calendar_event)
 
         # --- etape 5 : journal d'import ------------------------------------
-        if not state.get("log_row"):
+        log_row = int(state.get("log_row") or 0)
+        if not log_row:
             log_row = self._safe_log(outcome, message)
             store.update_document(self._db, doc_key, log_row=log_row, state=store.LOGGED)
+        elif parked:
+            # La ligne existante disait "A valider" : elle doit maintenant
+            # dire ou l'ecriture a ete faite, sans creer de seconde ligne.
+            self._safe_log(outcome, message, row_index=log_row)
 
         store.set_state(self._db, doc_key, store.COMPLETED)
         return outcome
@@ -829,7 +914,13 @@ class DocumentPipeline:
             outcome.drive_link = self._archive_for_review(
                 file, doc, source_url, outcome.doc_key
             )
-        fields: dict[str, Any] = {"state": state, "drive_link": outcome.drive_link}
+        fields: dict[str, Any] = {
+            "state": state,
+            "drive_link": outcome.drive_link,
+            # L'archive est provisoire : elle vit dans "A verifier" tant
+            # qu'aucune decision n'est prise.
+            "review_archive": 1 if outcome.drive_link else 0,
+        }
         if payload:
             fields["payload"] = payload
         store.update_document(self._db, outcome.doc_key, **fields)
@@ -867,9 +958,11 @@ class DocumentPipeline:
         except Exception as exc:  # noqa: BLE001 - report non bloquant
             logger.warning("Report %s!%s%d impossible: %s", tab, column, row_index, exc)
 
-    def _safe_log(self, outcome: DocumentOutcome, message: dict[str, Any]) -> int:
+    def _safe_log(
+        self, outcome: DocumentOutcome, message: dict[str, Any], row_index: int = 0
+    ) -> int:
         try:
-            return self.append_import_log(outcome, message)
+            return self.append_import_log(outcome, message, row_index=row_index)
         except Exception as exc:  # noqa: BLE001 - le journal ne bloque jamais
             logger.warning("Journal d'import non ecrit (%s): %s", outcome.filename, exc)
             return 0
@@ -1040,7 +1133,9 @@ class DocumentPipeline:
         ids = [str(r[0]).strip() for r in self._read(f"{tab}!A2:A400") if r]
         return next_stable_invoice_id(ids, year, prefix)
 
-    def append_import_log(self, outcome: DocumentOutcome, message: dict[str, Any]) -> int:
+    def append_import_log(
+        self, outcome: DocumentOutcome, message: dict[str, Any], row_index: int = 0
+    ) -> int:
         from datetime import datetime, timezone
 
         doc = outcome.document
@@ -1070,7 +1165,7 @@ class DocumentPipeline:
             avertissements=tuple(outcome.warnings),
             en_attente=outcome.pending_review,
         )
-        index = self.next_row(TAB_IMPORTS_LOG)
+        index = row_index or self.next_row(TAB_IMPORTS_LOG)
         self._write(f"{TAB_IMPORTS_LOG}!A{index}:F{index}", [row])
         return index
 
@@ -1089,6 +1184,15 @@ def first_folder_id(payload: dict[str, Any]) -> str:
         if isinstance(candidate, dict) and candidate.get("id"):
             return str(candidate["id"])
     return ""
+
+
+def drive_file_id(link: str) -> str:
+    """Identifiant Drive porte par un lien de fichier."""
+    marker = "/d/"
+    if marker not in link:
+        return ""
+    rest = link.split(marker, 1)[1]
+    return rest.split("/", 1)[0].split("?", 1)[0]
 
 
 def drive_link(uploaded: dict[str, Any]) -> str:
