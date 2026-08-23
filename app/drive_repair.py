@@ -41,6 +41,17 @@ MIGRATION_VERSION = 1
 QUARANTINE_FOLDER = "ZZ_QUARANTAINE_ARCHIVES_ZIP"
 PDF_MAGIC = b"%PDF-"
 
+# --- nettoyage des enregistrements parasites du 23/08/2026 ----------------
+# Une validation humaine en echec avait supprime la fiche de deux documents
+# DEJA archives et DEJA journalises ; le cycle suivant les a recrees de
+# zero, trois fois. Ces trois cles sont les enregistrements parasites, et
+# eux seuls. Ils ne sont supprimes QUE si l'enregistrement canonique du
+# meme document existe encore : sinon, ils SONT le document et on n'y
+# touche pas.
+CLEANUP_KEY = "cleanup_duplicate_records"
+CLEANUP_VERSION = 1
+DUPLICATE_KEY_PREFIXES = ("29dee48b317c", "4b6ea8b8a6e3", "af8348a31d13")
+
 
 class RepairError(RuntimeError):
     """Echec d'une reparation. Jamais porteur de secret."""
@@ -401,7 +412,100 @@ def read_calendar_event(worker, event_id: str) -> dict:
     }
 
 
-# --- migration ------------------------------------------------------------
+# --- inventaire et nettoyage des doublons ---------------------------------
+
+def inventory(db_path: str, chat_id: int) -> list[dict[str, Any]]:
+    """Etat REEL de chaque fiche, tel qu'il sera journalise avant tout
+    nettoyage. Aucune ecriture."""
+    keep = (
+        "doc_key", "filename", "numero", "doc_type", "state", "drive_link",
+        "log_row", "file_sha256", "gmail_message_id", "created_at",
+        "last_notified_state",
+    )
+    return [
+        {k: row.get(k) for k in keep}
+        for row in store.list_documents(db_path, chat_id)
+    ]
+
+
+def canonical_twin(rows: list[dict[str, Any]], row: dict[str, Any]) -> dict[str, Any] | None:
+    """Fiche PLUS ANCIENNE decrivant exactement le meme document.
+
+    Meme email, meme empreinte de fichier, autre cle. C'est la definition
+    du doublon : sans jumeau plus ancien, la fiche examinee est le seul
+    enregistrement du document et ne doit jamais etre supprimee.
+    """
+    # `rows` vient de `list_documents`, trie par date de creation puis par
+    # ordre d'insertion : la fiche canonique est donc celle qui apparait
+    # AVANT. Comparer les horodatages seuls ne suffit pas, deux fiches
+    # creees dans la meme seconde porteraient la meme valeur.
+    try:
+        position = next(
+            i for i, r in enumerate(rows) if r["doc_key"] == row["doc_key"]
+        )
+    except StopIteration:
+        return None
+    for other in rows[:position]:
+        if other.get("gmail_message_id") != row.get("gmail_message_id"):
+            continue
+        if other.get("file_sha256") != row.get("file_sha256"):
+            continue
+        return other
+    return None
+
+
+def delete_record(db_path: str, doc_key: str) -> None:
+    """Suppression ciblee d'UNE fiche parasite, apres sauvegarde."""
+    with connect(db_path) as conn:
+        conn.execute("DELETE FROM documents WHERE doc_key = ?", (doc_key,))
+        conn.commit()
+
+
+def cleanup_duplicates(worker) -> dict[str, Any]:
+    """Retire les fiches parasites nommement identifiees, et elles seules."""
+    db = worker._db_path
+    chat = worker._chat_id
+    store.ensure_schema(db)
+    ensure_schema(db)
+    if migration_state(db, CLEANUP_KEY, CLEANUP_VERSION) == "done":
+        return {"skipped": True, "reason": "deja executee"}
+
+    rows = inventory(db, chat)
+    saved = backup(db)
+    listing = Path(saved["root"]) / f"documents-avant-{CLEANUP_KEY}-v{CLEANUP_VERSION}.json"
+    listing.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    report: dict[str, Any] = {
+        "backup": saved["db"], "inventaire": str(listing),
+        "supprimes": [], "conserves": [], "absents": [],
+    }
+    for prefix in DUPLICATE_KEY_PREFIXES:
+        cible = next(
+            (r for r in rows if str(r["doc_key"]).startswith(prefix)), None
+        )
+        if cible is None:
+            report["absents"].append(prefix)
+            continue
+        jumeau = canonical_twin(rows, cible)
+        detail = {
+            "cle": prefix,
+            "numero": cible.get("numero"),
+            "etat": cible.get("state"),
+            "drive": drive_file_id(str(cible.get("drive_link") or "")),
+            "log_row": cible.get("log_row"),
+            "creee": cible.get("created_at"),
+        }
+        if jumeau is None:
+            detail["motif"] = "seul enregistrement de ce document : conserve"
+            report["conserves"].append(detail)
+            continue
+        detail["canonique"] = str(jumeau["doc_key"])[:12]
+        delete_record(db, str(cible["doc_key"]))
+        report["supprimes"].append(detail)
+
+    set_migration(db, CLEANUP_KEY, CLEANUP_VERSION, "done", "")
+    return report
+
 
 def run(worker) -> dict[str, Any]:
     """Repare les archives, puis met les faux fichiers en quarantaine."""
@@ -409,6 +513,42 @@ def run(worker) -> dict[str, Any]:
     chat = worker._chat_id
     store.ensure_schema(db)
     ensure_schema(db)
+
+    # Nettoyage des fiches parasites : marqueur propre, execute une fois,
+    # AVANT toute sortie anticipee de la migration des archives. Un echec
+    # ici ne doit jamais empecher le cycle Gmail de tourner.
+    try:
+        menage = cleanup_duplicates(worker)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Nettoyage des doublons impossible : %s", type(exc).__name__)
+    else:
+        if menage.get("skipped"):
+            logger.info("Nettoyage des doublons : %s", menage.get("reason"))
+        else:
+            logger.info("Sauvegarde avant nettoyage : %s", menage["backup"])
+            logger.info("Inventaire des fiches : %s", menage["inventaire"])
+            for entree in menage["supprimes"]:
+                logger.info(
+                    "Fiche parasite supprimee %s (%s, etat=%s, drive=%s, "
+                    "journal=%s, creee=%s) - canonique conservee : %s",
+                    entree["cle"], entree["numero"], entree["etat"],
+                    entree["drive"], entree["log_row"], entree["creee"],
+                    entree["canonique"],
+                )
+            for entree in menage["conserves"]:
+                logger.warning(
+                    "Fiche %s NON supprimee (%s) : %s",
+                    entree["cle"], entree["numero"], entree["motif"],
+                )
+            for prefixe in menage["absents"]:
+                logger.info("Fiche %s : absente de la base, rien a supprimer", prefixe)
+            logger.info(
+                "Nettoyage des doublons termine : %d supprimee(s), %d conservee(s), "
+                "%d absente(s)",
+                len(menage["supprimes"]), len(menage["conserves"]),
+                len(menage["absents"]),
+            )
+
     state = migration_state(db, MIGRATION_KEY, MIGRATION_VERSION)
     if state == "done":
         return {"skipped": True, "reason": "deja executee"}
