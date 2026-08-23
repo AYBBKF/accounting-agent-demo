@@ -74,6 +74,10 @@ class FakeMailWorker(MailWorker):
         self.blobs: dict[str, bytes] = {}
         self.gmail_calls: list[tuple[str, dict]] = []
         self.download_failures: set[str] = set()
+        # Contenus reellement deposes chez Composio avant l'upload Drive :
+        # cle S3 -> octets. C'est ce qui prouve qu'un PDF membre d'un ZIP
+        # est archive avec SON contenu et non celui de l'archive.
+        self.uploaded: dict[str, bytes] = {}
 
     # -- alimentation du faux Gmail ---------------------------------------
 
@@ -120,6 +124,12 @@ class FakeMailWorker(MailWorker):
         if slug == "GMAIL_GET_ATTACHMENT":
             return {"file": {"s3url": f"https://example.invalid/{arguments['attachment_id']}"}}
         raise AssertionError(f"outil Gmail non simule : {slug}")
+
+    def upload(self, *, name: str, mimetype: str, content: bytes) -> str:
+        assert mimetype == "application/pdf"
+        key = f"s3/{len(self.uploaded)}/{name}"
+        self.uploaded[key] = content
+        return key
 
     def download(self, message_id: str, attachment: dict) -> tuple[bytes, str]:
         attachment_id = str(attachment.get("attachmentId"))
