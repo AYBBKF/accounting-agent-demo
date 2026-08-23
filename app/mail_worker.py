@@ -45,6 +45,7 @@ NL = chr(10)
 
 COMPOSIO_BASE_URL = "https://backend.composio.dev"
 COMPOSIO_TOOLS_EXECUTE_PATH = "/api/v3.1/tools/execute/{tool_slug}"
+COMPOSIO_FILE_UPLOAD_PATH = "/api/v3.1/files/upload/request"
 _REQUEST_TIMEOUT_SECONDS = 60.0
 _MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
 
@@ -186,6 +187,54 @@ class MailWorker:
             logger.warning("Outil '%s' en echec (user=%s)", slug, self.user_id)
             raise MailWorkerError(f"L'outil '{slug}' a echoue.")
         return result.get("data") or {}
+
+    def upload(self, *, name: str, mimetype: str, content: bytes) -> str:
+        """Depose les octets reels du document chez Composio et retourne la
+        cle S3 a passer a GOOGLEDRIVE_UPLOAD_FILE.
+
+        Indispensable pour un PDF membre d'un ZIP : son contenu n'a aucune
+        URL Gmail propre, et archiver l'URL du ZIP parent reviendrait a
+        stocker l'archive entiere sous le nom du PDF.
+        """
+        import hashlib
+
+        client = self._ensure_client()
+        empreinte = hashlib.md5(content).hexdigest()
+        try:
+            response = client.post(
+                COMPOSIO_FILE_UPLOAD_PATH,
+                json={
+                    "toolkit_slug": "googledrive",
+                    "tool_slug": "GOOGLEDRIVE_UPLOAD_FILE",
+                    "filename": name,
+                    "mimetype": mimetype,
+                    "md5": empreinte,
+                },
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except Exception as exc:  # noqa: BLE001 - jamais de secret dans le message
+            logger.warning("Preparation du depot de %s impossible: %s", name, exc)
+            raise MailWorkerError("Depot du document impossible.") from exc
+
+        key = str(payload.get("key") or "")
+        presigned = str(payload.get("new_presigned_url") or "")
+        if not key:
+            raise MailWorkerError("Depot du document refuse (aucune cle).")
+        if presigned:
+            try:
+                import httpx
+
+                put = httpx.put(
+                    presigned, content=content,
+                    headers={"Content-Type": mimetype},
+                    timeout=_REQUEST_TIMEOUT_SECONDS,
+                )
+                put.raise_for_status()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Envoi du contenu de %s echoue: %s", name, exc)
+                raise MailWorkerError("Envoi du document impossible.") from exc
+        return key
 
     # -- curseur -----------------------------------------------------------
 
