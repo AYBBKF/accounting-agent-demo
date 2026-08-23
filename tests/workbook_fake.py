@@ -99,6 +99,11 @@ TOOL_ARGUMENTS: dict[str, tuple[set[str], set[str]]] = {
         {"parent_folder_id", "mime_type", "source_headers", "verify_ssl",
          "supports_all_drives"},
     ),
+    "GOOGLEDRIVE_UPLOAD_FILE": ({"file_to_upload"}, {"folder_to_upload_to"}),
+    "GOOGLEDRIVE_GET_FILE_METADATA": ({"fileId"}, {"fields", "supportsAllDrives"}),
+    "GOOGLEDRIVE_MOVE_FILE": (
+        {"file_id"}, {"add_parents", "remove_parents", "supports_all_drives"},
+    ),
     "GOOGLECALENDAR_CREATE_EVENT": (
         {"start_datetime"},
         {"summary", "description", "timezone", "end_datetime", "calendar_id",
@@ -167,6 +172,8 @@ class FakeWorkbook:
         self.validations: list[dict] = []
         self.folders: dict[tuple[str, str], str] = {}
         self.uploads: list[dict] = []
+        self.moves: list[dict] = []
+        self.drive_parents: dict[str, str] = {}
         self.events: list[dict] = []
         self.drive_fails = False
         self._next_folder = 1
@@ -254,6 +261,25 @@ class FakeWorkbook:
                 raise RuntimeError("Drive indisponible")
             self.uploads.append(arguments)
             return {"id": f"file-{len(self.uploads)}"}
+
+        if slug == "GOOGLEDRIVE_UPLOAD_FILE":
+            if self.drive_fails:
+                raise RuntimeError("Drive indisponible")
+            self.uploads.append(arguments)
+            file_id = f"file-{len(self.uploads)}"
+            self.drive_parents[file_id] = str(arguments.get("folder_to_upload_to") or "")
+            return {"id": file_id}
+
+        if slug == "GOOGLEDRIVE_GET_FILE_METADATA":
+            parent = self.drive_parents.get(str(arguments["fileId"]), "")
+            return {"id": arguments["fileId"], "parents": [parent] if parent else []}
+
+        if slug == "GOOGLEDRIVE_MOVE_FILE":
+            self.moves.append(arguments)
+            self.drive_parents[str(arguments["file_id"])] = str(
+                arguments.get("add_parents") or ""
+            )
+            return {"id": arguments["file_id"]}
 
         if slug == "GOOGLECALENDAR_CREATE_EVENT":
             self.events.append(arguments)
