@@ -174,7 +174,7 @@ def test_a_document_awaiting_a_decision_is_archived_and_logged(worker):
     outcome = worker.process_once()[0].to_review[0]
 
     upload = worker.workbook.uploads[-1]
-    assert upload["name"] == "anomalie.pdf"
+    assert upload["file_to_upload"]["name"] == "anomalie.pdf"
     folders = {name for (_parent, name) in worker.workbook.folders}
     assert "A verifier" in folders
     assert outcome.drive_link
@@ -414,7 +414,7 @@ def test_a_rotating_gmail_attachment_id_no_longer_creates_a_new_document(worker,
     worker.process_once()
 
     again = {r["doc_key"] for r in store.list_by_message(db_path, CHAT_ID, "m-pack")}
-    assert again == keys, "un identifiant Gmail volatil ne doit plus creer de doublon"
+    assert again == keys, "un identifiant Gmail volatil ne doit plus creer de doublon."
 
 
 def test_retry_pending_finishes_what_is_left_without_duplicating(worker, db_path):
@@ -510,3 +510,78 @@ def test_the_vault_survives_a_restart(db_path):
     content = b"%PDF-durable"
     vault.save(db_path, CHAT_ID, "cle", content)
     assert vault.load(db_path, CHAT_ID, "cle", sha256_of(content)) == content
+
+
+# === 12. le contenu archive est celui du document, pas celui du ZIP ======
+
+def test_each_archived_pdf_carries_its_own_bytes_not_the_zip(worker):
+    """Le defaut trouve en production : chaque PDF etait archive avec le
+    contenu de l'archive parente. Le lien existait, la piece etait fausse."""
+    send_pack(worker)
+    worker.process_once()
+
+    archive_entier = zip_of(PACK_MEMBERS)
+    deposes = dict(worker.uploaded)
+    assert deposes, "aucun contenu depose"
+    assert archive_entier not in deposes.values()
+
+    par_nom = {}
+    for upload in worker.workbook.uploads:
+        cible = upload["file_to_upload"]
+        par_nom[cible["name"]] = deposes[cible["s3key"]]
+
+    for chemin, contenu in PACK_MEMBERS.items():
+        nom = chemin.split("/")[-1]
+        assert par_nom[nom] == contenu, f"{nom} archive avec un contenu etranger"
+
+
+def test_a_zip_member_is_never_archived_from_the_parent_url(worker):
+    """Aucun repli sur l'URL Gmail pour un membre de ZIP : elle designe
+    l'archive entiere. Mieux vaut ne rien archiver que du faux."""
+    send_pack(worker)
+    worker.uploaded.clear()
+
+    def refuse(**kwargs):
+        raise MailWorkerError("depot indisponible")
+
+    worker.upload = refuse
+    worker.process_once()
+
+    assert not any(
+        "source_url" in upload for upload in worker.workbook.uploads
+    ), "un membre de ZIP a ete archive depuis l'URL du ZIP parent"
+
+
+# === 13. apres validation, la piece et le journal suivent ================
+
+def test_validation_moves_the_document_out_of_the_review_folder(worker):
+    send_pack(worker)
+    pending = worker.process_once()[0].to_review[0]
+    assert pending.drive_link
+
+    worker.confirm(pending.doc_key[:24])
+
+    assert worker.workbook.moves, "la piece est restee dans 'A verifier'"
+    move = worker.workbook.moves[-1]
+    a_verifier = worker.workbook.folders.get(("", "A verifier"))
+    assert move["remove_parents"] != ""
+    assert move["add_parents"] != a_verifier
+
+
+def test_validation_updates_the_pending_log_row_instead_of_adding_one(worker):
+    send_pack(worker)
+    pending = worker.process_once()[0].to_review[0]
+    journal_avant = worker.workbook.rows("14_IMPORTS_LOG")
+    ligne = next(
+        index for index, row in enumerate(journal_avant, start=1)
+        if row and row[3] == "A valider"
+    )
+
+    worker.confirm(pending.doc_key[:24])
+
+    journal_apres = worker.workbook.rows("14_IMPORTS_LOG")
+    assert len(journal_apres) == len(journal_avant), "une seconde ligne a ete creee"
+    mise_a_jour = journal_apres[ligne - 1]
+    assert mise_a_jour[3] == "Cree"
+    assert "EN ATTENTE DE VALIDATION" not in mise_a_jour[5]
+    assert "05_FACTURES_ACHATS" in mise_a_jour[5]
