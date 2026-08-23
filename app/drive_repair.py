@@ -62,6 +62,23 @@ DUPLICATE_KEY_PREFIXES = ("29dee48b317c", "4b6ea8b8a6e3", "af8348a31d13")
 # notification restent intacts.
 RESTORE_KEY = "restore_canonical_links"
 RESTORE_VERSION = 1
+# --- retour en validation des cinq documents du Pack V2 -------------------
+# Cinq pieces avaient ete comptabilisees automatiquement alors que leur
+# lecture etait ambigue : deux TTC possibles, une devise etrangere sans
+# taux, un TTC absent, un avoir sans facture d'origine identifiable. Les
+# regles corrigees les auraient toutes retenues. Leurs lignes comptables
+# sont supprimees du classeur ; leur fiche revient donc en attente de
+# decision, et redemande son arbitrage UNE seule fois.
+RESET_V2_KEY = "reset_pack_v2_documents"
+RESET_V2_VERSION = 1
+RESET_V2_NUMEROS = (
+    "FAC-V2-AMB-001",
+    "FAC-V2-AMB-002",
+    "FAC-V2-INC-001",
+    "FAC-V2-USD-001",
+    "AV-V2-INC-001",
+)
+
 CANONICAL_LINKS = (
     {
         "prefix": "4b6ea8b8a6e3",
@@ -610,6 +627,87 @@ def restore_canonical_links(worker) -> dict[str, Any]:
     return report
 
 
+def reset_pack_v2_documents(worker) -> dict[str, Any]:
+    """Remet en attente de validation les cinq documents du Pack V2.
+
+    Ecrit UNIQUEMENT l'etat et les champs de notification. L'empreinte du
+    fichier, la reference Gmail, le lien Drive et l'horodatage de creation
+    ne sont pas touches : la fiche reste le meme document, elle attend
+    seulement une decision au lieu d'en avoir recu une a tort.
+    """
+    db = worker._db_path
+    chat = worker._chat_id
+    store.ensure_schema(db)
+    ensure_schema(db)
+    if migration_state(db, RESET_V2_KEY, RESET_V2_VERSION) == "done":
+        return {"skipped": True, "reason": "deja executee"}
+
+    rows = inventory(db, chat)
+    saved = backup(db)
+    report: dict[str, Any] = {
+        "backup": saved["db"], "remises": [], "absentes": [], "inchangees": [],
+    }
+    attendus = {n.upper() for n in RESET_V2_NUMEROS}
+
+    for numero in RESET_V2_NUMEROS:
+        fiche = next(
+            (r for r in rows if str(r.get("numero") or "").upper() == numero.upper()),
+            None,
+        )
+        if fiche is None:
+            report["absentes"].append(numero)
+            continue
+        cle = str(fiche["doc_key"])
+        avant = {
+            "state": fiche.get("state"),
+            "file_sha256": fiche.get("file_sha256"),
+            "drive_link": fiche.get("drive_link"),
+            "last_notified_state": fiche.get("last_notified_state"),
+        }
+        if avant["state"] == store.NEEDS_REVIEW:
+            report["inchangees"].append({"numero": numero, "cle": cle})
+            continue
+        with connect(db) as conn:
+            conn.execute(
+                "UPDATE documents SET state = ?, stable_id = '', tab = '', "
+                "row_index = 0, lines_written = 0, review_archive = 1, "
+                "last_notified_state = '', notified_at = NULL, "
+                "validation_notification_sent_at = NULL, telegram_message_id = 0, "
+                "updated_at = ? WHERE doc_key = ?",
+                (store.NEEDS_REVIEW, _now(), cle),
+            )
+            conn.commit()
+        relu = store.get_document(db, cle) or {}
+        apres = {
+            "state": relu.get("state"),
+            "stable_id": relu.get("stable_id"),
+            "row_index": relu.get("row_index"),
+            "file_sha256": relu.get("file_sha256"),
+            "drive_link": relu.get("drive_link"),
+            "last_notified_state": relu.get("last_notified_state"),
+            "validation_notification_sent_at": relu.get("validation_notification_sent_at"),
+        }
+        conforme = (
+            apres["state"] == store.NEEDS_REVIEW
+            and not (apres["stable_id"] or "")
+            and int(apres["row_index"] or 0) == 0
+            and apres["file_sha256"] == avant["file_sha256"]
+            and apres["drive_link"] == avant["drive_link"]
+            and not (apres["last_notified_state"] or "")
+        )
+        report["remises"].append({
+            "numero": numero, "cle": cle,
+            "avant": avant, "apres": apres, "conforme": conforme,
+        })
+
+    # Filet : aucune autre fiche que celles nommees ci-dessus.
+    touchees = {e["numero"].upper() for e in report["remises"]}
+    assert touchees <= attendus
+
+    set_migration(db, RESET_V2_KEY, RESET_V2_VERSION, "done", "")
+    return report
+
+
 def run(worker) -> dict[str, Any]:
     """Repare les archives, puis met les faux fichiers en quarantaine."""
     db = worker._db_path
@@ -684,6 +782,39 @@ def run(worker) -> dict[str, Any]:
             for entree in remise["ignorees"]:
                 logger.warning(
                     "Fiche %s non rattachee : %s", entree["cle"], entree["motif"]
+                )
+
+    # Retour en validation des cinq documents du Pack V2, sur decision
+    # explicite du client. Un echec ici ne bloque jamais le cycle Gmail.
+    try:
+        retour = reset_pack_v2_documents(worker)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Retour en validation Pack V2 impossible : %s", type(exc).__name__)
+    else:
+        if retour.get("skipped"):
+            logger.info("Retour en validation Pack V2 : %s", retour.get("reason"))
+        else:
+            logger.info("Sauvegarde avant retour en validation : %s", retour["backup"])
+            for entree in retour["remises"]:
+                logger.info(
+                    "Document %s (%s) remis en validation : etat %s -> %s, "
+                    "stable_id vide=%s, ligne=%s, sha inchange=%s, drive inchange=%s, "
+                    "notification remise a zero=%s | conforme=%s",
+                    entree["numero"], entree["cle"],
+                    entree["avant"]["state"], entree["apres"]["state"],
+                    not (entree["apres"]["stable_id"] or ""),
+                    entree["apres"]["row_index"],
+                    entree["apres"]["file_sha256"] == entree["avant"]["file_sha256"],
+                    entree["apres"]["drive_link"] == entree["avant"]["drive_link"],
+                    not (entree["apres"]["last_notified_state"] or ""),
+                    entree["conforme"],
+                )
+            for numero in retour["absentes"]:
+                logger.info("Document %s absent de la base, rien a remettre", numero)
+            for entree in retour["inchangees"]:
+                logger.info(
+                    "Document %s (%s) deja en attente de validation, inchange",
+                    entree["numero"], entree["cle"],
                 )
 
     state = migration_state(db, MIGRATION_KEY, MIGRATION_VERSION)
