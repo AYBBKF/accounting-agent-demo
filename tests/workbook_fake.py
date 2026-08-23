@@ -7,6 +7,8 @@ reseau.
 """
 from __future__ import annotations
 
+import base64
+import hashlib
 import re
 from typing import Any
 
@@ -104,6 +106,8 @@ TOOL_ARGUMENTS: dict[str, tuple[set[str], set[str]]] = {
     "GOOGLEDRIVE_MOVE_FILE": (
         {"file_id"}, {"add_parents", "remove_parents", "supports_all_drives"},
     ),
+    "GOOGLEDRIVE_DOWNLOAD_FILE": ({"fileId"}, {"mime_type"}),
+    "GOOGLECALENDAR_EVENTS_GET": ({"event_id"}, {"calendar_id"}),
     "GOOGLECALENDAR_CREATE_EVENT": (
         {"start_datetime"},
         {"summary", "description", "timezone", "end_datetime", "calendar_id",
@@ -174,6 +178,11 @@ class FakeWorkbook:
         self.uploads: list[dict] = []
         self.moves: list[dict] = []
         self.drive_parents: dict[str, str] = {}
+        # Contenus reellement stockes dans le faux Drive : id -> octets.
+        self.drive_files: dict[str, dict] = {}
+        self.uploaded_content: dict[str, bytes] = {}
+        self.calendar_events: dict[str, dict] = {}
+        self.upload_failures: set[str] = set()
         self.events: list[dict] = []
         self.drive_fails = False
         self._next_folder = 1
@@ -265,14 +274,50 @@ class FakeWorkbook:
         if slug == "GOOGLEDRIVE_UPLOAD_FILE":
             if self.drive_fails:
                 raise RuntimeError("Drive indisponible")
+            cible = arguments["file_to_upload"]
+            if cible["name"] in self.upload_failures:
+                raise RuntimeError("depot refuse par Drive")
             self.uploads.append(arguments)
             file_id = f"file-{len(self.uploads)}"
-            self.drive_parents[file_id] = str(arguments.get("folder_to_upload_to") or "")
+            folder = str(arguments.get("folder_to_upload_to") or "")
+            self.drive_parents[file_id] = folder
+            self.drive_files[file_id] = {
+                "name": cible["name"],
+                "mimeType": cible["mimetype"],
+                "content": self.uploaded_content.get(cible["s3key"], b""),
+            }
             return {"id": file_id}
 
         if slug == "GOOGLEDRIVE_GET_FILE_METADATA":
-            parent = self.drive_parents.get(str(arguments["fileId"]), "")
-            return {"id": arguments["fileId"], "parents": [parent] if parent else []}
+            file_id = str(arguments["fileId"])
+            parent = self.drive_parents.get(file_id, "")
+            payload = {"id": file_id, "parents": [parent] if parent else []}
+            stored = self.drive_files.get(file_id)
+            if stored is not None:
+                content = stored["content"]
+                payload.update({
+                    "name": stored["name"],
+                    "mimeType": stored["mimeType"],
+                    "size": len(content),
+                    "md5Checksum": hashlib.md5(content).hexdigest(),
+                })
+            else:
+                for (_p, name), fid in self.folders.items():
+                    if fid == file_id:
+                        payload["name"] = name
+            return payload
+
+        if slug == "GOOGLEDRIVE_DOWNLOAD_FILE":
+            stored = self.drive_files.get(str(arguments["fileId"]))
+            if stored is None:
+                raise RuntimeError("fichier introuvable")
+            return {"file": {"content_b64": base64.b64encode(stored["content"]).decode()}}
+
+        if slug == "GOOGLECALENDAR_EVENTS_GET":
+            found = self.calendar_events.get(str(arguments["event_id"]))
+            if found is None:
+                raise RuntimeError("evenement introuvable")
+            return dict(found)
 
         if slug == "GOOGLEDRIVE_MOVE_FILE":
             self.moves.append(arguments)
