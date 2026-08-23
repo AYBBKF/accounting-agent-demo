@@ -15,6 +15,7 @@ journalise ni renvoye dans un message.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -57,6 +58,61 @@ CALLBACK_REFUSE_PREFIX = "dno:"
 CALLBACK_KEY_LENGTH = 24
 
 
+# Etats de NOTIFICATION. Ils ne remplacent pas l'etat metier stocke dans
+# SQLite : ils disent ce qui a deja ete ANNONCE au client. Une notification
+# n'est envoyee que lors d'une transition reelle entre deux de ces valeurs.
+NOTIFY_NEW = ""
+NOTIFY_COMPLETED = "completed"
+NOTIFY_WAITING = "waiting_validation"
+NOTIFY_SKIPPED = "skipped"
+NOTIFY_PARTIAL = "partial"
+NOTIFY_FAILED = "failed"
+NOTIFY_REJECTED = "rejected"
+
+# Motifs de rejet qui ne meritent AUCUN message : un ZIP comptable contient
+# normalement un manifeste, un README ou une somme de controle. Ce ne sont
+# pas des documents, leur presence n'est pas une anomalie.
+SILENT_REJECTIONS = (
+    "n'est pas un PDF (signature invalide)",
+    "piece jointe ignoree : ni PDF ni archive ZIP",
+)
+
+
+# L'etat METIER stocke en base decide de l'etat NOTIFIABLE. C'est lui qui
+# fait foi : deux cycles successifs qui laissent un document dans le meme
+# etat metier doivent produire exactement le meme etat notifiable, donc
+# aucun message.
+_STATE_TO_NOTIFY = {
+    store.COMPLETED: NOTIFY_COMPLETED,
+    store.DUPLICATE: NOTIFY_COMPLETED,
+    store.SKIPPED: NOTIFY_SKIPPED,
+    store.NEEDS_REVIEW: NOTIFY_WAITING,
+    store.PARTIAL: NOTIFY_PARTIAL,
+    store.FAILED: NOTIFY_FAILED,
+}
+
+
+def notify_state_of(outcome: "DocumentOutcome", state: str = "") -> str:
+    """Etat qu'il faudrait annoncer pour ce resultat.
+
+    ACTION_DUPLICATE ne produit jamais d'etat propre : un document deja
+    importe reste 'completed', donc identique au dernier etat notifie, donc
+    silencieux. C'est exactement la regle demandee.
+    """
+    connu = _STATE_TO_NOTIFY.get(str(state or ""))
+    if connu:
+        return connu
+    if outcome.error:
+        return NOTIFY_FAILED
+    if outcome.action == ACTION_REVIEW:
+        return NOTIFY_WAITING
+    return NOTIFY_COMPLETED
+
+
+def is_silent_rejection(reason: str) -> bool:
+    return any(motif in reason for motif in SILENT_REJECTIONS)
+
+
 class MailWorkerError(RuntimeError):
     """Erreur destinee aux logs / au client, jamais porteuse de secret."""
 
@@ -70,25 +126,53 @@ class MailSummary:
     sender: str
     outcomes: list[DocumentOutcome] = field(default_factory=list)
     rejected: list[tuple[str, str]] = field(default_factory=list)
+    # Sous-ensemble de `outcomes` correspondant a une TRANSITION reelle
+    # d'etat. Seul ce sous-ensemble est annonce dans Telegram ; `outcomes`
+    # reste complet pour les journaux et les comptages internes.
+    notifiable: list[DocumentOutcome] = field(default_factory=list)
+    silenced: int = 0
+    # Rejets reellement dignes d'un message (les membres non-PDF d'un ZIP
+    # sont ecartes en amont, silencieusement).
+    notifiable_rejected: list[tuple[str, str]] = field(default_factory=list)
+    planned: bool = False
 
     def count(self, action: str) -> int:
-        return sum(1 for o in self.outcomes if o.action == action)
+        return sum(1 for o in self.notified_outcomes if o.action == action)
+
+    @property
+    def notified_outcomes(self) -> list[DocumentOutcome]:
+        """Ce que le client doit voir : rien si aucun etat n'a change."""
+        return self.notifiable if self.planned else self.outcomes
+
+    @property
+    def notified_rejected(self) -> list[tuple[str, str]]:
+        return self.notifiable_rejected if self.planned else self.rejected
+
+    @property
+    def should_notify(self) -> bool:
+        return bool(self.notified_outcomes or self.notified_rejected)
 
     @property
     def imported(self) -> list[DocumentOutcome]:
-        return [o for o in self.outcomes if o.action == ACTION_AUTO and o.accounting]
+        return [o for o in self.notified_outcomes if o.action == ACTION_AUTO and o.accounting]
 
     @property
     def classified(self) -> list[DocumentOutcome]:
-        return [o for o in self.outcomes if o.action == ACTION_AUTO and not o.accounting]
+        return [
+            o for o in self.notified_outcomes
+            if o.action == ACTION_AUTO and not o.accounting
+        ]
 
     @property
     def to_review(self) -> list[DocumentOutcome]:
-        return [o for o in self.outcomes if o.action == ACTION_REVIEW]
+        return [o for o in self.notified_outcomes if o.action == ACTION_REVIEW]
 
     @property
     def errors(self) -> list[DocumentOutcome]:
-        return [o for o in self.outcomes if o.error and o.action != ACTION_AUTO]
+        return [
+            o for o in self.notified_outcomes
+            if o.error and o.action != ACTION_AUTO
+        ]
 
 
 class MailWorker:
@@ -335,10 +419,13 @@ class MailWorker:
         summaries: list[MailSummary] = []
         resumed = self.finish_unfinished()
         if resumed:
-            summaries.append(
-                MailSummary(message_id="(reprises)", subject="Reprise d'imports interrompus",
-                            sender="", outcomes=resumed)
+            reprise = MailSummary(
+                message_id="(reprises)", subject="Reprise d'imports interrompus",
+                sender="", outcomes=resumed,
             )
+            self.plan_notifications(reprise)
+            if reprise.should_notify:
+                summaries.append(reprise)
         messages = self.search_messages()
         logger.info(
             "Cycle Gmail (user=%s): %d email(s) correspondant a la requete",
@@ -355,8 +442,13 @@ class MailWorker:
                 logger.warning("Email %s ignore: %s", message_id, exc)
                 continue
             newest = max(newest, internal_date)
-            if summary.outcomes or summary.rejected:
+            if summary.should_notify:
                 summaries.append(summary)
+            else:
+                logger.info(
+                    "Email %s : aucun changement d'etat, 0 message Telegram.",
+                    message_id,
+                )
         if newest:
             store.advance_cursor(self._db_path, self._chat_id, newest)
         return summaries
@@ -469,7 +561,101 @@ class MailWorker:
                             reasons=[f"erreur technique : {exc}"],
                         )
                     )
+        self.plan_notifications(summary)
         return summary, internal_date
+
+    # -- idempotence des notifications -------------------------------------
+
+    def plan_notifications(self, summary: MailSummary) -> MailSummary:
+        """Ne retient que les TRANSITIONS reelles d'etat.
+
+        Le bug corrige ici etait entier a cet endroit : le worker renvoyait
+        au client tout ce qu'il venait de recalculer, sans jamais se demander
+        si quelque chose avait change depuis le cycle precedent. Un document
+        deja termine restait 'deja importe' a chaque tour, un document en
+        attente redemandait sa validation toutes les soixante secondes.
+        """
+        retenus: list[DocumentOutcome] = []
+        silencieux = 0
+        for outcome in summary.outcomes:
+            fiche = store.get_document(self._db_path, outcome.doc_key) or {}
+            etat = notify_state_of(outcome, str(fiche.get("state") or ""))
+            deja = str(fiche.get("last_notified_state") or "")
+            if etat == deja:
+                silencieux += 1
+                continue
+            retenus.append(outcome)
+        summary.notifiable = retenus
+        summary.silenced = silencieux
+
+        # Un .txt, un .csv, un README ou une somme de controle dans un ZIP
+        # comptable n'est pas une anomalie : il est ecarte SILENCIEUSEMENT,
+        # sans notification, sans validation et sans trace dans le journal
+        # comptable. `summary.rejected` garde la verite technique pour les
+        # journaux serveur ; seul l'affichage client est filtre.
+        rejets = [
+            (nom, motif) for nom, motif in summary.rejected
+            if not is_silent_rejection(motif)
+        ]
+        if rejets:
+            signature = hashlib.sha256(
+                repr(sorted(rejets)).encode("utf-8")
+            ).hexdigest()
+            connue = store.email_notification_signature(
+                self._db_path, self._chat_id, summary.message_id
+            )
+            if signature == connue:
+                rejets = []
+            else:
+                store.remember_email_notification(
+                    self._db_path, self._chat_id, summary.message_id, signature
+                )
+        summary.notifiable_rejected = rejets
+        summary.planned = True
+        if silencieux:
+            logger.info(
+                "Email %s : %d document(s) sans changement d'etat, aucune "
+                "notification envoyee pour eux.",
+                summary.message_id, silencieux,
+            )
+        return summary
+
+    def mark_notified(
+        self, outcome: DocumentOutcome, *, telegram_message_id: int = 0
+    ) -> None:
+        """A appeler APRES un envoi Telegram reussi, jamais avant.
+
+        Si l'envoi echoue, l'etat notifie reste inchange et le message sera
+        retente au cycle suivant : c'est la seule facon de ne perdre aucune
+        demande de validation sans en renvoyer aucune en trop.
+        """
+        fiche = store.get_document(self._db_path, outcome.doc_key) or {}
+        store.mark_notified(
+            self._db_path, outcome.doc_key,
+            notify_state_of(outcome, str(fiche.get("state") or "")),
+            telegram_message_id=telegram_message_id,
+        )
+
+    def pending_validations(self) -> list[DocumentOutcome]:
+        """Documents encore en attente de decision, sans rien reecrire.
+
+        Sert a la commande manuelle /resend_pending. Aucune ecriture Sheets,
+        Drive ou Calendar n'est declenchee : on relit la fiche stockee et on
+        reconstruit le message a partir du PDF deja conserve dans le coffre.
+        """
+        store.ensure_schema(self._db_path)
+        outcomes: list[DocumentOutcome] = []
+        for row in store.list_pending_review(self._db_path, self._chat_id):
+            try:
+                outcome = self.resume(row)
+            except Exception as exc:  # noqa: BLE001 - un document n'en bloque pas un autre
+                logger.warning(
+                    "Renvoi impossible (%s): %s", row["doc_key"][:12], type(exc).__name__
+                )
+                continue
+            if outcome.action == ACTION_REVIEW and not outcome.error:
+                outcomes.append(outcome)
+        return outcomes
 
     def process_file(
         self,
@@ -704,8 +890,13 @@ class MailWorker:
         # Idempotence du bouton : deux clics ne creent jamais deux lignes.
         # L'etat fait foi, pas le nombre de clics.
         if row["state"] in store.TERMINAL_STATES or row["state"] in store.STATES_AFTER_SHEET:
+            store.mark_notified(self._db_path, row["doc_key"], NOTIFY_COMPLETED)
             return already_written_message(row)
         outcome = self.resume(row, forced=True)
+        # La transition waiting_validation -> completed est annoncee ICI,
+        # dans la reponse au bouton. Elle est donc deja notifiee : le cycle
+        # Gmail suivant ne doit plus rien dire de ce document.
+        store.mark_notified(self._db_path, row["doc_key"], NOTIFY_COMPLETED)
         return format_outcome(outcome, prefix="Document valide et enregistre")
 
     def refuse(self, short_key: str) -> str:
@@ -715,6 +906,10 @@ class MailWorker:
         if row["state"] in store.STATES_AFTER_SHEET or row["state"] == store.COMPLETED:
             return "Ce document a deja ete enregistre ; il ne peut plus etre refuse ici."
         store.set_state(self._db_path, row["doc_key"], store.SKIPPED, error="refuse par le client")
+        # waiting_validation -> refus : annonce dans la reponse au bouton,
+        # plus jamais ensuite. L'etat notifie suit l'etat metier (skipped)
+        # pour qu'aucun cycle ne croie a une transition.
+        store.mark_notified(self._db_path, row["doc_key"], NOTIFY_SKIPPED)
         drive = str(row.get("drive_link") or "")
         message = (
             f"Document {row['numero'] or row['filename']} refuse. "
@@ -785,7 +980,7 @@ def format_outcome(outcome: DocumentOutcome, *, prefix: str = "") -> str:
 
 def build_summary(summary: MailSummary) -> str:
     """Resume compact d'un email, tel qu'il arrive dans Telegram."""
-    total = len(summary.outcomes)
+    total = len(summary.notified_outcomes)
     head = [
         f"Email traite : {summary.subject or '(sans objet)'}",
         "",
@@ -794,13 +989,13 @@ def build_summary(summary: MailSummary) -> str:
         f"Classes sans ecriture    : {len(summary.classified)}",
         f"Doublons ignores         : {summary.count(ACTION_DUPLICATE)}",
         f"A valider                : {len(summary.to_review)}",
-        f"En erreur                : {len(summary.errors) + len(summary.rejected)}",
+        f"En erreur                : {len(summary.errors) + len(summary.notified_rejected)}",
     ]
     body: list[str] = []
     for outcome in summary.imported + summary.classified:
         body.append("")
         body.append(format_outcome(outcome))
-    for outcome in summary.outcomes:
+    for outcome in summary.notified_outcomes:
         if outcome.action == ACTION_DUPLICATE:
             body.append("")
             body.append(
@@ -813,7 +1008,7 @@ def build_summary(summary: MailSummary) -> str:
             body.append(
                 f"{outcome.filename} : type non reconnu. Depose dans Drive / A verifier."
             )
-    for name, reason in summary.rejected:
+    for name, reason in summary.notified_rejected:
         body.append("")
         body.append(f"{name} : ignore ({reason})")
     return f"{NL}".join(head + body)
