@@ -109,3 +109,61 @@ def test_missing_keys_are_reported_not_invented(db_path):
     assert rapport["supprimes"] == []
     assert sorted(rapport["absents"]) == sorted(drive_repair.DUPLICATE_KEY_PREFIXES)
     assert store.get_document(db_path, "cfa6d9b526eb" + "0" * 52) is not None
+
+
+# === rattachement des fiches vivantes a leur ligne d'origine ==============
+
+def test_restore_only_touches_log_row_and_drive_link(db_path):
+    """Option A : deux champs corriges, tout le reste intact."""
+    cle = "4b6ea8b8a6e3" + "0" * 52
+    claim(db_path, cle, SHA_IMPORT,
+          drive="https://drive.google.com/file/d/1-wPJsFe/view", log_row=16)
+    store.update_document(db_path, cle, numero="CI-2026-045", member_path="pack/ci.pdf")
+    store.mark_notified(db_path, cle, "waiting_validation", telegram_message_id=4242)
+    avant = store.get_document(db_path, cle)
+
+    rapport = drive_repair.restore_canonical_links(FauxWorker(db_path))
+
+    corrigee = next(e for e in rapport["corrigees"] if e["cle"] == "4b6ea8b8a6e3")
+    assert corrigee["conforme"] is True
+    assert "UPDATE documents SET log_row = 9" in corrigee["sql"]
+
+    apres = store.get_document(db_path, cle)
+    assert apres["log_row"] == 9
+    assert apres["drive_link"].endswith("1k4OhGRE-Plpr6IkQD5X95nVzR2NVxDBP/view")
+    # Tout le reste est preserve, champ par champ.
+    for champ in (
+        "doc_key", "state", "file_sha256", "member_path", "numero",
+        "telegram_message_id", "last_notified_state",
+        "validation_notification_sent_at", "chat_id", "gmail_message_id",
+    ):
+        assert apres[champ] == avant[champ], champ
+
+
+def test_restore_refuses_a_record_whose_number_does_not_match(db_path):
+    """Un garde-fou : on ne rattache pas une fiche qui n'est pas la bonne."""
+    cle = "af8348a31d13" + "0" * 52
+    claim(db_path, cle, SHA_EXPORT, drive="https://drive.google.com/file/d/x/view",
+          log_row=17)
+    store.update_document(db_path, cle, numero="AUTRE-CHOSE")
+
+    rapport = drive_repair.restore_canonical_links(FauxWorker(db_path))
+
+    assert rapport["corrigees"] == []
+    ignoree = next(e for e in rapport["ignorees"] if e["cle"] == "af8348a31d13")
+    assert "numero inattendu" in ignoree["motif"]
+    assert store.get_document(db_path, cle)["log_row"] == 17
+
+
+def test_restore_runs_only_once(db_path):
+    cle = "4b6ea8b8a6e3" + "0" * 52
+    claim(db_path, cle, SHA_IMPORT, log_row=16)
+    store.update_document(db_path, cle, numero="CI-2026-045")
+
+    premier = drive_repair.restore_canonical_links(FauxWorker(db_path))
+    assert len(premier["corrigees"]) == 1
+
+    store.update_document(db_path, cle, log_row=99)
+    second = drive_repair.restore_canonical_links(FauxWorker(db_path))
+    assert second == {"skipped": True, "reason": "deja executee"}
+    assert store.get_document(db_path, cle)["log_row"] == 99
