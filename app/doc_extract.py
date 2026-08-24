@@ -646,6 +646,55 @@ _AMBIGUITY_HT_LABELS = (
     "Subtotal", "Total net", "Net commercial",
 )
 
+# Une liste de libelles ne suffit pas. Le document reel qui a echappe au
+# controle annoncait "MONTANT A PAYER", synonyme absent de la liste : la
+# facture est partie en comptabilite avec 2 400 alors que le document en
+# annoncait aussi 2 600. On reconnait donc un libelle de TOTAL FINAL par sa
+# FORME, pas par son appartenance a une liste fermee.
+_TOTAL_TTC_RE = re.compile(
+    r"\b("
+    r"TTC"
+    r"|A PAYER"
+    r"|TOUTES TAXES"
+    r"|TOTAL GENERAL"
+    r"|TOTAL DU"
+    r"|MONTANT DU"
+    r"|GRAND TOTAL"
+    r"|AMOUNT DUE"
+    r"|BALANCE DUE"
+    r"|TOTAL AMOUNT"
+    r")\b"
+)
+_TOTAL_HT_RE = re.compile(
+    r"\b(HORS TAXES|TOTAL HT|MONTANT HT|SOUS-?TOTAL|SUBTOTAL|NET COMMERCIAL)\b"
+)
+
+
+def labelled_amounts(lines: list[Line], pattern: re.Pattern) -> list[Decimal]:
+    """Montants dont le LIBELLE correspond au motif, valeur sur la meme
+    ligne ou sur la ligne de montant qui suit.
+
+    Sert uniquement a detecter une contradiction : deux libelles de total
+    final annoncant deux valeurs differentes. Aucun de ces montants n'est
+    retenu comme valeur comptable.
+    """
+    found: list[Decimal] = []
+    for i, line in enumerate(lines):
+        label = line.norm
+        if not label or not pattern.search(label):
+            continue
+        # Une ligne de detail ("TVA 20 %") n'est pas un total final.
+        parsed = parse_money(label) if re.search(r"\d", label) else None
+        if parsed is None:
+            for nxt in lines[i + 1:]:
+                if not nxt.text.strip():
+                    continue
+                parsed = parse_money(nxt.text) if is_amount_line(nxt) else None
+                break
+        if parsed and parsed[0] not in found:
+            found.append(parsed[0])
+    return found
+
 # Valeurs qui, dans un champ "facture d'origine", signifient explicitement
 # QU'IL N'Y EN A PAS. Les retenir comme reference revenait a croire l'avoir
 # rattache a une facture nommee "NON".
@@ -802,13 +851,17 @@ def extract_document(
     # deux valeurs differentes. Ne regarder qu'une etiquette laissait passer
     # exactement ce cas : la facture partait en comptabilite avec l'un des
     # deux montants, choisi par l'ordre des lignes.
-    for attr, labels in (
-        ("montant_ht", _AMBIGUITY_HT_LABELS + _HT_LABELS.get(kind, ())),
-        ("montant_ttc", _AMBIGUITY_TTC_LABELS + _TTC_LABELS.get(kind, ())),
+    for attr, labels, motif in (
+        ("montant_ht", _AMBIGUITY_HT_LABELS + _HT_LABELS.get(kind, ()), _TOTAL_HT_RE),
+        ("montant_ttc", _AMBIGUITY_TTC_LABELS + _TTC_LABELS.get(kind, ()), _TOTAL_TTC_RE),
     ):
         proposees: list[Decimal] = []
         for label in labels:
             proposees.extend(all_amounts_for(lines, label))
+        if kind != BANK_STATEMENT:
+            # Le releve bancaire porte ses propres totaux ("Total credits"),
+            # controles ailleurs : le motif ne s'y applique pas.
+            proposees.extend(labelled_amounts(lines, motif))
         if len({abs(v) for v in proposees}) > 1:
             doc.ambigus.append(attr)
 
