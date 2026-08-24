@@ -69,8 +69,16 @@ RESTORE_VERSION = 1
 # regles corrigees les auraient toutes retenues. Leurs lignes comptables
 # sont supprimees du classeur ; leur fiche revient donc en attente de
 # decision, et redemande son arbitrage UNE seule fois.
+# Version 2 : la premiere execution a bien remis quatre documents en
+# attente, mais FAC-V2-AMB-002 est repartie en comptabilite au cycle
+# suivant. Le document reel annonce "MONTANT A PAYER 2 600.00" a cote de
+# "Total TTC 2 400.00", et ce libelle ne figurait pas dans la liste de
+# synonymes. L'extraction reconnait desormais un total final a sa forme ;
+# la tache rejoue donc pour ramener cette seule fiche en attente. Les
+# quatre autres, deja en `needs_review`, sont laissees intactes : elles
+# portent chacune UNE demande de validation en cours.
 RESET_V2_KEY = "reset_pack_v2_documents"
-RESET_V2_VERSION = 1
+RESET_V2_VERSION = 2
 RESET_V2_NUMEROS = (
     "FAC-V2-AMB-001",
     "FAC-V2-AMB-002",
