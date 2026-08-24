@@ -1,0 +1,18 @@
+Fournisseur : TECH OFFICE SARL
+ICE : 003202020000092
+ AVOIR
+FOURNISSEUR
+Client : X BLASTE
+ICE : 003456789000052
+Numéro d'avoir
+AV-V2-INC-001
+Date
+23/08/2026
+Facture d'origine
+NON PRÉCISÉE
+ Total HT
+ -300.00 MAD
+ TVA
+ -60.00 MAD
+ Total TTC
+ -360.00 MAD

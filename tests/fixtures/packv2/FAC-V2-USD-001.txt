@@ -1,0 +1,22 @@
+Supplier : US CLOUD DEMO LLC
+ FACTURE
+FOURNISSEUR EN
+ DEVISE
+Client : X BLASTE
+ICE : 003456789000052
+Numéro de facture
+FAC-V2-USD-001
+Date
+23/08/2026
+Échéance
+22/09/2026
+Devise
+USD
+Taux de change
+NON INDIQUÉ
+ Total HT
+ 1 000.00 USD
+ TVA 0 %
+ 0.00 USD
+ Total TTC
+ 1 000.00 USD
