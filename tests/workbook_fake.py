@@ -80,6 +80,7 @@ TOOL_ARGUMENTS: dict[str, tuple[set[str], set[str]]] = {
         {"spreadsheet_id", "range", "values"}, {"value_input_option"},
     ),
     "GOOGLESHEETS_ADD_SHEET": ({"spreadsheet_id", "title"}, {"force_unique"}),
+    "GOOGLESHEETS_CLEAR_VALUES": ({"spreadsheet_id", "range"}, set()),
     "GOOGLESHEETS_FORMAT_CELL": (
         {"spreadsheet_id"},
         # Liste alignee sur le schema REEL de Composio (verifie via
@@ -242,6 +243,18 @@ class FakeWorkbook:
         if slug == "GOOGLESHEETS_BATCH_GET":
             a1 = (arguments.get("ranges") or [""])[0]
             return {"valueRanges": [{"values": self._read_range(a1)}]}
+
+        if slug == "GOOGLESHEETS_CLEAR_VALUES":
+            # Efface les VALEURS de la plage, en conservant les lignes
+            # (comme le vrai outil, qui preserve format et notes).
+            m = _RANGE_RE.match(arguments["range"])
+            if m:
+                tab, _c1, row1, _c2, row2 = m.groups()
+                table = self.tabs.setdefault(tab, [])
+                debut, fin = int(row1), int(row2 or row1)
+                for index in range(debut - 1, min(fin, len(table))):
+                    table[index] = []
+            return {"clearedRange": arguments["range"]}
 
         if slug == "GOOGLESHEETS_VALUES_UPDATE":
             self._write_range(arguments["range"], arguments["values"])
