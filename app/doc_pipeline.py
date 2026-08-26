@@ -401,6 +401,71 @@ class DocumentPipeline:
             logger.info("Onglet %s cree (zone de quarantaine comptable)", TAB_REVIEW)
         return self.sheet_id(TAB_REVIEW)
 
+    def backup_review_tab(self) -> str:
+        """Copie l'onglet de quarantaine dans un onglet horodate.
+
+        Faite AVANT toute reconstruction. On copie les valeurs telles
+        quelles : le but n'est pas de rejouer la mise en forme, mais de
+        pouvoir relire ce qui existait si la reconstruction deraille.
+
+        Rend le nom de l'onglet de sauvegarde. Leve si la copie n'a pas
+        pu etre relue - une sauvegarde non verifiee ne compte pas.
+        """
+        if TAB_REVIEW not in self.tabs(refresh=True):
+            # Installation neuve : il n'y a rien a proteger. Ce n'est pas
+            # un echec, et cela ne doit pas bloquer la migration.
+            logger.info("Onglet %s absent : aucune sauvegarde necessaire", TAB_REVIEW)
+            return ""
+        lignes = self._read(f"{TAB_REVIEW}!A1:{REVIEW_LAST_COL}5000")
+        if len(lignes) <= 1:
+            # En-tete seul, ou onglet vide : rien de metier a sauvegarder.
+            logger.info("Onglet %s sans ligne de donnees : rien a sauvegarder", TAB_REVIEW)
+            return ""
+
+        nom = f"{TAB_REVIEW}_BACKUP_{_now_iso().replace(':', '-')}"
+        self._gw.execute(
+            "GOOGLESHEETS_ADD_SHEET",
+            {"spreadsheet_id": self._sheet, "title": nom, "force_unique": False},
+        )
+        self._tabs_cache = None
+        fin = len(lignes)
+        self._write(f"{nom}!A1:{REVIEW_LAST_COL}{fin}", lignes)
+
+        # Verification : on relit la copie et on compare le nombre de
+        # lignes. Sans cela, on croirait avoir un filet sans en avoir un.
+        relu = self._read(f"{nom}!A1:{REVIEW_LAST_COL}5000")
+        if len(relu) != fin:
+            raise PipelineError(
+                f"Sauvegarde {nom} incomplete : {len(relu)} lignes relues "
+                f"sur {fin} attendues."
+            )
+        logger.info(
+            "Onglet %s sauvegarde dans %s | %d ligne(s) relues", TAB_REVIEW, nom, fin
+        )
+        return nom
+
+    def clear_review_rows(self) -> int:
+        """Vide les LIGNES de `21_A_VERIFIER`, jamais son en-tete.
+
+        Les 12 en-tetes et la mise en forme de l'onglet restent en place :
+        on efface des valeurs, on ne detruit pas la structure.
+        """
+        if TAB_REVIEW not in self.tabs():
+            return 0
+        lignes = self._read(f"{TAB_REVIEW}!A2:A5000")
+        if not lignes:
+            return 0
+        fin = len(lignes) + 1
+        self._gw.execute(
+            "GOOGLESHEETS_CLEAR_VALUES",
+            {
+                "spreadsheet_id": self._sheet,
+                "range": f"{TAB_REVIEW}!A2:{REVIEW_LAST_COL}{fin}",
+            },
+        )
+        logger.info("Onglet %s : %d ligne(s) effacees", TAB_REVIEW, len(lignes))
+        return len(lignes)
+
     def write_review(self, entry: ReviewEntry) -> int:
         """Ecrit - ou REECRIT - la ligne de quarantaine d'un document.
 

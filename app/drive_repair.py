@@ -32,6 +32,8 @@ from app import doc_store as store
 from app import doc_vault as vault
 from app.db import connect
 from app.attachments import extract_member, is_zip, sha256_of
+from app.business_key import group_by_business_key
+from app.db_backup import BackupError, verified_backup
 from app.review_sheet import ReviewEntry
 from app.doc_pipeline import REVIEW_DRIVE_FOLDER, drive_file_id, drive_link
 from app.doc_routing import route_for
@@ -730,7 +732,7 @@ def reset_pack_v2_documents(worker) -> dict[str, Any]:
 
 
 MIGRATE_REVIEW_KEY = "migrate_needs_review_to_review_tab"
-MIGRATE_REVIEW_VERSION = 1
+MIGRATE_REVIEW_VERSION = 3
 
 
 def migrate_needs_review_to_review_tab(worker) -> dict[str, Any]:
@@ -756,29 +758,105 @@ def migrate_needs_review_to_review_tab(worker) -> dict[str, Any]:
     if migration_state(db, MIGRATE_REVIEW_KEY, MIGRATE_REVIEW_VERSION) == "done":
         return {"skipped": True, "reason": "deja executee"}
 
-    pipeline = worker.pipeline
-    saved = backup(db)
+    # FILET AVANT TOUT. Une sauvegarde qu'on n'a pas verifiee n'est pas
+    # une sauvegarde. Si le moindre controle echoue, on sort AVANT
+    # d'avoir touche a quoi que ce soit : ni SQLite, ni le classeur.
+    try:
+        sauvegarde = verified_backup(db, MIGRATE_REVIEW_KEY)
+    except BackupError as exc:
+        logger.error(
+            "Migration vers 21_A_VERIFIER ANNULEE : sauvegarde non verifiee (%s). "
+            "Aucune ecriture n'a ete faite.", exc,
+        )
+        return {
+            "skipped": True,
+            "reason": f"sauvegarde non verifiee : {exc}",
+            "aborted": True,
+        }
+
     report: dict[str, Any] = {
-        "backup": saved["db"], "migres": [], "deja_presents": [], "echecs": [],
+        "backup": sauvegarde["path"],
+        "backup_size": sauvegarde["size"],
+        "backup_sha256": sauvegarde["sha256"],
+        "backup_integrity": sauvegarde["integrity_check"],
+        "migres": [], "deja_presents": [], "echecs": [], "doublons_marques": [],
     }
 
-    for fiche in store.list_documents(db, chat):
-        if str(fiche.get("state") or "") != store.NEEDS_REVIEW:
-            continue
-        cle = str(fiche["doc_key"])
-        numero = str(fiche.get("numero") or "")
+    # Le pipeline n'est resolu qu'APRES le filet : rien ne doit etre
+    # sollicite tant que la sauvegarde n'est pas prouvee saine.
+    pipeline = worker.pipeline
+
+    en_attente = [
+        f for f in store.list_documents(db, chat)
+        if str(f.get("state") or "") == store.NEEDS_REVIEW
+        and not str(f.get("superseded_by") or "").strip()
+    ]
+
+    # SECOND FILET, cote classeur : l'onglet est copie puis vide, pour
+    # etre reconstruit a partir des seuls documents physiques. Sans cette
+    # purge, les ~470 lignes ecrites par la version 1 resteraient en
+    # place a cote des 17 bonnes.
+    try:
+        report["sheet_backup"] = pipeline.backup_review_tab()
+        report["rows_cleared"] = pipeline.clear_review_rows()
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "Migration vers 21_A_VERIFIER ANNULEE : onglet non sauvegarde (%s). "
+            "Aucune ligne effacee.", exc,
+        )
+        return {
+            "skipped": True,
+            "reason": f"sauvegarde de l'onglet impossible : {exc}",
+            "aborted": True,
+            "backup": sauvegarde["path"],
+        }
+
+    # L'onglet est vide : toute fiche doit etre reecrite, y compris celles
+    # qui portaient deja un review_row pointant sur une ligne disparue.
+    for fiche in en_attente:
         if int(fiche.get("review_row") or 0):
+            store.update_document(db, str(fiche["doc_key"]), review_row=0)
+            fiche["review_row"] = 0
+
+    # DEDUPLICATION METIER, avant toute ecriture. La version 1 de cette
+    # migration ecrivait une ligne par FICHE SQLite ; comme l'ancien bug
+    # d'attachment_id tournant avait cree ~94 fiches pour un seul PDF,
+    # l'onglet recevait ~470 lignes pour 5 documents. On regroupe donc par
+    # identite du document PHYSIQUE, jamais par doc_key.
+    groupes = group_by_business_key(en_attente)
+    logger.info(
+        "Deduplication : %d fiche(s) en attente -> %d document(s) physique(s)",
+        len(en_attente), len(groupes),
+    )
+
+    for _cle_metier, canonique, doublons in groupes:
+        cle = str(canonique["doc_key"])
+        numero = str(canonique.get("numero") or "")
+
+        # Les fiches ecartees sont MARQUEES, jamais supprimees : l'audit
+        # doit pouvoir remonter a ce qui a ete observe a l'epoque.
+        for double in doublons:
+            cle_double = str(double["doc_key"])
+            if str(double.get("superseded_by") or "") == cle:
+                continue
+            store.update_document(db, cle_double, superseded_by=cle)
+            report["doublons_marques"].append(
+                {"cle": cle_double[:12], "remplacee_par": cle[:12]}
+            )
+
+        if int(canonique.get("review_row") or 0):
             report["deja_presents"].append({"numero": numero, "cle": cle[:12]})
             continue
-        motifs = _motifs_de(fiche)
+
+        motifs = _motifs_de(canonique)
         entree = ReviewEntry(
             doc_key=cle,
-            detected_at=str(fiche.get("created_at") or _now()),
-            type_label=str(fiche.get("doc_type") or "non determine"),
+            detected_at=str(canonique.get("created_at") or _now()),
+            type_label=str(canonique.get("doc_type") or "non determine"),
             numero=numero,
-            drive_link=str(fiche.get("drive_link") or ""),
-            gmail_message_id=str(fiche.get("gmail_message_id") or ""),
-            filename=str(fiche.get("filename") or ""),
+            drive_link=str(canonique.get("drive_link") or ""),
+            gmail_message_id=str(canonique.get("gmail_message_id") or ""),
+            filename=str(canonique.get("filename") or ""),
             reasons=motifs,
         )
         try:
@@ -877,9 +955,21 @@ def run(worker) -> dict[str, Any]:
         )
     else:
         if descente.get("skipped"):
-            logger.info("Migration vers 21_A_VERIFIER : %s", descente.get("reason"))
+            if descente.get("aborted"):
+                logger.error(
+                    "Migration vers 21_A_VERIFIER ANNULEE : %s", descente.get("reason")
+                )
+            else:
+                logger.info(
+                    "Migration vers 21_A_VERIFIER : %s", descente.get("reason")
+                )
         else:
-            logger.info("Sauvegarde avant migration : %s", descente["backup"])
+            logger.info(
+                "Sauvegarde avant migration | chemin=%s | taille=%s octets | "
+                "sha256=%s | integrity_check=%s",
+                descente["backup"], descente["backup_size"],
+                descente["backup_sha256"], descente["backup_integrity"],
+            )
             for entree in descente["migres"]:
                 logger.info(
                     "Document %s (%s) inscrit dans 21_A_VERIFIER ligne %d : %s",

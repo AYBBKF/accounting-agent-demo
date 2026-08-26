@@ -140,6 +140,10 @@ _ADDED_COLUMNS = (
     # y figure deja - et un onglet relu 60 fois par heure finit par heurter
     # les quotas Sheets.
     ("review_row", "INTEGER DEFAULT 0"),
+    # Fiche remplacee par une autre, apres deduplication metier. On ne
+    # SUPPRIME jamais une fiche d'audit : elle reste, marquee, pour que
+    # l'historique reste verifiable.
+    ("superseded_by", "TEXT"),
 )
 
 
@@ -208,6 +212,7 @@ def update_document(db_path: str, doc_key: str, **fields: Any) -> None:
         "lines_written", "drive_link", "calendar_event", "log_row", "payload",
         "error", "attachment_id", "parent_attachment_id", "parent_filename",
         "member_path", "local_path", "review_archive", "review_row",
+        "superseded_by",
     )
     columns = [k for k in fields if k in allowed]
     if not columns:
