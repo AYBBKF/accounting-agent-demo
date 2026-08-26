@@ -3,6 +3,8 @@ name: Build and push demo image to GHCR
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch: {}
 
 permissions:
@@ -25,6 +27,7 @@ jobs:
         run: pytest -q
 
   build:
+    if: github.event_name != 'pull_request'
     needs: test
     runs-on: ubuntu-latest
     steps:
