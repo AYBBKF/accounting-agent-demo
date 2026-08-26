@@ -312,6 +312,50 @@ def decide(doc: ExtractedDocument, context: DecisionContext | None = None) -> De
     return Decision(action=ACTION_AUTO, warnings=warnings)
 
 
+class NotWritable(RuntimeError):
+    """Un document a atteint l'ecriture comptable alors qu'il n'aurait pas du."""
+
+
+def assert_writable(
+    doc: ExtractedDocument,
+    party_id: str | None,
+    *,
+    tolerance: Decimal = DEFAULT_TOLERANCE,
+) -> None:
+    """Dernier verrou, juste avant d'ecrire une ligne comptable.
+
+    `decide()` s'applique sur ce que l'extraction a compris ; ce verrou-ci
+    s'applique sur ce qu'on s'apprete REELLEMENT a ecrire, avec le tiers
+    deja resolu. Les deux ne sont pas redondants : l'ancienne architecture
+    laissait un bouton Telegram court-circuiter `decide()` et ecrire malgre
+    tout une facture dont HT + TVA ne faisait pas le TTC, ou un avoir sans
+    identifiant de tiers. Les boutons ont disparu, mais l'invariant doit
+    tenir par lui-meme, pas par l'absence de chemin qui le viole.
+
+    Leve NotWritable. Ne renvoie rien, ne corrige rien : on n'invente pas
+    une valeur manquante pour pouvoir ecrire quand meme.
+    """
+    if doc.doc_type in ACCOUNTING_TYPES and doc.doc_type != BANK_STATEMENT:
+        if doc.montant_ht and doc.montant_tva and doc.montant_ttc:
+            ecart = abs(
+                doc.montant_ht.value + doc.montant_tva.value - doc.montant_ttc.value
+            )
+            if ecart > tolerance:
+                raise NotWritable(
+                    f"HT + TVA ne correspond pas au TTC (ecart {ecart})"
+                )
+        devise = (doc.devise or "").strip().upper()
+        if devise and devise != BOOKKEEPING_CURRENCY:
+            raise NotWritable(
+                f"montants en {devise} : aucune ecriture en {BOOKKEEPING_CURRENCY} "
+                "sans conversion explicite"
+            )
+    if doc.doc_type in NEEDS_PARTY_ID and not (party_id or "").strip():
+        raise NotWritable(
+            "identifiant de tiers absent : la ligne serait imputee a personne"
+        )
+
+
 def fingerprint(party_id: str | None, numero: str | None) -> str:
     """Cle de doublon metier : (identifiant du tiers + numero du document).
 

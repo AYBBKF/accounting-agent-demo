@@ -46,9 +46,6 @@ from app.db import (
 from app.demo_data import generate_demo_bank_statement, generate_demo_invoices
 from app.doc_policy import ACTION_AUTO, ACTION_REVIEW
 from app.mail_worker import (
-    CALLBACK_CONFIRM_PREFIX,
-    CALLBACK_KEY_LENGTH,
-    CALLBACK_REFUSE_PREFIX,
     MailWorker,
     MailWorkerError,
     build_review_message,
@@ -576,8 +573,9 @@ def build_dispatcher() -> Dispatcher:
         Reservee au proprietaire du suivi Gmail : un autre utilisateur
         autorise ne doit pas pouvoir declencher la reprise des documents
         d'autrui. Les lignes deja ecrites sont protegees par l'etat de chaque
-        document ; la reprise ne fait que terminer ce qui manque et redonner
-        des boutons vivants aux documents en attente de decision.
+        document ; la reprise ne fait que terminer ce qui manque et
+        replacer dans 21_A_VERIFIER les documents qui n'y figurent pas
+        encore. Aucune validation n'est proposee : ce bot n'en a plus.
         """
         if message.chat.id != settings.gmail_watch_chat_id:
             await message.answer("Commande reservee au proprietaire du suivi Gmail.")
@@ -597,29 +595,25 @@ def build_dispatcher() -> Dispatcher:
         await message.answer(
             f"Reprise terminee.{NL}"
             f"- Termines sans intervention : {len(finished)}{NL}"
-            f"- En attente de ta decision  : {len(waiting)}{NL}"
+            f"- Ecarts dans 21_A_VERIFIER  : {len(waiting)}{NL}"
             f"- En echec                   : {len(failed)}"
         )
         for outcome in waiting:
-            sent = await message.answer(
-                build_review_message(outcome),
-                reply_markup=document_keyboard(outcome.doc_key),
-            )
-            await asyncio.to_thread(
-                mail_worker.mark_notified, outcome,
-                telegram_message_id=getattr(sent, "message_id", 0) or 0,
-            )
+            await message.answer(build_review_message(outcome))
+            await asyncio.to_thread(mail_worker.mark_notified, outcome)
         for outcome in failed:
             await message.answer(f"{outcome.filename} : {outcome.error}")
 
-    @dp.message(Command("resend_pending"))
-    async def cmd_resend_pending(message: Message) -> None:
-        """Renvoie VOLONTAIREMENT les validations encore en attente.
+    @dp.message(Command("a_verifier"))
+    async def cmd_a_verifier(message: Message) -> None:
+        """Rappelle les documents ecartes de la comptabilite.
 
-        C'est la seule facon de recevoir a nouveau une demande de decision :
-        le worker, lui, ne renvoie plus jamais automatiquement un message
-        deja delivre. Aucune ecriture Sheets, Drive ou Calendar n'est
-        declenchee ici.
+        Purement informatif : ces documents sont deja inscrits en rouge
+        dans 21_A_VERIFIER, avec leur motif. Cette commande ne fait que
+        les relister dans Telegram. Aucune ecriture Sheets, Drive ou
+        Calendar n'est declenchee ici, et aucune validation n'est
+        proposee - la correction se fait dans le classeur, ou en le
+        demandant explicitement au bot.
         """
         if message.chat.id != settings.gmail_watch_chat_id:
             await message.answer("Commande reservee au proprietaire du suivi Gmail.")
@@ -627,23 +621,18 @@ def build_dispatcher() -> Dispatcher:
         try:
             outcomes = await asyncio.to_thread(mail_worker.pending_validations)
         except MailWorkerError as exc:
-            await message.answer(f"Renvoi impossible : {exc}")
+            await message.answer(f"Lecture impossible : {exc}")
             return
         if not outcomes:
-            await message.answer("Aucune validation en attente.")
+            await message.answer("Aucun document en attente dans 21_A_VERIFIER.")
             return
         await message.answer(
-            f"Validations en attente renvoyees : {len(outcomes)}."
+            f"Documents ecartes de la comptabilite : {len(outcomes)}. "
+            f"Ils sont ecrits en rouge dans 21_A_VERIFIER."
         )
         for outcome in outcomes:
-            sent = await message.answer(
-                build_review_message(outcome),
-                reply_markup=document_keyboard(outcome.doc_key),
-            )
-            await asyncio.to_thread(
-                mail_worker.mark_notified, outcome,
-                telegram_message_id=getattr(sent, "message_id", 0) or 0,
-            )
+            await message.answer(build_review_message(outcome))
+            await asyncio.to_thread(mail_worker.mark_notified, outcome)
 
     @dp.message(Command("export"))
     async def cmd_export(message: Message) -> None:
@@ -710,68 +699,7 @@ def build_dispatcher() -> Dispatcher:
             return
         await message.answer(reply)
 
-    @dp.callback_query(F.data.startswith(CALLBACK_CONFIRM_PREFIX))
-    async def cb_document_confirm(callback: CallbackQuery) -> None:
-        short_key = callback.data[len(CALLBACK_CONFIRM_PREFIX):]
-        await callback.answer("Enregistrement en cours...")
-        logger.info("Validation recue (document=%s)", short_key)
-        try:
-            result = await asyncio.wait_for(
-                asyncio.to_thread(mail_worker.confirm, short_key),
-                timeout=AGENT_TIMEOUT_SECONDS,
-            )
-        except asyncio.TimeoutError:
-            logger.warning("Ecriture trop longue (document=%s)", short_key)
-            await callback.message.answer(
-                "L'enregistrement a pris trop de temps. Rien n'est garanti ecrit : "
-                "verifie ton classeur avant de reessayer."
-            )
-            return
-        except MailWorkerError as exc:
-            logger.warning("Ecriture impossible (document=%s): %s", short_key, exc)
-            await callback.message.answer(f"Enregistrement impossible : {exc}")
-            return
-        except Exception:  # noqa: BLE001 - jamais de silence cote client
-            logger.exception("Erreur inattendue a l'ecriture (document=%s)", short_key)
-            await callback.message.answer(
-                "Une erreur interne est survenue pendant l'enregistrement. "
-                "L'incident est journalise ; verifie ton classeur avant de reessayer."
-            )
-            return
-        await callback.message.answer(result)
-
-    @dp.callback_query(F.data.startswith(CALLBACK_REFUSE_PREFIX))
-    async def cb_document_refuse(callback: CallbackQuery) -> None:
-        short_key = callback.data[len(CALLBACK_REFUSE_PREFIX):]
-        await callback.answer("Document refuse.")
-        logger.info("Refus recu (document=%s)", short_key)
-        try:
-            result = await asyncio.to_thread(mail_worker.refuse, short_key)
-        except MailWorkerError as exc:
-            await callback.message.answer(f"Refus impossible : {exc}")
-            return
-        await callback.message.answer(result)
-
     return dp
-
-
-def document_keyboard(doc_key: str) -> InlineKeyboardMarkup:
-    """Boutons envoyes avec les seuls documents reellement ambigus.
-
-    Telegram limite `callback_data` a 64 octets : on n'envoie que le prefixe
-    de la cle du document, suffisant pour le retrouver sans ambiguite.
-    """
-    short = doc_key[:CALLBACK_KEY_LENGTH]
-    return InlineKeyboardMarkup(
-        inline_keyboard=[[
-            InlineKeyboardButton(
-                text="Valider et enregistrer", callback_data=f"{CALLBACK_CONFIRM_PREFIX}{short}"
-            ),
-            InlineKeyboardButton(
-                text="Refuser", callback_data=f"{CALLBACK_REFUSE_PREFIX}{short}"
-            ),
-        ]]
-    )
 
 
 async def _gmail_watch_loop(bot: Bot) -> None:
@@ -804,7 +732,6 @@ async def _gmail_watch_loop(bot: Bot) -> None:
                     sent = await bot.send_message(
                         chat_id=settings.gmail_watch_chat_id,
                         text=build_review_message(outcome),
-                        reply_markup=document_keyboard(outcome.doc_key),
                     )
                     await asyncio.to_thread(
                         mail_worker.mark_notified, outcome,

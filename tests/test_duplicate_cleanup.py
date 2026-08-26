@@ -18,8 +18,8 @@ from app import doc_store as store
 from app import drive_repair
 from app.db import init_db
 
-CHAT_ID = 999653395
-MESSAGE = "1a02a81e3859a298"
+CHAT_ID = 42
+MESSAGE = "gmail-message-fixture"
 SHA_EXPORT = "aa" * 32
 SHA_IMPORT = "bb" * 32
 
@@ -51,16 +51,16 @@ def claim(db_path, cle, sha, *, drive="", log_row=0, state=store.NEEDS_REVIEW):
 def test_only_the_three_parasites_are_removed(db_path):
     # Les deux fiches canoniques, creees en premier.
     claim(db_path, "d5331e88d32b" + "0" * 52, SHA_EXPORT,
-          drive="https://drive.google.com/file/d/17ahnRBx/view", log_row=10)
+          drive="https://drive.google.com/file/d/test-exp-original/view", log_row=10)
     claim(db_path, "cfa6d9b526eb" + "0" * 52, SHA_IMPORT,
-          drive="https://drive.google.com/file/d/1k4OhGRE/view", log_row=9)
+          drive="https://drive.google.com/file/d/test-ci-original/view", log_row=9)
     # Les trois parasites, creees ensuite.
     claim(db_path, "29dee48b317c" + "0" * 52, SHA_EXPORT,
-          drive="https://drive.google.com/file/d/1wxfXUVm/view", log_row=15)
+          drive="https://drive.google.com/file/d/test-exp-orphan/view", log_row=15)
     claim(db_path, "4b6ea8b8a6e3" + "0" * 52, SHA_IMPORT,
-          drive="https://drive.google.com/file/d/1-wPJsFe/view", log_row=16)
+          drive="https://drive.google.com/file/d/test-ci-duplicate/view", log_row=16)
     claim(db_path, "af8348a31d13" + "0" * 52, SHA_EXPORT,
-          drive="https://drive.google.com/file/d/1GiDn6V1/view", log_row=17)
+          drive="https://drive.google.com/file/d/test-exp-duplicate/view", log_row=17)
     # Un document sans rapport, qui ne doit pas bouger.
     claim(db_path, "ffffffffffff" + "0" * 52, "cc" * 32, state=store.COMPLETED)
 
@@ -79,7 +79,7 @@ def test_only_the_three_parasites_are_removed(db_path):
 def test_a_parasite_key_that_is_the_only_record_is_kept(db_path):
     """Si la fiche canonique a disparu, le 'parasite' EST le document."""
     claim(db_path, "4b6ea8b8a6e3" + "0" * 52, SHA_IMPORT,
-          drive="https://drive.google.com/file/d/1-wPJsFe/view", log_row=16)
+          drive="https://drive.google.com/file/d/test-ci-duplicate/view", log_row=16)
 
     rapport = drive_repair.cleanup_duplicates(FauxWorker(db_path))
 
@@ -113,13 +113,16 @@ def test_missing_keys_are_reported_not_invented(db_path):
 
 # === rattachement des fiches vivantes a leur ligne d'origine ==============
 
-def test_restore_only_touches_log_row_and_drive_link(db_path):
+def test_restore_only_touches_log_row_and_drive_link(db_path, monkeypatch):
     """Option A : deux champs corriges, tout le reste intact."""
+    monkeypatch.setenv(
+        "RESTORE_CANONICAL_DRIVE_ID_CI_2026_045", "canonical-import-file"
+    )
     cle = "4b6ea8b8a6e3" + "0" * 52
     claim(db_path, cle, SHA_IMPORT,
-          drive="https://drive.google.com/file/d/1-wPJsFe/view", log_row=16)
+          drive="https://drive.google.com/file/d/test-ci-duplicate/view", log_row=16)
     store.update_document(db_path, cle, numero="CI-2026-045", member_path="pack/ci.pdf")
-    store.mark_notified(db_path, cle, "waiting_validation", telegram_message_id=4242)
+    store.mark_notified(db_path, cle, "waiting_validation", telegram_message_id=7)
     avant = store.get_document(db_path, cle)
 
     rapport = drive_repair.restore_canonical_links(FauxWorker(db_path))
@@ -130,7 +133,7 @@ def test_restore_only_touches_log_row_and_drive_link(db_path):
 
     apres = store.get_document(db_path, cle)
     assert apres["log_row"] == 9
-    assert apres["drive_link"].endswith("1k4OhGRE-Plpr6IkQD5X95nVzR2NVxDBP/view")
+    assert apres["drive_link"].endswith("canonical-import-file/view")
     # Tout le reste est preserve, champ par champ.
     for champ in (
         "doc_key", "state", "file_sha256", "member_path", "numero",
@@ -155,7 +158,10 @@ def test_restore_refuses_a_record_whose_number_does_not_match(db_path):
     assert store.get_document(db_path, cle)["log_row"] == 17
 
 
-def test_restore_runs_only_once(db_path):
+def test_restore_runs_only_once(db_path, monkeypatch):
+    monkeypatch.setenv(
+        "RESTORE_CANONICAL_DRIVE_ID_CI_2026_045", "canonical-import-file"
+    )
     cle = "4b6ea8b8a6e3" + "0" * 52
     claim(db_path, cle, SHA_IMPORT, log_row=16)
     store.update_document(db_path, cle, numero="CI-2026-045")
@@ -167,3 +173,17 @@ def test_restore_runs_only_once(db_path):
     second = drive_repair.restore_canonical_links(FauxWorker(db_path))
     assert second == {"skipped": True, "reason": "deja executee"}
     assert store.get_document(db_path, cle)["log_row"] == 99
+
+
+def test_restore_does_not_publish_or_invent_a_missing_drive_id(db_path):
+    cle = "4b6ea8b8a6e3" + "0" * 52
+    claim(db_path, cle, SHA_IMPORT, log_row=16)
+    store.update_document(db_path, cle, numero="CI-2026-045")
+
+    rapport = drive_repair.restore_canonical_links(FauxWorker(db_path))
+
+    assert rapport["corrigees"] == []
+    assert "configuration absente" in rapport["ignorees"][0]["motif"]
+    assert drive_repair.migration_state(
+        db_path, drive_repair.RESTORE_KEY, drive_repair.RESTORE_VERSION
+    ) == ""

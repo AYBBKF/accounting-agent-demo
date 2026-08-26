@@ -135,6 +135,11 @@ _ADDED_COLUMNS = (
     ("notified_at", "TEXT"),
     ("validation_notification_sent_at", "TEXT"),
     ("telegram_message_id", "INTEGER DEFAULT 0"),
+    # Ligne occupee par ce document dans 21_A_VERIFIER. Sans elle, chaque
+    # cycle Gmail devrait relire tout l'onglet pour savoir si le document
+    # y figure deja - et un onglet relu 60 fois par heure finit par heurter
+    # les quotas Sheets.
+    ("review_row", "INTEGER DEFAULT 0"),
 )
 
 
@@ -202,7 +207,7 @@ def update_document(db_path: str, doc_key: str, **fields: Any) -> None:
         "state", "doc_type", "numero", "stable_id", "tab", "row_index",
         "lines_written", "drive_link", "calendar_event", "log_row", "payload",
         "error", "attachment_id", "parent_attachment_id", "parent_filename",
-        "member_path", "local_path", "review_archive",
+        "member_path", "local_path", "review_archive", "review_row",
     )
     columns = [k for k in fields if k in allowed]
     if not columns:

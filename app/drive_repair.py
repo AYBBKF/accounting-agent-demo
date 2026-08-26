@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import shutil
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,6 +32,7 @@ from app import doc_store as store
 from app import doc_vault as vault
 from app.db import connect
 from app.attachments import extract_member, is_zip, sha256_of
+from app.review_sheet import ReviewEntry
 from app.doc_pipeline import REVIEW_DRIVE_FOLDER, drive_file_id, drive_link
 from app.doc_routing import route_for
 
@@ -92,13 +94,13 @@ CANONICAL_LINKS = (
         "prefix": "4b6ea8b8a6e3",
         "numero": "CI-2026-045",
         "log_row": 9,
-        "drive_id": "1k4OhGRE-Plpr6IkQD5X95nVzR2NVxDBP",
+        "drive_id_env": "RESTORE_CANONICAL_DRIVE_ID_CI_2026_045",
     },
     {
         "prefix": "af8348a31d13",
         "numero": "EXP-2026-019",
         "log_row": 10,
-        "drive_id": "17ahnRBx0Nnr4EYKkeN5rl4ZSbT7LSM2v",
+        "drive_id_env": "RESTORE_CANONICAL_DRIVE_ID_EXP_2026_019",
     },
 )
 
@@ -570,6 +572,7 @@ def restore_canonical_links(worker) -> dict[str, Any]:
     rows = inventory(db, chat)
     saved = backup(db)
     report: dict[str, Any] = {"backup": saved["db"], "corrigees": [], "ignorees": []}
+    configuration_missing = False
 
     for cible in CANONICAL_LINKS:
         fiche = next(
@@ -587,7 +590,16 @@ def restore_canonical_links(worker) -> dict[str, Any]:
             })
             continue
 
-        lien = f"https://drive.google.com/file/d/{cible['drive_id']}/view"
+        canonical_drive_id = str(os.getenv(cible["drive_id_env"], "")).strip()
+        if not canonical_drive_id:
+            configuration_missing = True
+            report["ignorees"].append({
+                "cle": cible["prefix"],
+                "motif": f"configuration absente: {cible['drive_id_env']}",
+            })
+            continue
+
+        lien = f"https://drive.google.com/file/d/{canonical_drive_id}/view"
         avant = {
             "log_row": fiche.get("log_row"),
             "drive_link": fiche.get("drive_link"),
@@ -621,7 +633,7 @@ def restore_canonical_links(worker) -> dict[str, Any]:
         }
         conforme = (
             int(apres["log_row"] or 0) == int(cible["log_row"])
-            and drive_file_id(str(apres["drive_link"] or "")) == cible["drive_id"]
+            and drive_file_id(str(apres["drive_link"] or "")) == canonical_drive_id
             and apres["state"] == avant["state"]
             and apres["file_sha256"] == avant["file_sha256"]
             and apres["last_notified_state"] == avant["last_notified_state"]
@@ -631,7 +643,8 @@ def restore_canonical_links(worker) -> dict[str, Any]:
             "sql": sql, "avant": avant, "apres": apres, "conforme": conforme,
         })
 
-    set_migration(db, RESTORE_KEY, RESTORE_VERSION, "done", "")
+    if not configuration_missing:
+        set_migration(db, RESTORE_KEY, RESTORE_VERSION, "done", "")
     return report
 
 
@@ -716,6 +729,101 @@ def reset_pack_v2_documents(worker) -> dict[str, Any]:
     return report
 
 
+MIGRATE_REVIEW_KEY = "migrate_needs_review_to_review_tab"
+MIGRATE_REVIEW_VERSION = 1
+
+
+def migrate_needs_review_to_review_tab(worker) -> dict[str, Any]:
+    """Fait descendre les anciens `needs_review` dans `21_A_VERIFIER`.
+
+    Ces documents ont ete mis de cote par l'ancienne architecture : ils
+    attendaient un bouton Telegram qui n'existe plus. Sans cette
+    migration, ils resteraient invisibles - ni en comptabilite, ni dans
+    l'onglet de quarantaine - c'est-a-dire nulle part.
+
+    Trois garanties :
+      - AUCUN doublon : un document dont `review_row` est deja renseigne
+        est saute, et `write_review` retrouve de toute facon sa ligne par
+        l'identifiant en colonne A ;
+      - AUCUN bouton : on ecrit dans le classeur, on n'envoie rien ;
+      - AUCUNE ecriture comptable : ces documents ne touchent ni les
+        totaux, ni le Dashboard, ni la TVA.
+    """
+    db = worker._db_path
+    chat = worker._chat_id
+    store.ensure_schema(db)
+    ensure_schema(db)
+    if migration_state(db, MIGRATE_REVIEW_KEY, MIGRATE_REVIEW_VERSION) == "done":
+        return {"skipped": True, "reason": "deja executee"}
+
+    pipeline = worker.pipeline
+    saved = backup(db)
+    report: dict[str, Any] = {
+        "backup": saved["db"], "migres": [], "deja_presents": [], "echecs": [],
+    }
+
+    for fiche in store.list_documents(db, chat):
+        if str(fiche.get("state") or "") != store.NEEDS_REVIEW:
+            continue
+        cle = str(fiche["doc_key"])
+        numero = str(fiche.get("numero") or "")
+        if int(fiche.get("review_row") or 0):
+            report["deja_presents"].append({"numero": numero, "cle": cle[:12]})
+            continue
+        motifs = _motifs_de(fiche)
+        entree = ReviewEntry(
+            doc_key=cle,
+            detected_at=str(fiche.get("created_at") or _now()),
+            type_label=str(fiche.get("doc_type") or "non determine"),
+            numero=numero,
+            drive_link=str(fiche.get("drive_link") or ""),
+            gmail_message_id=str(fiche.get("gmail_message_id") or ""),
+            filename=str(fiche.get("filename") or ""),
+            reasons=motifs,
+        )
+        try:
+            ligne = pipeline.write_review(entree)
+        except Exception as exc:  # noqa: BLE001 - jamais bloquant
+            report["echecs"].append(
+                {"numero": numero, "cle": cle[:12], "erreur": type(exc).__name__}
+            )
+            continue
+        store.update_document(db, cle, review_row=ligne)
+        report["migres"].append(
+            {"numero": numero, "cle": cle[:12], "ligne": ligne, "motifs": motifs}
+        )
+
+    # La migration n'est marquee terminee que si RIEN n'a echoue : sinon
+    # elle doit pouvoir reprendre au prochain demarrage, sans avoir
+    # reecrit ce qui etait deja passe.
+    if not report["echecs"]:
+        set_migration(db, MIGRATE_REVIEW_KEY, MIGRATE_REVIEW_VERSION, "done")
+    return report
+
+
+def _motifs_de(fiche: dict[str, Any]) -> list[str]:
+    """Motifs deja enregistres pour ce document, sinon un motif honnete.
+
+    On ne reinvente pas une anomalie qu'on ne connait plus : si le
+    payload d'origine ne dit rien, on l'ecrit tel quel plutot que de
+    fabriquer une explication plausible.
+    """
+    brut = str(fiche.get("payload") or "").strip()
+    if brut:
+        try:
+            charge = json.loads(brut)
+        except (ValueError, TypeError):
+            charge = None
+        if isinstance(charge, dict):
+            motifs = [str(r) for r in (charge.get("reasons") or []) if str(r).strip()]
+            if motifs:
+                return motifs
+    return [
+        "document mis de cote par l'ancienne architecture ; motif d'origine "
+        "non conserve - a verifier manuellement"
+    ]
+
+
 def run(worker) -> dict[str, Any]:
     """Repare les archives, puis met les faux fichiers en quarantaine."""
     db = worker._db_path
@@ -756,6 +864,43 @@ def run(worker) -> dict[str, Any]:
                 "%d absente(s)",
                 len(menage["supprimes"]), len(menage["conserves"]),
                 len(menage["absents"]),
+            )
+
+    # Descente des anciens documents en attente vers 21_A_VERIFIER.
+    # Executee AVANT toute sortie anticipee : un document oublie par
+    # l'ancienne architecture ne doit pas le rester un cycle de plus.
+    try:
+        descente = migrate_needs_review_to_review_tab(worker)
+    except Exception as exc:  # noqa: BLE001 - le cycle Gmail ne meurt jamais
+        logger.warning(
+            "Migration vers 21_A_VERIFIER impossible : %s", type(exc).__name__
+        )
+    else:
+        if descente.get("skipped"):
+            logger.info("Migration vers 21_A_VERIFIER : %s", descente.get("reason"))
+        else:
+            logger.info("Sauvegarde avant migration : %s", descente["backup"])
+            for entree in descente["migres"]:
+                logger.info(
+                    "Document %s (%s) inscrit dans 21_A_VERIFIER ligne %d : %s",
+                    entree["numero"] or "sans numero", entree["cle"],
+                    entree["ligne"], " | ".join(entree["motifs"]),
+                )
+            for entree in descente["deja_presents"]:
+                logger.info(
+                    "Document %s (%s) deja dans 21_A_VERIFIER, aucun doublon cree",
+                    entree["numero"] or "sans numero", entree["cle"],
+                )
+            for entree in descente["echecs"]:
+                logger.warning(
+                    "Document %s (%s) non migre (%s) : reprise au prochain demarrage",
+                    entree["numero"] or "sans numero", entree["cle"], entree["erreur"],
+                )
+            logger.info(
+                "Migration vers 21_A_VERIFIER : %d migre(s), %d deja present(s), "
+                "%d echec(s)",
+                len(descente["migres"]), len(descente["deja_presents"]),
+                len(descente["echecs"]),
             )
 
     # Rattachement des fiches vivantes a leur ligne et a leur archive

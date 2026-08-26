@@ -263,6 +263,22 @@ def build_line_rows(
     return rows
 
 
+def _montant_journal(label: str, valeur: Decimal | None, devise: str) -> str:
+    """Montant du journal, dans SA devise reelle.
+
+    L'ancienne version suffixait " MAD" sans condition : une facture en
+    EUR ou en USD apparaissait donc dans le journal comme un montant en
+    dirhams, ce qui est faux et trompeur pour qui relit la comptabilite.
+    Quand la devise n'a pas ete lue, on le dit plutot que de supposer.
+    """
+    if valeur is None:
+        return ""
+    code = (devise or "").strip().upper()
+    if not code:
+        return f"{label} {valeur} (devise non lue)"
+    return f"{label} {valeur} {code}"
+
+
 def build_import_log_row(
     *,
     horodatage: str,
@@ -285,6 +301,7 @@ def build_import_log_row(
     type_enregistrement: str = "Facture achat",
     avertissements: tuple[str, ...] | list[str] = (),
     en_attente: bool = False,
+    devise: str = "",
 ) -> list[object]:
     """Entree complete du journal d'import (6 colonnes reelles de l'onglet).
 
@@ -301,9 +318,9 @@ def build_import_log_row(
         *(f"Avertissement : {w}" for w in avertissements),
         f"Facture {numero}",
         f"Fournisseur {fournisseur} (ICE {ice})" if ice else f"Fournisseur {fournisseur}",
-        f"HT {montant_ht} MAD" if montant_ht is not None else "",
-        f"TVA {montant_tva} MAD" if montant_tva is not None else "",
-        f"TTC {montant_ttc} MAD" if montant_ttc is not None else "",
+        _montant_journal("HT", montant_ht, devise),
+        _montant_journal("TVA", montant_tva, devise),
+        _montant_journal("TTC", montant_ttc, devise),
         f"Onglet {tab} ligne {row_index}",
         f"Gmail message {gmail_message_id}" if gmail_message_id else "",
         f"Expediteur {gmail_expediteur}" if gmail_expediteur else "",
