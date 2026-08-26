@@ -34,6 +34,7 @@ from app.attachments import (
     is_zip,
     sha256_of,
 )
+from app.review_sheet import TAB_REVIEW
 from app.doc_pipeline import DocumentOutcome, DocumentPipeline
 from app.doc_policy import ACTION_AUTO, ACTION_DUPLICATE, ACTION_REVIEW, ACTION_UNKNOWN
 from app.doc_types import LABELS
@@ -53,9 +54,6 @@ _MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
 
 # Telegram limite `callback_data` a 64 octets : le prefixe court de la cle
 # d'idempotence suffit a retrouver le document sans risque de collision.
-CALLBACK_CONFIRM_PREFIX = "dok:"
-CALLBACK_REFUSE_PREFIX = "dno:"
-CALLBACK_KEY_LENGTH = 24
 
 
 # Etats de NOTIFICATION. Ils ne remplacent pas l'etat metier stocke dans
@@ -666,7 +664,6 @@ class MailWorker:
         attachment_id: str,
         parent_filename: str,
         source_url: str = "",
-        forced: bool = False,
     ) -> DocumentOutcome:
         """Traite UN document, apres l'avoir mis a l'abri dans le coffre.
 
@@ -683,7 +680,7 @@ class MailWorker:
         local_path = vault.save(self._db_path, self._chat_id, doc_key, file.content)
         return self.pipeline.process_document(
             file, message, attachment_id=attachment_id, source_url=source_url,
-            forced=forced, parent_attachment_id=attachment_id,
+            parent_attachment_id=attachment_id,
             parent_filename=parent_filename, local_path=local_path,
         )
 
@@ -819,7 +816,7 @@ class MailWorker:
                 logger.warning("Reprise impossible (%s): %s", row["doc_key"][:12], exc)
         return outcomes
 
-    def resume(self, row: dict[str, Any], *, forced: bool = False) -> DocumentOutcome:
+    def resume(self, row: dict[str, Any]) -> DocumentOutcome:
         """Reprend UN document exactement la ou il s'est arrete."""
         file, source_url = self.materialize(row)
         message = {
@@ -830,7 +827,7 @@ class MailWorker:
         return self.pipeline.process_document(
             file, message,
             attachment_id=str(row.get("attachment_id") or ""),
-            source_url=source_url, forced=forced,
+            source_url=source_url,
             parent_attachment_id=str(row.get("parent_attachment_id") or ""),
             parent_filename=str(row.get("parent_filename") or ""),
             local_path=str(row.get("local_path") or ""),
@@ -879,46 +876,6 @@ class MailWorker:
                     )
                 )
         return outcomes
-
-    # -- validation humaine ------------------------------------------------
-
-    def confirm(self, short_key: str) -> str:
-        """Ecrit un document apres validation humaine."""
-        row = store.find_by_key_prefix(self._db_path, self._chat_id, short_key)
-        if row is None:
-            raise MailWorkerError("Document introuvable.")
-        # Idempotence du bouton : deux clics ne creent jamais deux lignes.
-        # L'etat fait foi, pas le nombre de clics.
-        if row["state"] in store.TERMINAL_STATES or row["state"] in store.STATES_AFTER_SHEET:
-            store.mark_notified(self._db_path, row["doc_key"], NOTIFY_COMPLETED)
-            return already_written_message(row)
-        outcome = self.resume(row, forced=True)
-        # La transition waiting_validation -> completed est annoncee ICI,
-        # dans la reponse au bouton. Elle est donc deja notifiee : le cycle
-        # Gmail suivant ne doit plus rien dire de ce document.
-        store.mark_notified(self._db_path, row["doc_key"], NOTIFY_COMPLETED)
-        return format_outcome(outcome, prefix="Document valide et enregistre")
-
-    def refuse(self, short_key: str) -> str:
-        row = store.find_by_key_prefix(self._db_path, self._chat_id, short_key)
-        if row is None:
-            raise MailWorkerError("Document introuvable.")
-        if row["state"] in store.STATES_AFTER_SHEET or row["state"] == store.COMPLETED:
-            return "Ce document a deja ete enregistre ; il ne peut plus etre refuse ici."
-        store.set_state(self._db_path, row["doc_key"], store.SKIPPED, error="refuse par le client")
-        # waiting_validation -> refus : annonce dans la reponse au bouton,
-        # plus jamais ensuite. L'etat notifie suit l'etat metier (skipped)
-        # pour qu'aucun cycle ne croie a une transition.
-        store.mark_notified(self._db_path, row["doc_key"], NOTIFY_SKIPPED)
-        drive = str(row.get("drive_link") or "")
-        message = (
-            f"Document {row['numero'] or row['filename']} refuse. "
-            "Aucune ecriture comptable n'a ete faite."
-        )
-        if drive:
-            message += f"{NL}La piece reste archivee dans Drive / A verifier : {drive}"
-        return message
-
 
 def already_written_message(row: dict[str, Any]) -> str:
     """Reponse a un second clic sur "Valider". Rien n'est reecrit."""
@@ -1015,10 +972,14 @@ def build_summary(summary: MailSummary) -> str:
 
 
 def build_review_message(outcome: DocumentOutcome) -> str:
-    """Message d'un document qui exige une validation humaine."""
+    """Message d'un document ECARTE de la comptabilite.
+
+    Purement informatif : il n'y a plus rien a valider dans Telegram.
+    Le document est deja inscrit dans 21_A_VERIFIER avec son motif.
+    """
     doc = outcome.document
     lines = [
-        f"Validation requise : {outcome.type_label} {outcome.numero or ''}".strip(),
+        f"Document a verifier : {outcome.type_label} {outcome.numero or ''}".strip(),
         f"Fichier : {outcome.filename}",
         "",
         "Valeurs detectees :",
@@ -1032,7 +993,7 @@ def build_review_message(outcome: DocumentOutcome) -> str:
         lines.append(f"- Echeance : {outcome.echeance}")
     if doc and doc.text_source == "ocr":
         lines.append("- Lecture  : OCR (couche texte absente)")
-    lines += ["", "Motif de la validation :"]
+    lines += ["", "Motif de la mise a l'ecart :"]
     lines += [f"- {reason}" for reason in outcome.reasons]
     # Information EXACTE : la piece est deja archivee, c'est l'ecriture
     # comptable - et elle seule - qui attend une decision. L'ancien message
@@ -1043,5 +1004,13 @@ def build_review_message(outcome: DocumentOutcome) -> str:
     else:
         lines.append("- Archivage Drive a terminer au prochain cycle")
     lines.append("- Trace ecrite dans 14_IMPORTS_LOG")
-    lines.append("- Aucune ligne comptable, aucun rappel Calendar : en attente de ta decision")
+    lines.append(f"- Inscrit en rouge dans {TAB_REVIEW}, avec le motif ci-dessus")
+    lines.append(
+        "- Aucune ligne comptable, aucun rappel Calendar : ces montants "
+        "n'entrent ni dans les totaux, ni dans le Dashboard, ni dans la TVA"
+    )
+    lines.append(
+        "- Rien a valider ici : corrige la ligne dans le classeur, ou "
+        "demande-moi la correction en clair"
+    )
     return f"{NL}".join(lines)

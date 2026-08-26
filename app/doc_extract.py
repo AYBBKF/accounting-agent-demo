@@ -339,6 +339,51 @@ def all_amounts_for(lines: list[Line], label: str) -> list[Decimal]:
     return found
 
 
+# Libelles de role qui precedent une raison sociale. Ils doivent etre
+# retires du NOM : "Client : ATLAS CLINIQUE SARL" et "ATLAS CLINIQUE SARL"
+# designent le meme tiers, et les laisser differer a suffi a creer une
+# seconde fiche client pour une societe deja connue.
+_ROLE_LABELS = (
+    "CLIENT", "CLIENTE", "FOURNISSEUR", "EMETTEUR", "ACHETEUR", "VENDEUR",
+    "IMPORTER", "EXPORTER", "SUPPLIER", "CUSTOMER", "VENDOR", "BUYER",
+    "SELLER", "BILL TO", "SOLD TO", "SHIP TO", "BENEFICIAIRE", "TITULAIRE",
+    "ORGANISME", "PAYEUR", "DESTINATAIRE", "RAISON SOCIALE",
+)
+
+
+def clean_party_name(raw: str | None) -> str | None:
+    """Retire le libelle de role qui prefixe parfois une raison sociale.
+
+    Applique APRES l'extraction, quel que soit le chemin qui a produit le
+    nom : le libelle peut etre reste colle parce qu'il vivait sur la ligne
+    suivante, pas sur la ligne du label. Sans ce nettoyage, le meme tiers
+    entre deux fois dans le classeur sous deux identifiants differents.
+
+    Un nom qui ne serait QUE le libelle n'est pas transforme en chaine
+    vide silencieusement : on rend None, et la politique de decision
+    tranchera - c'est elle qui sait qu'un tiers sans nom bloque tout.
+    """
+    candidate = (raw or "").strip()
+    if not candidate:
+        return None
+    for _ in range(3):  # "Client : Fournisseur : X" reste pathologique mais fini
+        courant = normalize(candidate)
+        retire = False
+        for label in _ROLE_LABELS:
+            if not courant.startswith(label):
+                continue
+            reste = candidate[len(label):].lstrip()
+            reste = re.sub(r"^[:/\-]\s*", "", reste).strip()
+            if reste and normalize(reste) != courant:
+                candidate = reste
+                retire = True
+                break
+        if not retire:
+            break
+    candidate = candidate.strip(" :;,-").strip()
+    return candidate or None
+
+
 def party(lines: list[Line], labels: tuple[str, ...]) -> tuple[str | None, str | None, int]:
     """(nom, ICE, page) d'une partie. L'ICE est celui du bloc, pas un autre."""
     for i, line in enumerate(lines):
@@ -767,11 +812,15 @@ def extract_document(
     doc.destinataire, doc.destinataire_ice, _ = party(
         lines, ("Client", "Acheteur", "Importer", "Beneficiaire", "Titulaire")
     )
+    doc.emetteur = clean_party_name(doc.emetteur)
+    doc.destinataire = clean_party_name(doc.destinataire)
     if kind in ("bon_commande",):
         # Sur un bon de commande, l'acheteur est en tete et le fournisseur
         # apres : les roles sont inverses par rapport a une facture.
         doc.emetteur, doc.emetteur_ice, _ = party(lines, ("Fournisseur",))
         doc.destinataire, doc.destinataire_ice, _ = party(lines, ("Acheteur", "Client"))
+        doc.emetteur = clean_party_name(doc.emetteur)
+        doc.destinataire = clean_party_name(doc.destinataire)
 
     # --- montants -------------------------------------------------------
     if kind != BANK_STATEMENT:

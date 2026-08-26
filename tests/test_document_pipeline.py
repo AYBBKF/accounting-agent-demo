@@ -99,14 +99,13 @@ def make_file(pipeline, name: str, *, tag: str = "", filename: str | None = None
     )
 
 
-def run(pipeline, name, *, message_id="m1", attachment_id="att-1", tag="", forced=False):
+def run(pipeline, name, *, message_id="m1", attachment_id="att-1", tag=""):
     file = make_file(pipeline, name, tag=tag)
     return pipeline.process_document(
         file,
         {"messageId": message_id, "subject": "Pack test", "sender": "client@example.ma"},
         attachment_id=attachment_id,
         source_url="https://example.invalid/f.pdf",
-        forced=forced,
     )
 
 
@@ -186,12 +185,27 @@ def test_the_known_supplier_is_reused_and_never_duplicated(pipeline, workbook):
     assert workbook.writes_to("03_FOURNISSEURS") == []
 
 
-def test_an_unknown_supplier_is_created_from_its_ice(pipeline, workbook):
-    outcome = run(pipeline, ANOMALIE, forced=True)     # NORTH DATA SARL, ICE present
+def test_an_unknown_supplier_is_created_from_a_clean_invoice(pipeline, workbook):
+    """Un fournisseur inconnu entre au classeur - si la facture est SAINE.
+
+    L'ancienne version de ce test creait la fiche depuis une facture dont
+    HT + TVA ne faisait pas le TTC : elle ne pouvait le faire que parce
+    qu'un bouton Telegram forcait l'ecriture. Ce chemin n'existe plus.
+    """
+    run(pipeline, SANS_ICE)               # EXPRESS SERVICE, ICE absent
     created = workbook.rows("03_FOURNISSEURS")[-1]
     assert created[0] == "FRS-007"
-    assert created[1] == "NORTH DATA SARL"
-    assert created[2] == "002998877000061"
+    assert created[1] == "EXPRESS SERVICE"
+
+
+def test_an_incoherent_invoice_never_creates_a_supplier(pipeline, workbook):
+    """Un ecart HT + TVA / TTC ne cree plus rien, meme pas une fiche tiers."""
+    before = len(workbook.rows("03_FOURNISSEURS"))
+    outcome = run(pipeline, ANOMALIE)     # NORTH DATA SARL, ecart de 300
+    assert outcome.action == ACTION_REVIEW
+    assert outcome.tab == ""
+    assert len(workbook.rows("03_FOURNISSEURS")) == before
+    assert workbook.writes_to("05_FACTURES_ACHATS") == []
 
 
 # === 4. deux lignes de detail, ecrites une seule fois =====================
@@ -303,27 +317,29 @@ def test_a_reminder_is_never_created_twice(pipeline, workbook):
 
 # === 9. import / export avec devise et douane ============================
 
-def test_an_import_invoice_keeps_currency_and_customs_data(pipeline, workbook):
-    outcome = run(pipeline, IMPORT, forced=True)
+def test_an_import_invoice_in_usd_is_read_but_never_booked(pipeline, workbook):
+    """La devise est LUE, la comptabilite n'est pas touchee.
+
+    Une facture d'import en USD sans taux de change ne peut pas devenir
+    une charge en dirhams : la convertir serait une decision comptable,
+    pas une lecture. Elle part donc en quarantaine avec sa devise.
+    """
+    outcome = run(pipeline, IMPORT)
     assert outcome.devise == "USD"
-    customs = workbook.rows("20_DOUANE")[-1]
-    assert customs[2] == "Import"
-    assert customs[3] == "CI-2026-045"
-    assert customs[5] == "USD"
-    assert customs[6] == "CIF Casablanca"
-    assert customs[7] == "China"
-    assert "847160" in customs[9] and "844332" in customs[9]
-    assert customs[10] == 3200.0 and customs[11] == 320.0 and customs[12] == 3520.0
+    assert outcome.action == ACTION_REVIEW
+    assert outcome.tab == ""
+    assert workbook.writes_to("05_FACTURES_ACHATS") == []
+    assert any("USD" in reason for reason in outcome.reasons)
 
 
-def test_an_export_invoice_keeps_currency_and_destination(pipeline, workbook):
-    outcome = run(pipeline, EXPORT, forced=True)
-    assert outcome.tab == "04_FACTURES_VENTES"
-    customs = workbook.rows("20_DOUANE")[-1]
-    assert customs[2] == "Export"
-    assert customs[5] == "EUR"
-    assert customs[6] == "DAP Dakar"
-    assert customs[8] == "Sénégal"
+def test_an_export_invoice_in_eur_is_read_but_never_booked(pipeline, workbook):
+    """Meme regle a l'export : EUR lu, aucune ligne de vente ecrite."""
+    outcome = run(pipeline, EXPORT)
+    assert outcome.devise == "EUR"
+    assert outcome.action == ACTION_REVIEW
+    assert outcome.tab == ""
+    assert workbook.writes_to("04_FACTURES_VENTES") == []
+    assert any("EUR" in reason for reason in outcome.reasons)
 
 
 def test_a_foreign_currency_invoice_without_a_rate_asks_for_validation(pipeline, workbook):
@@ -376,7 +392,7 @@ def test_a_credit_note_matching_several_invoices_asks(pipeline, workbook):
 
 
 def test_a_validated_credit_note_is_written_with_negative_amounts(pipeline, workbook):
-    outcome = run(pipeline, AVOIR, forced=True)
+    outcome = run(pipeline, AVOIR)
     row = workbook.row("17_AVOIRS", outcome.row_index)
     assert row[2] == "AV-2026-003"
     assert row[3] == "Fournisseur"
@@ -515,7 +531,7 @@ def test_the_same_pdf_in_another_email_is_detected_by_its_hash(pipeline, workboo
 def test_a_certain_duplicate_is_never_written_even_when_validated(pipeline, workbook):
     run(pipeline, ACHAT)
     rows = len(workbook.rows("05_FACTURES_ACHATS"))
-    outcome = run(pipeline, ACHAT, message_id="m3", attachment_id="att-3", forced=True)
+    outcome = run(pipeline, ACHAT, message_id="m3", attachment_id="att-3")
     assert outcome.action == ACTION_DUPLICATE
     assert len(workbook.rows("05_FACTURES_ACHATS")) == rows
 

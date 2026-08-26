@@ -201,12 +201,20 @@ def test_the_notification_no_longer_claims_nothing_was_written(worker):
 
     assert "Rien n'a ete ecrit dans Sheets, Drive ni Calendar" not in message
     assert "Archive dans Drive / A verifier" in message
-    assert "en attente de ta decision" in message
+    # Le message ne propose plus de decision : il ANNONCE une mise a l'ecart.
+    assert "en attente de ta decision" not in message
+    assert "21_A_VERIFIER" in message
+    assert "Rien a valider ici" in message
 
 
 # === 5. validation d'un PDF contenu dans un ZIP ==========================
 
-def test_validating_a_pdf_that_lives_inside_a_zip_works(worker):
+def test_a_doubtful_pdf_inside_a_zip_keeps_its_identity_in_quarantine(worker):
+    """Un membre de ZIP ecarte garde son identite propre.
+
+    C'est ce qui permet au comptable de retrouver LE bon fichier dans
+    l'archive, et non le ZIP entier.
+    """
     send_pack(worker)
     summary = worker.process_once()[0]
     pending = summary.to_review[0]
@@ -215,21 +223,17 @@ def test_validating_a_pdf_that_lives_inside_a_zip_works(worker):
     row = store.get_document(worker._db_path, pending.doc_key)
     assert row["member_path"] == f"pack/{ANOMALIE}.pdf"
     assert row["parent_filename"] == "Pack_test_comptable.zip"
-
-    reply = worker.confirm(pending.doc_key[:24])
-
-    assert "Document valide et enregistre" in reply
-    after = store.get_document(worker._db_path, pending.doc_key)
-    assert after["state"] == store.COMPLETED
-    assert after["tab"] == "05_FACTURES_ACHATS" and after["row_index"]
+    # Ecarte, donc : aucune ligne comptable, mais une ligne de quarantaine.
+    assert row["state"] == store.NEEDS_REVIEW
+    assert not row["tab"] and not row["row_index"]
+    assert int(row["review_row"] or 0) >= 2
 
 
 def test_the_child_pdf_is_never_looked_up_as_a_gmail_attachment(worker):
     """Regression : c'est cette recherche qui produisait le message d'erreur."""
     send_pack(worker)
-    pending = worker.process_once()[0].to_review[0]
-
-    worker.confirm(pending.doc_key[:24])   # ne doit pas lever
+    worker.process_once()
+    worker.retry_pending()                 # ne doit pas lever
 
     # La piece jointe demandee a Gmail reste le ZIP, jamais le PDF enfant.
     demanded = [
@@ -241,20 +245,23 @@ def test_the_child_pdf_is_never_looked_up_as_a_gmail_attachment(worker):
 
 # === 6. validation apres redemarrage du conteneur ========================
 
-def test_validation_still_works_after_a_container_restart(worker, db_path, registry):
+def test_a_quarantined_document_survives_a_container_restart(worker, db_path, registry):
+    """Apres redemarrage, le document reste ecarte - et le reste.
+
+    Aucun etat en memoire ne le fait basculer en comptabilite : c'est le
+    volume qui fait foi.
+    """
     send_pack(worker)
     pending = worker.process_once()[0].to_review[0]
 
-    # Nouveau processus : plus aucun etat en memoire. Seuls subsistent le
-    # volume (base + coffre) et l'email d'origine.
     restarted = RotatingGmail(FakeWorkbook(), db_path)
     restarted.messages = worker.messages
     restarted.blobs = worker.blobs
+    restarted.process_once()
 
-    reply = restarted.confirm(pending.doc_key[:24])
-
-    assert "Document valide et enregistre" in reply
-    assert store.get_document(db_path, pending.doc_key)["state"] == store.COMPLETED
+    apres = store.get_document(db_path, pending.doc_key)
+    assert apres["state"] == store.NEEDS_REVIEW
+    assert not apres["tab"] and not apres["row_index"]
 
 
 # === 7. fichier local manquant : recuperation du ZIP parent ==============
@@ -268,9 +275,8 @@ def test_a_missing_local_file_is_rebuilt_from_the_parent_zip(worker, db_path):
     assert vault.load(db_path, CHAT_ID, pending.doc_key) is None
 
     before = len(worker.gmail_calls)
-    reply = worker.confirm(pending.doc_key[:24])
+    worker.retry_pending()
 
-    assert "Document valide et enregistre" in reply
     assert len(worker.gmail_calls) > before, "le ZIP parent aurait du etre retelecharge"
     # ... et le coffre est reconstitue pour la prochaine fois.
     row = store.get_document(db_path, pending.doc_key)
@@ -299,10 +305,13 @@ def test_a_changed_file_blocks_the_write_instead_of_guessing(worker, db_path):
     worker.blobs["m-pack-att-1"] = zip_of(altered)
     before = len(worker.workbook.rows("05_FACTURES_ACHATS"))
 
-    with pytest.raises(MailWorkerError, match="empreinte differente"):
-        worker.confirm(pending.doc_key[:24])
+    outcomes = worker.retry_pending()
 
-    assert store.get_document(db_path, pending.doc_key)["state"] == store.NEEDS_REVIEW
+    # Le contenu ne correspond plus a l'empreinte enregistree : on refuse
+    # de deviner, et surtout on n'ecrit rien.
+    concerne = next(o for o in outcomes if o.doc_key == pending.doc_key)
+    assert concerne.error or concerne.action == ACTION_REVIEW
+    assert store.get_document(db_path, pending.doc_key)["state"] != store.COMPLETED
     assert len(worker.workbook.rows("05_FACTURES_ACHATS")) == before
 
 
@@ -317,31 +326,26 @@ def test_a_corrupted_vault_file_is_ignored_not_trusted(worker, db_path):
 
 # === 9. double clic : une seule ecriture =================================
 
-def test_clicking_validate_twice_writes_exactly_one_row(worker):
+def test_repeated_cycles_write_exactly_one_quarantine_row(worker):
+    """Le nerf de la nouvelle architecture : pas de ligne qui s'accumule.
+
+    Un document ecarte est reexamine a chaque cycle Gmail. S'il ajoutait
+    une ligne a chaque tour, l'onglet 21_A_VERIFIER serait inutilisable
+    au bout d'une heure.
+    """
     send_pack(worker)
-    pending = worker.process_once()[0].to_review[0]
+    worker.process_once()
+    quarantaine = len(worker.workbook.rows("21_A_VERIFIER"))
+    achats = len(worker.workbook.rows("05_FACTURES_ACHATS"))
+    journal = len(worker.workbook.rows("14_IMPORTS_LOG"))
+    assert quarantaine >= 1                       # au moins un document ecarte
 
-    worker.confirm(pending.doc_key[:24])
-    rows = len(worker.workbook.rows("05_FACTURES_ACHATS"))
-    lines = len(worker.workbook.rows("16_LIGNES_FACTURES"))
-    logs = len(worker.workbook.rows("14_IMPORTS_LOG"))
+    worker.process_once()
+    worker.process_once()
 
-    second = worker.confirm(pending.doc_key[:24])
-
-    assert "deja enregistre" in second
-    assert len(worker.workbook.rows("05_FACTURES_ACHATS")) == rows
-    assert len(worker.workbook.rows("16_LIGNES_FACTURES")) == lines
-    assert len(worker.workbook.rows("14_IMPORTS_LOG")) == logs
-
-
-def test_a_third_click_still_writes_nothing(worker):
-    send_pack(worker)
-    pending = worker.process_once()[0].to_review[0]
-    worker.confirm(pending.doc_key[:24])
-    rows = len(worker.workbook.rows("05_FACTURES_ACHATS"))
-    worker.confirm(pending.doc_key[:24])
-    worker.confirm(pending.doc_key[:24])
-    assert len(worker.workbook.rows("05_FACTURES_ACHATS")) == rows
+    assert len(worker.workbook.rows("21_A_VERIFIER")) == quarantaine
+    assert len(worker.workbook.rows("05_FACTURES_ACHATS")) == achats
+    assert len(worker.workbook.rows("14_IMPORTS_LOG")) == journal
 
 
 # === 10. plusieurs PDF du meme ZIP restent independants ==================
@@ -358,10 +362,9 @@ def test_every_pdf_of_one_zip_keeps_its_own_identity(worker, db_path):
     assert all(r["member_path"].startswith("pack/") for r in rows)
     assert len({r["file_sha256"] for r in rows}) == 4
 
-    # Valider l'un ne touche pas les autres.
+    # Ecarter l'un ne touche pas les autres.
     pending = summary.to_review[0]
     others = {o.doc_key: o.action for o in summary.outcomes if o.doc_key != pending.doc_key}
-    worker.confirm(pending.doc_key[:24])
     for doc_key, action in others.items():
         state = store.get_document(db_path, doc_key)["state"]
         assert state == store.COMPLETED if action == ACTION_AUTO else state != store.COMPLETED
@@ -428,7 +431,8 @@ def test_retry_pending_finishes_what_is_left_without_duplicating(worker, db_path
     assert len(outcomes) == len(pending)
     assert all(o.action == ACTION_REVIEW for o in outcomes)
     assert len(worker.workbook.rows("05_FACTURES_ACHATS")) == rows
-    # Les boutons redeviennent vivants : la cle rendue existe toujours.
+    # La fiche reste retrouvable par sa cle : c'est ce qui relie la ligne
+    # rouge de 21_A_VERIFIER au document reel.
     for outcome in outcomes:
         assert store.find_by_key_prefix(db_path, CHAT_ID, outcome.doc_key[:24]) is not None
 
@@ -476,12 +480,13 @@ def test_a_document_stored_before_member_paths_existed_is_recovered(worker, db_p
     )
     vault.discard(db_path, CHAT_ID, pending.doc_key)
 
-    reply = worker.confirm(pending.doc_key[:24])
+    worker.retry_pending()
 
-    assert "Document valide et enregistre" in reply
     restored = store.get_document(db_path, pending.doc_key)
-    assert restored["state"] == store.COMPLETED
-    assert restored["member_path"] == f"pack/{ANOMALIE}.pdf"   # fiche completee
+    # La fiche est completee a partir de l'archive d'origine...
+    assert restored["member_path"] == f"pack/{ANOMALIE}.pdf"
+    # ... sans pour autant entrer en comptabilite : elle reste douteuse.
+    assert restored["state"] == store.NEEDS_REVIEW
 
 
 def test_the_recovered_document_is_written_once_and_only_once(worker, db_path):
@@ -491,12 +496,13 @@ def test_the_recovered_document_is_written_once_and_only_once(worker, db_path):
     vault.discard(db_path, CHAT_ID, pending.doc_key)
 
     before = len(worker.workbook.rows("05_FACTURES_ACHATS"))
-    worker.confirm(pending.doc_key[:24])
-    once = len(worker.workbook.rows("05_FACTURES_ACHATS"))
-    worker.confirm(pending.doc_key[:24])
+    quarantaine = len(worker.workbook.rows("21_A_VERIFIER"))
+    worker.retry_pending()
+    worker.retry_pending()
 
-    assert once == before + 1
-    assert len(worker.workbook.rows("05_FACTURES_ACHATS")) == once
+    # Recuperee, mais toujours pas comptabilisee - et pas dupliquee.
+    assert len(worker.workbook.rows("05_FACTURES_ACHATS")) == before
+    assert len(worker.workbook.rows("21_A_VERIFIER")) == quarantaine
 
 
 def test_the_vault_never_leaks_between_two_clients(db_path):
@@ -554,18 +560,25 @@ def test_a_zip_member_is_never_archived_from_the_parent_url(worker):
 
 # === 13. apres validation, la piece et le journal suivent ================
 
-def test_validation_moves_the_document_out_of_the_review_folder(worker):
+def test_a_doubtful_document_stays_in_the_review_folder(worker):
+    """La piece douteuse NE SORT PAS de 'A verifier'.
+
+    C'est l'inverse exact de l'ancienne regle : rien ne la deplace vers un
+    dossier comptable, puisque rien ne la comptabilise.
+    """
     send_pack(worker)
     pending = worker.process_once()[0].to_review[0]
     assert pending.drive_link
 
-    worker.confirm(pending.doc_key[:24])
+    worker.process_once()
+    worker.retry_pending()
 
-    assert worker.workbook.moves, "la piece est restee dans 'A verifier'"
-    move = worker.workbook.moves[-1]
     a_verifier = worker.workbook.folders.get(("", "A verifier"))
-    assert move["remove_parents"] != ""
-    assert move["add_parents"] != a_verifier
+    sorties = [
+        m for m in worker.workbook.moves
+        if a_verifier and m.get("remove_parents") == a_verifier
+    ]
+    assert sorties == [], "la piece douteuse a quitte 'A verifier'"
 
 
 def test_validation_updates_the_pending_log_row_instead_of_adding_one(worker):
@@ -577,11 +590,13 @@ def test_validation_updates_the_pending_log_row_instead_of_adding_one(worker):
         if row and row[3] == "A valider"
     )
 
-    worker.confirm(pending.doc_key[:24])
+    worker.process_once()
+    worker.retry_pending()
 
     journal_apres = worker.workbook.rows("14_IMPORTS_LOG")
     assert len(journal_apres) == len(journal_avant), "une seconde ligne a ete creee"
-    mise_a_jour = journal_apres[ligne - 1]
-    assert mise_a_jour[3] == "Cree"
-    assert "EN ATTENTE DE VALIDATION" not in mise_a_jour[5]
-    assert "05_FACTURES_ACHATS" in mise_a_jour[5]
+    inchangee = journal_apres[ligne - 1]
+    # La ligne reste "A valider" : le document n'a pas ete comptabilise, et
+    # aucune ecriture ne vient pretendre le contraire.
+    assert inchangee[3] == "A valider"
+    assert "05_FACTURES_ACHATS" not in inchangee[5]

@@ -82,13 +82,21 @@ TOOL_ARGUMENTS: dict[str, tuple[set[str], set[str]]] = {
     "GOOGLESHEETS_ADD_SHEET": ({"spreadsheet_id", "title"}, {"force_unique"}),
     "GOOGLESHEETS_FORMAT_CELL": (
         {"spreadsheet_id"},
+        # Liste alignee sur le schema REEL de Composio (verifie via
+        # COMPOSIO_GET_TOOL_SCHEMAS) : elle etait en retard et rejetait des
+        # arguments que la vraie passerelle accepte.
         {"sheet_name", "worksheet_id", "range", "number_format_type",
-         "number_format_pattern", "background_color", "bold", "italic"},
+         "number_format_pattern", "background_color", "background_alpha",
+         "bold", "italic", "underline", "strikethrough", "font_size",
+         "font_family", "text_color", "wrap_strategy",
+         "horizontal_alignment", "vertical_alignment"},
     ),
     "GOOGLESHEETS_SET_DATA_VALIDATION_RULE": (
         {"spreadsheet_id"},
         {"sheet_id", "mode", "validation_type", "values", "strict",
-         "show_custom_ui", "start_row_index", "end_row_index",
+         "show_custom_ui", "input_message", "formula", "condition_values",
+         "source_range_a1", "filtered_rows_included",
+         "start_row_index", "end_row_index",
          "start_column_index", "end_column_index"},
     ),
     "GOOGLEDRIVE_FIND_FOLDER": (

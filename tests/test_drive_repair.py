@@ -194,12 +194,16 @@ def test_the_repair_updates_the_existing_log_row_in_place(worker, db_path):
 
 # === 3. classement : valide -> categorie, ambigu -> A verifier ===========
 
-def test_a_validated_document_lands_in_its_category_folder(worker, db_path):
+def test_an_imported_document_lands_in_its_category_folder(worker, db_path):
+    """Un document REELLEMENT comptabilise rejoint son dossier metier.
+
+    Il n'y a plus de validation humaine pour l'y amener : seuls les
+    documents importes automatiquement sortent de "A verifier".
+    """
     pending = [
         r for r in drive_repair.list_zip_archives(db_path, CHAT_ID)
-        if r["state"] == store.NEEDS_REVIEW
+        if r["state"] == store.COMPLETED and r.get("tab") == "05_FACTURES_ACHATS"
     ][0]
-    worker.confirm(pending["doc_key"][:24])
     for row in drive_repair.list_zip_archives(db_path, CHAT_ID):
         drive_repair.reset_repaired(db_path, row["doc_key"])
     drive_repair.set_migration(

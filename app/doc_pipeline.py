@@ -20,7 +20,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Protocol
 
@@ -28,6 +28,8 @@ from app import doc_store as store
 from app.attachments import DocumentFile, idempotency_key
 from app.doc_extract import ExtractedDocument, extract_from_pdf_bytes
 from app.doc_policy import (
+    NotWritable,
+    assert_writable,
     ACTION_AUTO,
     ACTION_DUPLICATE,
     ACTION_REVIEW,
@@ -60,6 +62,17 @@ from app.doc_routing import (
     build_payable_row,
     is_purchase_side,
     route_for,
+)
+from app.review_sheet import (
+    COL_ANOMALY,
+    LAST_COL as REVIEW_LAST_COL,
+    REVIEW_HEADERS,
+    REVIEW_ROW_COLOR,
+    TAB_REVIEW,
+    ReviewEntry,
+    build_review_row,
+    build_tooltip,
+    find_row as find_review_row,
 )
 from app.doc_types import (
     BANK_STATEMENT,
@@ -146,6 +159,11 @@ class PartyMatch:
     existing: bool = False
     ambiguous: bool = False
     reason: str = ""
+
+
+def _now_iso() -> str:
+    """Horodatage UTC, meme convention que le journal d'import."""
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
 @dataclass
@@ -347,6 +365,127 @@ class DocumentPipeline:
         except Exception as exc:  # noqa: BLE001 - le fond n'est pas comptable
             logger.warning(
                 "Fond de ligne %s!%d non applique: %s", tab, row_index, exc
+            )
+
+    # -- onglet 21_A_VERIFIER ----------------------------------------------
+
+    def ensure_review_tab(self) -> int:
+        """Cree `21_A_VERIFIER` s'il manque et renvoie son identifiant.
+
+        L'onglet entier est force en TEXTE. C'est volontaire et c'est le
+        coeur de la garantie : un montant douteux ecrit ici est une chaine
+        de caracteres, pas un nombre. Aucune somme, aucune formule de TVA
+        et aucune tuile du Dashboard ne peut le capter, meme par accident.
+        """
+        if TAB_REVIEW not in self.tabs():
+            self._gw.execute(
+                "GOOGLESHEETS_ADD_SHEET",
+                {"spreadsheet_id": self._sheet, "title": TAB_REVIEW,
+                 "force_unique": False},
+            )
+            self._write(f"{TAB_REVIEW}!A1:{REVIEW_LAST_COL}1", [REVIEW_HEADERS])
+            self._tabs_cache = None
+            try:
+                self._gw.execute(
+                    "GOOGLESHEETS_FORMAT_CELL",
+                    {
+                        "spreadsheet_id": self._sheet,
+                        "sheet_name": TAB_REVIEW,
+                        "range": f"A2:{REVIEW_LAST_COL}500",
+                        "number_format_type": "TEXT",
+                        "wrap_strategy": "CLIP",
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001 - format non bloquant
+                logger.warning("Format texte de %s non applique: %s", TAB_REVIEW, exc)
+            logger.info("Onglet %s cree (zone de quarantaine comptable)", TAB_REVIEW)
+        return self.sheet_id(TAB_REVIEW)
+
+    def write_review(self, entry: ReviewEntry) -> int:
+        """Ecrit - ou REECRIT - la ligne de quarantaine d'un document.
+
+        Idempotent par construction : un document deja present dans
+        l'onglet voit sa ligne mise a jour, jamais dupliquee. C'est
+        indispensable, car un document ecarte est reexamine a chaque cycle
+        Gmail.
+
+        Renvoie le numero de ligne ecrit.
+        """
+        sheet_id = self.ensure_review_tab()
+        existing = [
+            str(r[0]).strip() if r else ""
+            for r in self._read(f"{TAB_REVIEW}!A2:A2000")
+        ]
+        row_index = find_review_row(existing, entry.doc_key)
+        nouvelle = row_index == 0
+        if nouvelle:
+            row_index = len(existing) + 2
+        self._write(
+            f"{TAB_REVIEW}!A{row_index}:{REVIEW_LAST_COL}{row_index}",
+            [build_review_row(entry)],
+        )
+        self._paint_review_row(row_index)
+        self._explain_review_row(sheet_id, row_index, entry)
+        logger.info(
+            "Document %s %s dans %s ligne %d : %s",
+            entry.short_key, "ecrit" if nouvelle else "mis a jour",
+            TAB_REVIEW, row_index, entry.reasons[0] if entry.reasons else "anomalie",
+        )
+        return row_index
+
+    def _paint_review_row(self, row_index: int) -> None:
+        """Fond rouge de la ligne. Jamais bloquant : une couleur absente
+        ne doit pas empecher un document douteux d'etre signale."""
+        try:
+            self._gw.execute(
+                "GOOGLESHEETS_FORMAT_CELL",
+                {
+                    "spreadsheet_id": self._sheet,
+                    "sheet_name": TAB_REVIEW,
+                    "range": f"A{row_index}:{REVIEW_LAST_COL}{row_index}",
+                    "background_color": REVIEW_ROW_COLOR,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - la couleur n'est pas comptable
+            logger.warning(
+                "Fond rouge de %s!%d non applique: %s", TAB_REVIEW, row_index, exc
+            )
+
+    def _explain_review_row(
+        self, sheet_id: int, row_index: int, entry: ReviewEntry
+    ) -> None:
+        """Pose l'explication au survol de la cellule Anomalie.
+
+        La passerelle Composio n'expose PAS l'ecriture d'une note de
+        cellule native (`spreadsheets.batchUpdate` / `repeatCell.note`).
+        On utilise donc le seul mecanisme disponible qui affiche un texte
+        au survol : une regle de validation NON bloquante (`strict=False`)
+        dont le message d'aide porte le motif. Le detail complet reste de
+        toute facon lisible en clair dans la colonne I, qui n'a ni limite
+        de longueur ni dependance a ce mecanisme.
+        """
+        index = ord(COL_ANOMALY) - ord("A")
+        try:
+            self._gw.execute(
+                "GOOGLESHEETS_SET_DATA_VALIDATION_RULE",
+                {
+                    "spreadsheet_id": self._sheet,
+                    "sheet_id": sheet_id,
+                    "mode": "SET",
+                    "validation_type": "NOT_BLANK",
+                    "strict": False,
+                    "show_custom_ui": False,
+                    "input_message": build_tooltip(entry),
+                    "start_row_index": row_index - 1,
+                    "end_row_index": row_index,
+                    "start_column_index": index,
+                    "end_column_index": index + 1,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - l'infobulle n'est pas comptable
+            logger.warning(
+                "Infobulle de %s!%s%d non posee: %s",
+                TAB_REVIEW, COL_ANOMALY, row_index, exc,
             )
 
     # -- tiers -------------------------------------------------------------
@@ -563,7 +702,6 @@ class DocumentPipeline:
         *,
         attachment_id: str,
         source_url: str = "",
-        forced: bool = False,
         parent_attachment_id: str = "",
         parent_filename: str = "",
         local_path: str = "",
@@ -588,7 +726,7 @@ class DocumentPipeline:
         outcome = DocumentOutcome(doc_key=doc_key, filename=file.display_name)
 
         existing = store.get_document(self._db, doc_key)
-        if existing and existing["state"] in store.TERMINAL_STATES and not forced:
+        if existing and existing["state"] in store.TERMINAL_STATES:
             outcome.action = ACTION_DUPLICATE
             outcome.doc_type = existing["doc_type"] or UNKNOWN
             outcome.numero = existing["numero"]
@@ -691,14 +829,6 @@ class DocumentPipeline:
             receipt_matches=len(receipt_matches),
         )
         decision = decide(doc, context)
-        if forced and decision.action == ACTION_REVIEW:
-            # Le client a valide en connaissance de cause : on ecrit, en
-            # conservant la trace des motifs qui avaient bloque l'import.
-            logger.info(
-                "Ecriture forcee apres validation humaine (%s) : %s",
-                outcome.filename, "; ".join(decision.reasons),
-            )
-            decision = Decision(action=ACTION_AUTO, reasons=decision.reasons)
         outcome.action = decision.action
         outcome.reasons = list(decision.reasons)
         outcome.warnings = list(decision.warnings)
@@ -729,15 +859,34 @@ class DocumentPipeline:
         store.set_state(self._db, doc_key, store.VALIDATED)
         return self._write_document(
             outcome, doc, file, message, party, party_tab, route, receipt_matches, source_url,
-            resuming=resuming, existing=existing or {}, forced=forced,
+            resuming=resuming, existing=existing or {},
         )
 
     def _write_document(
         self, outcome, doc, file, message, party, party_tab, route, receipt_matches,
-        source_url, *, resuming: bool, existing: dict[str, Any], forced: bool = False,
+        source_url, *, resuming: bool, existing: dict[str, Any],
     ) -> DocumentOutcome:
         """Les ecritures proprement dites, chacune avec son point de reprise."""
         doc_key = outcome.doc_key
+
+        # Verrou final : on refuse d'ecrire ce qui ne doit pas l'etre, meme
+        # si on est arrive jusqu'ici. Un document recale ici n'est pas
+        # perdu - il part en quarantaine comme les autres.
+        try:
+            assert_writable(doc, party.party_id)
+        except NotWritable as exc:
+            logger.warning(
+                "Ecriture refusee pour %s (%s) : %s",
+                outcome.filename, doc_key[:12], exc,
+            )
+            outcome.action = ACTION_REVIEW
+            outcome.pending_review = True
+            outcome.reasons = list(outcome.reasons) + [str(exc)]
+            self._park(
+                outcome, doc, file, message, source_url, store.NEEDS_REVIEW,
+                payload=json.dumps({"reasons": outcome.reasons}, ensure_ascii=False),
+            )
+            return outcome
 
         # --- etape 1 : la ligne principale --------------------------------
         if resuming and existing.get("stable_id"):
@@ -751,7 +900,7 @@ class DocumentPipeline:
         else:
             try:
                 self._write_primary(
-                    outcome, doc, party, party_tab, route, receipt_matches, forced=forced
+                    outcome, doc, party, party_tab, route, receipt_matches
                 )
             except Exception as exc:  # noqa: BLE001
                 store.release_document(self._db, doc_key)
@@ -836,7 +985,7 @@ class DocumentPipeline:
         return outcome
 
     def _write_primary(
-        self, outcome, doc, party, party_tab, route, receipt_matches, *, forced: bool = False
+        self, outcome, doc, party, party_tab, route, receipt_matches
     ) -> None:
         """Ecrit la ligne principale, selon le type de document."""
         kind = doc.doc_type
@@ -965,6 +1114,50 @@ class DocumentPipeline:
         if not known.get("log_row"):
             log_row = self._safe_log(outcome, message)
             store.update_document(self._db, outcome.doc_key, log_row=log_row)
+        self._quarantine(outcome, message, known)
+
+    def _quarantine(
+        self,
+        outcome: DocumentOutcome,
+        message: dict[str, Any],
+        known: dict[str, Any],
+    ) -> None:
+        """Inscrit le document dans `21_A_VERIFIER`.
+
+        C'est desormais le SEUL aboutissement d'un document douteux : plus
+        de bouton, plus d'attente silencieuse. Le comptable voit la ligne
+        rouge, lit le motif, et corrige lui-meme.
+
+        L'ecriture est retentee tant qu'elle n'a pas abouti (`review_row`
+        vide), et sautee ensuite : un document deja en quarantaine ne doit
+        pas etre reecrit a chaque cycle Gmail.
+        """
+        if int(known.get("review_row") or 0):
+            return
+        entry = ReviewEntry(
+            doc_key=outcome.doc_key,
+            detected_at=_now_iso(),
+            type_label=outcome.type_label,
+            numero=outcome.numero or "",
+            tiers=outcome.tiers or "",
+            devise=outcome.devise or "",
+            montant_ht=outcome.montant_ht,
+            montant_tva=outcome.montant_tva,
+            montant_ttc=outcome.montant_ttc,
+            reasons=list(outcome.reasons),
+            drive_link=outcome.drive_link or "",
+            gmail_message_id=str(message.get("id") or message.get("messageId") or ""),
+            filename=outcome.filename,
+        )
+        try:
+            row_index = self.write_review(entry)
+        except Exception as exc:  # noqa: BLE001 - le cycle Gmail ne meurt jamais
+            logger.warning(
+                "Document %s non inscrit dans %s (reessai au prochain cycle): %s",
+                entry.short_key, TAB_REVIEW, exc,
+            )
+            return
+        store.update_document(self._db, outcome.doc_key, review_row=row_index)
 
     def _archive_for_review(
         self, file: DocumentFile, doc: ExtractedDocument, source_url: str, doc_key: str
@@ -1119,8 +1312,43 @@ class DocumentPipeline:
             logger.warning("Validation du statut non appliquee ligne %d: %s", row_index, exc)
 
     def write_invoice_lines(self, doc: ExtractedDocument, stable_id: str, tab: str) -> int:
+        """Ecrit les lignes de detail d'UNE facture, une seule fois.
+
+        Deux garde-fous, tous deux nes d'un incident reel : le bloc de
+        detail de FAC-V3-ACH-002 s'est retrouve avec une premiere ligne
+        appartenant a un autre document, ecrite sous le meme identifiant
+        comptable par un second ecrivain concurrent.
+
+        1. Idempotence : si des lignes existent deja pour cet identifiant,
+           on n'en ajoute pas d'autres. Un bloc partiel vaut mieux qu'un
+           bloc melange, et il est visible.
+        2. Coherence : on refuse d'ecrire un detail dont la somme
+           contredit le total HT de la facture. Un detail faux est pire
+           qu'un detail absent, parce qu'il a l'air juste.
+        """
         if not doc.lignes:
             return 0
+        deja = [
+            r for r in self._read(f"{LIGNES_TAB}!A2:A2000")
+            if r and str(r[0]).strip() == stable_id
+        ]
+        if deja:
+            logger.info(
+                "Lignes de detail de %s deja presentes (%d) : aucune reecriture",
+                stable_id, len(deja),
+            )
+            return 0
+        if doc.montant_ht is not None:
+            somme = sum(
+                (abs(l.total) for l in doc.lignes if l.total is not None),
+                Decimal("0"),
+            )
+            if somme and somme != abs(doc.montant_ht.value):
+                logger.warning(
+                    "Detail de %s non ecrit : somme des lignes %s != total HT %s",
+                    stable_id, somme, abs(doc.montant_ht.value),
+                )
+                return 0
         rows = [
             [
                 stable_id, tab, doc.numero or "", index,
@@ -1208,6 +1436,7 @@ class DocumentPipeline:
             type_enregistrement=outcome.type_label,
             avertissements=tuple(outcome.warnings),
             en_attente=outcome.pending_review,
+            devise=outcome.devise or "",
         )
         index = row_index or self.next_row(TAB_IMPORTS_LOG)
         self._write(f"{TAB_IMPORTS_LOG}!A{index}:F{index}", [row])

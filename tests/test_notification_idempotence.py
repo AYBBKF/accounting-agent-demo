@@ -214,17 +214,22 @@ def test_an_already_imported_document_writes_nothing_and_says_nothing(worker):
 
 # === 7. une vraie transition produit exactement une notification ==========
 
-def test_a_real_transition_waiting_to_completed_notifies_once(worker):
-    deliver(worker)
+def test_a_quarantined_document_is_announced_exactly_once(worker):
+    """Un document ecarte se signale une fois, puis se tait.
+
+    Il n'y a plus de transition "en attente -> valide" a annoncer : le
+    document reste ecarte tant que le comptable ne l'a pas traite. Ce qui
+    doit rester vrai, c'est qu'il ne reveille pas le client a chaque
+    cycle Gmail.
+    """
+    premier = deliver(worker)
+    assert premier, "la mise a l'ecart doit etre annoncee une fois"
+
     ligne = store.list_pending_review(worker._db_path, worker._chat_id)[0]
-
-    reponse = worker.confirm(ligne["doc_key"][:24])
-    assert "enregistre" in reponse.lower() or "deja" in reponse.lower()
-
     fiche = store.get_document(worker._db_path, ligne["doc_key"])
-    assert fiche["last_notified_state"] == NOTIFY_COMPLETED
-    # La transition a ete annoncee dans la reponse au bouton : le cycle
-    # suivant ne doit rien ajouter.
+    assert fiche["state"] == store.NEEDS_REVIEW
+
+    assert deliver(worker) == []
     assert deliver(worker) == []
 
 
