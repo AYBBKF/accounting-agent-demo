@@ -77,7 +77,13 @@ NOTIFY_REJECTED = "rejected"
 # normalement un manifeste, un README ou une somme de controle. Ce ne sont
 # pas des documents, leur presence n'est pas une anomalie.
 SILENT_REJECTIONS = (
+    # Membre de ZIP qui n'est ni PDF ni image (README, manifeste, CSV, somme
+    # de controle). Les deux libelles - avant et apres l'ajout des images -
+    # restent reconnus pour ne rien annoncer.
+    "n'est ni un PDF ni une image (signature invalide)",
     "n'est pas un PDF (signature invalide)",
+    # Piece jointe directe qui n'est ni document ni archive.
+    "piece jointe ignoree : ni PDF, ni image, ni archive ZIP",
     "piece jointe ignoree : ni PDF ni archive ZIP",
 )
 
@@ -368,16 +374,28 @@ class MailWorker:
             "GMAIL_FETCH_MESSAGE_BY_MESSAGE_ID", {"message_id": message_id, "format": "full"}
         )
 
+    # Extensions et types MIME des pieces jointes exploitables. Les images
+    # (facture photographiee) sont selectionnees comme les PDF : la decision
+    # finale PDF/image/ZIP se prend en aval sur la SIGNATURE binaire, mais le
+    # premier tri, cote Gmail, se fait sur le nom et le type annonce.
+    _KEEP_EXTENSIONS = (".pdf", ".zip", ".png", ".jpg", ".jpeg")
+    _KEEP_MIMES = frozenset({
+        "application/pdf",
+        "application/zip",
+        "application/x-zip-compressed",
+        "image/png",
+        "image/jpeg",
+        "image/jpg",
+    })
+
     @staticmethod
     def attachments_of(message: dict[str, Any]) -> list[dict[str, Any]]:
-        """Toutes les pieces jointes exploitables : PDF et archives ZIP."""
+        """Pieces jointes exploitables : PDF, archives ZIP et images (PNG/JPEG)."""
         keep = []
         for att in message.get("attachmentList") or []:
             name = str(att.get("filename") or "").lower()
             mime = str(att.get("mimeType") or "").lower()
-            if name.endswith(".pdf") or name.endswith(".zip") or mime in (
-                "application/pdf", "application/zip", "application/x-zip-compressed",
-            ):
+            if name.endswith(MailWorker._KEEP_EXTENSIONS) or mime in MailWorker._KEEP_MIMES:
                 keep.append(att)
         return keep
 

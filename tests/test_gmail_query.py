@@ -77,12 +77,29 @@ def test_the_query_interpreter_treats_braces_as_a_disjunction():
         (["facture.pdf", "pack.zip"], True),           # les deux
         (["a.pdf", "b.pdf", "lot.zip"], True),         # plusieurs pieces
         (["PACK.ZIP"], True),                          # extension en majuscules
+        (["facture.png"], True),                       # facture photographiee PNG
+        (["photo.jpg"], True),                         # facture photographiee JPG
+        (["scan.jpeg"], True),                         # facture photographiee JPEG
+        (["FACTURE.JPG"], True),                       # image en majuscules
+        (["achat.pdf", "recu.jpg"], True),             # PDF + photo dans un email
         (["note.txt"], False),                         # rien d'exploitable
+        (["logo.gif"], False),                         # image non prise en charge
         ([], False),                                   # aucune piece jointe
     ],
 )
-def test_the_deployed_query_selects_pdf_zip_or_both(filenames, expected):
+def test_the_deployed_query_selects_pdf_zip_image_or_any_mix(filenames, expected):
     assert gmail_query_matches(QUERY, filenames) is expected
+
+
+def test_the_old_query_would_have_missed_a_photographed_invoice():
+    """Garde-fou : une facture photographiee (PNG/JPG) doit desormais passer,
+    la ou l'ancienne requete PDF/ZIP seule la laissait invisible."""
+    ancienne = "in:inbox has:attachment {filename:pdf filename:zip}"
+    assert not gmail_query_matches(ancienne, ["facture.jpg"])
+    assert not gmail_query_matches(ancienne, ["facture.png"])
+    assert gmail_query_matches(QUERY, ["facture.jpg"])
+    assert gmail_query_matches(QUERY, ["facture.png"])
+    assert gmail_query_matches(QUERY, ["facture.jpeg"])
 
 
 def test_the_old_query_would_have_missed_a_zip_only_email():

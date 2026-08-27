@@ -960,6 +960,84 @@ def extract_from_pdf_bytes(
     return extract_document(pages, company=company, text_source=source)
 
 
+def read_image_text(data: bytes) -> str:
+    """OCR d'une image (facture photographiee), avec garde-fous.
+
+    Trois refus, tous par une erreur CLAIRE et non par un abandon silencieux,
+    pour que l'appelant inscrive une ligne tracable en quarantaine :
+      - une image trop grande (bombe de decompression) est refusee AVANT
+        d'etre ouverte en grand ;
+      - une image corrompue ou illisible leve ;
+      - un moteur OCR absent ou en echec leve.
+    """
+    try:
+        from PIL import Image  # type: ignore
+    except ImportError as exc:  # pragma: no cover - dependance manquante
+        raise DocumentExtractError(f"Dependance Pillow manquante: {exc}") from exc
+    import io
+
+    from app.attachments import MAX_IMAGE_PIXELS
+
+    # Plafonner Pillow AVANT tout decodage complet : une image piege ne doit
+    # jamais etre ouverte en grand.
+    # Pillow leve de lui-meme une DecompressionBombError au-dela de 2x ce
+    # plafond ; notre controle explicite couvre la zone entre le plafond et
+    # ce double. Les deux menent au MEME message clair (trop volumineuse),
+    # jamais au message generique d'image corrompue.
+    Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            width, height = img.size
+            if width * height > MAX_IMAGE_PIXELS:
+                raise DocumentExtractError(
+                    f"image trop volumineuse ({width}x{height} pixels, "
+                    f"plafond {MAX_IMAGE_PIXELS} pixels)"
+                )
+            img.load()
+            frame = img.convert("RGB")
+    except DocumentExtractError:
+        raise
+    except Image.DecompressionBombError as exc:
+        raise DocumentExtractError(
+            f"image trop volumineuse (bombe de decompression, plafond "
+            f"{MAX_IMAGE_PIXELS} pixels)"
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 - image corrompue / illisible
+        raise DocumentExtractError("image illisible ou corrompue.") from exc
+
+    try:
+        import pytesseract  # type: ignore
+    except ImportError as exc:  # pragma: no cover - dependance manquante
+        raise DocumentExtractError(f"Dependance pytesseract manquante: {exc}") from exc
+
+    # On vise le francais, mais un serveur ou le pack `fra` manque ne doit pas
+    # renvoyer TOUTES les images en quarantaine : on retombe alors sur `eng`,
+    # qui lit tout aussi bien les caracteres latins d'une facture. Seul un
+    # echec des DEUX est un vrai echec OCR.
+    last_error: Exception | None = None
+    for lang in ("fra+eng", "eng"):
+        try:
+            return pytesseract.image_to_string(frame, lang=lang)
+        except Exception as exc:  # noqa: BLE001 - langue absente ou moteur en echec
+            last_error = exc
+    raise DocumentExtractError("OCR de l'image en echec.") from last_error
+
+
+def extract_from_image_bytes(
+    data: bytes, *, company: str = "X BLASTE", ocr: bool = True
+) -> ExtractedDocument:
+    """Lit une facture photographiee (PNG/JPEG) par OCR, comme un PDF scanne.
+
+    Le texte OCR passe ENSUITE par le meme moteur de classification et
+    d'extraction que les PDF : memes controles comptables, meme seuil de
+    confiance, meme politique de quarantaine. Une image sans texte
+    exploitable leve `DocumentExtractError` et part en validation humaine
+    avec une raison tracable.
+    """
+    text = read_image_text(data)
+    return extract_document([text], company=company, text_source="ocr")
+
+
 # Un PDF scanne renvoie quelques caracteres parasites : on exige un minimum
 # de texte reel avant de considerer la couche native comme exploitable.
 _MIN_USABLE_CHARS = 120

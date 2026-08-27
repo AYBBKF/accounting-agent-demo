@@ -6,3 +6,10 @@ openpyxl==3.1.5
 python-dotenv==1.0.1
 httpx==0.28.1
 pypdf==5.1.0
+# OCR des factures photographiees (PNG/JPG/JPEG) et des PDF scannes. Sans le
+# binaire `tesseract-ocr` et `poppler-utils` (installes dans l'image Docker),
+# ces bibliotheques ne peuvent rien lire : une image sans OCR part alors en
+# quarantaine avec une raison claire, jamais en silence.
+Pillow==11.0.0
+pytesseract==0.3.13
+pdf2image==1.17.0

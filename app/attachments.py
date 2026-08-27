@@ -25,6 +25,21 @@ from dataclasses import dataclass, field
 
 PDF_MAGIC = b"%PDF"
 
+# Signatures binaires des images acceptees. Comme pour le PDF, une image se
+# reconnait a sa signature, jamais a son extension : un fichier renomme
+# ".pdf" mais porteur d'un en-tete PNG est traite comme une image, et
+# inversement. JPEG couvre aussi bien le JFIF que l'Exif (photo de telephone).
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+JPEG_MAGIC = b"\xff\xd8\xff"
+
+# Garde-fou anti-bombe de decompression pour les images : une image de
+# quelques kilo-octets peut se decompresser en centaines de millions de
+# pixels et epuiser la memoire. Toute image dont largeur x hauteur depasse
+# ce plafond est REFUSEE (ligne tracable en quarantaine), jamais ouverte en
+# grand. 40 Mpx laisse passer une photo 7360x5000 d'un reflex, tout en
+# fermant la porte aux images pieges.
+MAX_IMAGE_PIXELS = 40_000_000
+
 # Limites par defaut, surchargeables par la configuration.
 #
 # MAX_FILES est passe de 25 a 120 : un ZIP comptable mensuel de 38
@@ -125,6 +140,30 @@ def is_pdf(content: bytes) -> bool:
 
 def is_zip(content: bytes) -> bool:
     return content[:2] == b"PK"
+
+
+def is_image(content: bytes) -> bool:
+    """Une image PNG ou JPEG, reconnue a sa signature, jamais a son extension.
+
+    Une facture photographiee arrive comme une piece jointe image directe :
+    elle doit etre acceptee et OCRisee comme un PDF, pas ignoree.
+    """
+    return content[:8] == PNG_MAGIC or content[:3] == JPEG_MAGIC
+
+
+def content_mimetype(content: bytes) -> str:
+    """Type MIME reel d'un document, deduit de sa SIGNATURE.
+
+    Sert a l'archivage Drive : une image stockee sous `application/pdf`
+    donnerait un fichier illisible. Le type suit le contenu, jamais le nom.
+    """
+    if is_pdf(content):
+        return "application/pdf"
+    if content[:8] == PNG_MAGIC:
+        return "image/png"
+    if content[:3] == JPEG_MAGIC:
+        return "image/jpeg"
+    return "application/octet-stream"
 
 
 def idempotency_key(
@@ -237,8 +276,11 @@ def extract_pdfs_from_zip(
                 depth=depth + 1, report=report, member_prefix=f"{member_path}/",
             )
             continue
-        if not is_pdf(data):
-            report.reject(name, "n'est pas un PDF (signature invalide)")
+        # Un lot comptable mensuel peut melanger PDF et photos de factures
+        # dans la meme archive : les deux signatures sont acceptees, tout le
+        # reste est refuse par la signature, pas par l'extension.
+        if not (is_pdf(data) or is_image(data)):
+            report.reject(name, "n'est ni un PDF ni une image (signature invalide)")
             continue
 
         accepted += 1
@@ -258,10 +300,15 @@ def collect_documents(
     report = ExtractionReport()
     if is_zip(content):
         return extract_pdfs_from_zip(content, container=filename, limits=limits, report=report)
-    if is_pdf(content):
+    if is_pdf(content) or is_image(content):
+        # PDF comme image (facture photographiee) suivent la meme route :
+        # les octets ORIGINAUX sont conserves tels quels, donc l'empreinte
+        # sha256 et l'anti-doublon restent exacts. C'est l'extraction, en
+        # aval, qui choisit couche texte (PDF) ou OCR d'image selon la
+        # signature du contenu.
         report.files.append(DocumentFile(filename=filename, content=content, source="attachment"))
         return report
-    report.reject(filename, "piece jointe ignoree : ni PDF ni archive ZIP")
+    report.reject(filename, "piece jointe ignoree : ni PDF, ni image, ni archive ZIP")
     return report
 
 

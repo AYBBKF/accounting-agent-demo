@@ -100,11 +100,13 @@ class Settings(BaseSettings):
     # boite ; et l'anti-doublon par empreinte du fichier puis par
     # (identifiant du tiers + numero du document).
     #
-    # L'accolade forme un OU : `{filename:pdf filename:zip}` retient aussi
-    # bien un email ne portant que des PDF, qu'un email ne portant qu'une
-    # archive ZIP, que les deux a la fois. Sans elle, un pack envoye en ZIP
-    # seul n'etait jamais vu par le worker, alors meme que le code sait
-    # depuis toujours ouvrir les archives.
+    # L'accolade forme un OU : `{filename:pdf filename:zip filename:png
+    # filename:jpg filename:jpeg}` retient aussi bien un email ne portant
+    # que des PDF, qu'un email ne portant qu'une archive ZIP, qu'un email ne
+    # portant qu'une facture PHOTOGRAPHIEE (PNG/JPG/JPEG), ou n'importe quelle
+    # combinaison. Sans elle, un pack envoye en ZIP seul, ou une photo de
+    # facture seule, n'etait jamais vu par le worker, alors meme que le code
+    # sait ouvrir les archives et, desormais, ocreiser les images.
     gmail_watch_enabled: bool = Field(default=True, alias="GMAIL_WATCH_ENABLED")
     gmail_watch_chat_id: int = Field(default=0, alias="GMAIL_WATCH_CHAT_ID")
     # Long polling Telegram. A desactiver UNIQUEMENT pour un conteneur de
@@ -116,7 +118,10 @@ class Settings(BaseSettings):
         default=True, alias="TELEGRAM_POLLING_ENABLED"
     )
     gmail_watch_query: str = Field(
-        default="in:inbox has:attachment {filename:pdf filename:zip}",
+        default=(
+            "in:inbox has:attachment "
+            "{filename:pdf filename:zip filename:png filename:jpg filename:jpeg}"
+        ),
         alias="GMAIL_WATCH_QUERY",
     )
     gmail_watch_interval_seconds: int = Field(default=60, alias="GMAIL_WATCH_INTERVAL_SECONDS")

@@ -73,7 +73,10 @@ def test_the_gmail_query_no_longer_requires_the_subject_marker():
     # Le client a explicitement autorise l'elargissement : c'est desormais le
     # contenu du document qui decide de son type.
     settings = Settings(_env_file=None)
-    assert settings.gmail_watch_query == "in:inbox has:attachment {filename:pdf filename:zip}"
+    assert settings.gmail_watch_query == (
+        "in:inbox has:attachment "
+        "{filename:pdf filename:zip filename:png filename:jpg filename:jpeg}"
+    )
     assert "XBLASTE" not in settings.gmail_watch_query
     assert "subject:" not in settings.gmail_watch_query
 
@@ -88,6 +91,15 @@ def test_the_gmail_query_covers_zip_archives_as_well_as_pdf():
     assert "filename:pdf" in query
     assert "filename:zip" in query
     assert "{" in query and "}" in query, "sans accolade, Gmail exigerait les DEUX extensions"
+
+
+def test_the_gmail_query_covers_photographed_invoices():
+    """Une facture photographiee arrive en PNG/JPG/JPEG : la requete doit la
+    ramener, sinon l'OCR d'image le plus soigne ne verrait jamais l'email."""
+    query = Settings(_env_file=None).gmail_watch_query
+    assert "filename:png" in query
+    assert "filename:jpg" in query
+    assert "filename:jpeg" in query
 
 
 def test_the_gmail_query_stays_overridable_by_environment():

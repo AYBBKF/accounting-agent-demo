@@ -26,9 +26,13 @@ from decimal import Decimal
 from typing import Any, Callable, Protocol
 
 from app import doc_store as store
-from app.attachments import DocumentFile, idempotency_key
+from app.attachments import DocumentFile, content_mimetype, idempotency_key, is_image
 from app.business_key import business_identity
-from app.doc_extract import ExtractedDocument, extract_from_pdf_bytes
+from app.doc_extract import (
+    ExtractedDocument,
+    extract_from_image_bytes,
+    extract_from_pdf_bytes,
+)
 from app.doc_policy import (
     NotWritable,
     assert_writable,
@@ -703,7 +707,7 @@ class DocumentPipeline:
         args: dict[str, Any] = {
             "source_url": source_url,
             "name": file.filename,
-            "mime_type": "application/pdf",
+            "mime_type": content_mimetype(file.content) if file.content else "application/pdf",
         }
         if target:
             args["parent_folder_id"] = target
@@ -721,9 +725,10 @@ class DocumentPipeline:
         upload = getattr(self._gw, "upload", None)
         if upload is None:
             return ""
+        mimetype = content_mimetype(file.content)
         try:
             key = upload(
-                name=file.filename, mimetype="application/pdf", content=file.content
+                name=file.filename, mimetype=mimetype, content=file.content
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Depot du contenu de %s impossible: %s", file.display_name, exc)
@@ -733,7 +738,7 @@ class DocumentPipeline:
         args: dict[str, Any] = {
             "file_to_upload": {
                 "name": file.filename,
-                "mimetype": "application/pdf",
+                "mimetype": mimetype,
                 "s3key": key,
             }
         }
@@ -890,9 +895,18 @@ class DocumentPipeline:
                 return self._attach_to_twin(outcome, twin)
 
         # --- extraction ---------------------------------------------------
+        # PDF et image partagent la meme suite : seule la PORTE d'entree
+        # differe (couche texte du PDF, ou OCR de l'image), choisie sur la
+        # signature du contenu et non sur l'extension. Tout ce qui suit -
+        # controles comptables, seuil de confiance, quarantaine - est
+        # identique. Une image illisible tombe dans le meme `except` qu'un
+        # PDF illisible et laisse donc, elle aussi, une ligne rouge tracable.
         try:
-            doc = extract_from_pdf_bytes(file.content, company=self._company)
-        except Exception as exc:  # noqa: BLE001 - PDF illisible
+            if is_image(file.content):
+                doc = extract_from_image_bytes(file.content, company=self._company)
+            else:
+                doc = extract_from_pdf_bytes(file.content, company=self._company)
+        except Exception as exc:  # noqa: BLE001 - PDF/image illisible
             # Un document illisible n'est pas un document perdu. Il laisse
             # UNE ligne rouge, comme toute piece que le bot refuse de
             # comptabiliser : sans elle, le comptable ne saurait jamais
