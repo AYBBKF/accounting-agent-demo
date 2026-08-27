@@ -134,22 +134,27 @@ def test_a_clean_invoice_is_imported_without_any_button(worker):
 
 # === 2. ICE manquant seul : import automatique avec avertissement =========
 
-def test_a_missing_ice_alone_never_asks_anything(worker):
+def test_a_supplier_invoice_without_ice_goes_to_quarantine(worker):
+    """CONTRAT INVERSE, cote worker.
+
+    Ce test affirmait qu'une facture sans ICE ne demandait rien. La regle
+    a change : cote fournisseur, l'ICE conditionne la deductibilite de la
+    TVA, donc l'ecriture. Le document part en quarantaine - il n'est ni
+    perdu, ni comptabilise, et le motif est ecrit noir sur blanc.
+
+    Ce qui NE change pas, et que ce test garde : aucun bouton, aucune
+    demande de validation. La quarantaine n'est pas une file d'attente.
+    """
     worker.add_message(
         "m1", internal_date=worker.moment(),
         attachments={"sans-ice.pdf": pdf_bytes(SANS_ICE)},
     )
     summary = worker.process_once()[0]
 
-    assert summary.to_review == []
-    outcome = summary.imported[0]
-    assert outcome.action == ACTION_AUTO
-    assert any("ICE absent" in w for w in outcome.warnings)
-    created = worker.workbook.rows("03_FOURNISSEURS")[-1]
-    assert created[1] == "EXPRESS SERVICE" and created[2] == "A completer"
-
-
-# === 3. HT + TVA != TTC : validation reellement demandee ==================
+    assert len(summary.to_review) == 1
+    motifs = " | ".join(summary.to_review[0].reasons)
+    assert "ICE exploitable" in motifs
+    assert worker.workbook.writes_to("05_FACTURES_ACHATS") == []
 
 def test_an_amount_contradiction_asks_for_a_decision(worker):
     worker.add_message(
