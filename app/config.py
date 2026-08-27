@@ -107,6 +107,14 @@ class Settings(BaseSettings):
     # depuis toujours ouvrir les archives.
     gmail_watch_enabled: bool = Field(default=True, alias="GMAIL_WATCH_ENABLED")
     gmail_watch_chat_id: int = Field(default=0, alias="GMAIL_WATCH_CHAT_ID")
+    # Long polling Telegram. A desactiver UNIQUEMENT pour un conteneur de
+    # verification qui partage le jeton du bot de production : deux
+    # long-pollers sur un meme jeton se disputent getUpdates (409) et
+    # casseraient la production. L'ENVOI de messages, lui, ne conflicte
+    # pas ; il reste actif.
+    telegram_polling_enabled: bool = Field(
+        default=True, alias="TELEGRAM_POLLING_ENABLED"
+    )
     gmail_watch_query: str = Field(
         default="in:inbox has:attachment {filename:pdf filename:zip}",
         alias="GMAIL_WATCH_QUERY",

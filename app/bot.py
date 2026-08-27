@@ -842,10 +842,21 @@ async def main() -> None:
     bot = Bot(token=settings.telegram_bot_token)
     dp = build_dispatcher()
 
-    asyncio.create_task(_heartbeat_loop())
-    asyncio.create_task(_gmail_watch_loop(bot))
-    logger.info("Demarrage du bot de demo (long polling).")
-    await dp.start_polling(bot)
+    heartbeat = asyncio.create_task(_heartbeat_loop())
+    gmail = asyncio.create_task(_gmail_watch_loop(bot))
+    if settings.telegram_polling_enabled:
+        logger.info("Demarrage du bot de demo (long polling).")
+        await dp.start_polling(bot)
+    else:
+        # Mode verification : le worker Gmail et le heartbeat tournent, les
+        # ENVOIS Telegram restent possibles, mais aucun getUpdates n'est
+        # emis - deux long-pollers sur un meme jeton se disputeraient la
+        # file (409) et casseraient l'instance de production.
+        logger.info(
+            "Demarrage du bot de demo SANS long polling Telegram "
+            "(TELEGRAM_POLLING_ENABLED=false) : worker Gmail seul."
+        )
+        await asyncio.gather(heartbeat, gmail)
 
 
 if __name__ == "__main__":
