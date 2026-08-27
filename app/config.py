@@ -32,6 +32,11 @@ class Settings(BaseSettings):
     db_path: str = Field(default="/app/data/demo.db", alias="DB_PATH")
     default_vat_rate: Decimal = Field(default=Decimal("20.0"), alias="DEFAULT_VAT_RATE")
     vat_rates_available: str = Field(default="0,7,10,20", alias="VAT_RATES_AVAILABLE")
+    # Limites de depaquetage ZIP. Seul le NOMBRE de fichiers est
+    # remonte ; le volume total reste a 60 Mo, ce qui borne la bombe
+    # de decompression independamment du nombre de membres.
+    zip_max_files: int = Field(default=120, alias="ZIP_MAX_FILES")
+    zip_max_total_mb: int = Field(default=60, alias="ZIP_MAX_TOTAL_MB")
     reconciliation_window_days: int = Field(default=5, alias="RECONCILIATION_WINDOW_DAYS")
     reconciliation_amount_tolerance: Decimal = Field(
         default=Decimal("0.01"), alias="RECONCILIATION_AMOUNT_TOLERANCE"
@@ -118,6 +123,19 @@ class Settings(BaseSettings):
         if not raw:
             return set()
         return {int(x.strip()) for x in raw.split(",") if x.strip()}
+
+    def zip_limits(self) -> "ZipLimits":
+        """Limites de depaquetage effectives, protections comprises.
+
+        Profondeur, ratio de compression et taille unitaire ne sont PAS
+        configurables : ce sont des protections, pas des reglages.
+        """
+        from app.attachments import ZipLimits
+
+        return ZipLimits(
+            max_files=int(self.zip_max_files),
+            max_total_bytes=int(self.zip_max_total_mb) * 1024 * 1024,
+        )
 
     def vat_rates(self) -> list[Decimal]:
         return [Decimal(x.strip()) for x in self.vat_rates_available.split(",") if x.strip()]

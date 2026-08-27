@@ -26,7 +26,16 @@ from dataclasses import dataclass, field
 PDF_MAGIC = b"%PDF"
 
 # Limites par defaut, surchargeables par la configuration.
-MAX_FILES = 25
+#
+# MAX_FILES est passe de 25 a 120 : un ZIP comptable mensuel de 38
+# pieces etait tronque en silence a 25, et les 13 documents restants
+# n'ont jamais ete lus. La marge tient compte des envois annuels.
+#
+# MAX_TOTAL_BYTES reste DELIBEREMENT a 60 Mo. Relever le nombre de
+# fichiers sans relever le volume total garde la protection anti-bombe
+# exactement aussi serree qu'avant : 120 fichiers ne peuvent toujours
+# pas depasser 60 Mo decompresses.
+MAX_FILES = 120
 MAX_FILE_BYTES = 15 * 1024 * 1024
 MAX_TOTAL_BYTES = 60 * 1024 * 1024
 MAX_DEPTH = 2
@@ -91,9 +100,18 @@ class ExtractionReport:
 
     files: list[DocumentFile] = field(default_factory=list)
     rejected: list[tuple[str, str]] = field(default_factory=list)
+    # Nombre de fichiers ECARTES par la seule limite de comptage. Compte a
+    # part, parce que ce rejet-la n'est pas de meme nature que les autres :
+    # le document etait valide, il a juste ete refuse par un plafond. Le
+    # noyer parmi les rejets ordinaires est ce qui l'a rendu invisible.
+    truncated: int = 0
 
     def reject(self, name: str, reason: str) -> None:
         self.rejected.append((name, reason))
+
+    def reject_over_limit(self, name: str, limit: int) -> None:
+        self.truncated += 1
+        self.rejected.append((name, f"limite de {limit} fichiers atteinte"))
 
 
 def sha256_of(content: bytes) -> str:
@@ -178,7 +196,7 @@ def extract_pdfs_from_zip(
             continue
         name = info.filename
         if accepted >= limits.max_files:
-            report.reject(name, f"limite de {limits.max_files} fichiers atteinte")
+            report.reject_over_limit(name, limits.max_files)
             continue
         if not _is_safe_member_name(name):
             report.reject(name, "chemin non sur (absolu, remontee ou lien)")
