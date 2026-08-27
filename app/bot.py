@@ -35,6 +35,7 @@ from app.agent_intent import LLMIntentRouter
 from app.auth import is_allowed_telegram_user
 from app.composio_connect import ComposioConnectError, ComposioConnectManager, SERVICES
 from app.config import settings
+from app.telegram_delivery import TelegramDeliveryError, send_text
 from app.db import (
     init_db,
     save_bank_lines,
@@ -141,6 +142,8 @@ mail_worker = MailWorker(
     company_name=settings.company_name,
     drive_folder=settings.drive_archive_folder,
     max_per_cycle=settings.gmail_watch_max_per_cycle,
+    zip_limits=settings.zip_limits(),
+    allowed_vat_rates=tuple(settings.vat_rates()),
 )
 
 SYNC_SHEET_BUTTON_TEXT = "Synchroniser Google Sheets"
@@ -281,6 +284,19 @@ class WhitelistMiddleware:
                 await event.answer("Acces refuse. Ce bot est prive.")
             return None
         return await handler(event, data)
+
+
+async def _reply_chunked(message: Any, text: str) -> None:
+    """Repond a une commande en decoupant si le texte est trop long.
+
+    `message.answer` ne prend pas de `chat_id` : on l'adapte a la signature
+    attendue par `send_text`, plutot que de dupliquer la logique de
+    decoupage et de reessai a deux endroits.
+    """
+    async def envoyer(*, chat_id: int, text: str) -> Any:  # noqa: ARG001
+        return await message.answer(text)
+
+    await send_text(envoyer, 0, text, label="reponse")
 
 
 def build_dispatcher() -> Dispatcher:
@@ -599,7 +615,7 @@ def build_dispatcher() -> Dispatcher:
             f"- En echec                   : {len(failed)}"
         )
         for outcome in waiting:
-            await message.answer(build_review_message(outcome))
+            await _reply_chunked(message, build_review_message(outcome))
             await asyncio.to_thread(mail_worker.mark_notified, outcome)
         for outcome in failed:
             await message.answer(f"{outcome.filename} : {outcome.error}")
@@ -631,7 +647,7 @@ def build_dispatcher() -> Dispatcher:
             f"Ils sont ecrits en rouge dans 21_A_VERIFIER."
         )
         for outcome in outcomes:
-            await message.answer(build_review_message(outcome))
+            await _reply_chunked(message, build_review_message(outcome))
             await asyncio.to_thread(mail_worker.mark_notified, outcome)
 
     @dp.message(Command("export"))
@@ -702,6 +718,87 @@ def build_dispatcher() -> Dispatcher:
     return dp
 
 
+async def deliver_summary(bot: Any, summary: Any) -> dict[str, Any]:
+    """Annonce UN email, et ne marque que ce qui a REELLEMENT ete delivre.
+
+    Le defaut corrige ici etait un mensonge d'etat. Quand l'envoi du
+    resume echouait, les documents importes ou classes etaient malgre tout
+    passes a `mark_notified` : le cycle suivant les croyait annonces et ne
+    les renvoyait jamais. Sheets et Drive avaient bouge, le client n'avait
+    rien recu, et plus rien ne le rattraperait.
+
+    `summary_delivered` est la preuve exigee. Il ne passe a True que
+    lorsque TOUS les morceaux du resume ont ete confirmes par Telegram.
+    Les documents ecartes de la comptabilite, eux, ont chacun leur propre
+    message et leur propre preuve : ils ne dependent pas du resume.
+
+    Rend un compte-rendu exploitable par un test comme par un journal.
+    """
+    rapport: dict[str, Any] = {
+        "message_id": summary.message_id,
+        "summary_delivered": False,
+        "marked": [],
+        "failed": [],
+    }
+    if not summary.should_notify:
+        rapport["skipped"] = True
+        return rapport
+
+    chat_id = settings.gmail_watch_chat_id
+    try:
+        morceaux = await send_text(
+            bot.send_message, chat_id, build_summary(summary), label="resume",
+        )
+        rapport["summary_delivered"] = bool(morceaux)
+    except TelegramDeliveryError as exc:
+        logger.error(
+            "Resume de l'email %s NON delivre (%s) : les documents importes "
+            "ou classes ne sont PAS marques notifies, ils seront reannonces "
+            "au prochain cycle.", summary.message_id, exc,
+        )
+        rapport["failed"].append(("resume", str(exc)))
+
+    # Chaque document ecarte porte sa propre preuve d'envoi. L'echec de
+    # l'un ne prive pas le client des autres, et ne marque que lui.
+    for outcome in summary.to_review:
+        try:
+            envoyes = await send_text(
+                bot.send_message, chat_id,
+                build_review_message(outcome), label="document",
+            )
+        except TelegramDeliveryError as exc:
+            logger.error(
+                "Document %s non annonce (%s) : sera reessaye au prochain "
+                "cycle.", outcome.doc_key[:12], exc,
+            )
+            rapport["failed"].append((outcome.doc_key, str(exc)))
+            continue
+        await asyncio.to_thread(
+            mail_worker.mark_notified, outcome,
+            telegram_message_id=envoyes[0] if envoyes else 0,
+        )
+        rapport["marked"].append(outcome.doc_key)
+
+    # Les documents importes ou classes n'ont PAS de message a eux : c'est
+    # le resume qui les annonce. Sans resume delivre, ils n'ont ete
+    # annonces nulle part, et les marquer serait faux.
+    if rapport["summary_delivered"]:
+        for outcome in summary.notified_outcomes:
+            if outcome in summary.to_review:
+                continue
+            await asyncio.to_thread(mail_worker.mark_notified, outcome)
+            rapport["marked"].append(outcome.doc_key)
+
+    logger.info(
+        "Email %s traite : %d document(s), resume delivre=%s, %d marque(s) "
+        "notifie(s), %d en echec, %d sans changement",
+        summary.message_id, len(summary.outcomes),
+        rapport["summary_delivered"], len(rapport["marked"]),
+        len(rapport["failed"]), summary.silenced,
+    )
+    return rapport
+
+
 async def _gmail_watch_loop(bot: Bot) -> None:
     """Boucle de fond : interroge Gmail toutes les N secondes, importe les
     factures certaines et notifie le client. Les boutons de validation ne
@@ -721,36 +818,7 @@ async def _gmail_watch_loop(bot: Bot) -> None:
         try:
             summaries = await asyncio.to_thread(mail_worker.process_once)
             for summary in summaries:
-                if not summary.should_notify:
-                    continue
-                await bot.send_message(
-                    chat_id=settings.gmail_watch_chat_id, text=build_summary(summary)
-                )
-                # Un message dedie, avec boutons, pour CHAQUE document
-                # reellement ambigu - et pour eux seuls.
-                for outcome in summary.to_review:
-                    sent = await bot.send_message(
-                        chat_id=settings.gmail_watch_chat_id,
-                        text=build_review_message(outcome),
-                    )
-                    await asyncio.to_thread(
-                        mail_worker.mark_notified, outcome,
-                        telegram_message_id=getattr(sent, "message_id", 0) or 0,
-                    )
-                # L'etat notifie n'est enregistre qu'APRES un envoi reussi :
-                # un echec Telegram doit pouvoir etre retente, jamais etre
-                # confondu avec un message deja delivre.
-                for outcome in summary.notified_outcomes:
-                    if outcome in summary.to_review:
-                        continue
-                    await asyncio.to_thread(mail_worker.mark_notified, outcome)
-                logger.info(
-                    "Email %s traite : %d document(s), %d notifie(s), "
-                    "%d sans changement, %d a valider",
-                    summary.message_id, len(summary.outcomes),
-                    len(summary.notified_outcomes), summary.silenced,
-                    len(summary.to_review),
-                )
+                await deliver_summary(bot, summary)
         except MailWorkerError as exc:
             logger.warning("Cycle Gmail en echec: %s", exc)
         except Exception:  # noqa: BLE001 - la boucle ne doit jamais mourir

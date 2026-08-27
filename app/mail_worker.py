@@ -16,6 +16,7 @@ journalise ni renvoye dans un message.
 from __future__ import annotations
 
 import hashlib
+from decimal import Decimal
 import json
 import logging
 import os
@@ -63,6 +64,11 @@ NOTIFY_NEW = ""
 NOTIFY_COMPLETED = "completed"
 NOTIFY_WAITING = "waiting_validation"
 NOTIFY_SKIPPED = "skipped"
+
+# Nombre maximal de lignes de detail dans un resume Telegram. Au-dela,
+# on annonce le compte : le detail exhaustif vit dans 14_IMPORTS_LOG et
+# dans les journaux serveur, pas dans un message de conversation.
+MAX_DETAIL_LINES = 10
 NOTIFY_PARTIAL = "partial"
 NOTIFY_FAILED = "failed"
 NOTIFY_REJECTED = "rejected"
@@ -132,6 +138,9 @@ class MailSummary:
     # Rejets reellement dignes d'un message (les membres non-PDF d'un ZIP
     # sont ecartes en amont, silencieusement).
     notifiable_rejected: list[tuple[str, str]] = field(default_factory=list)
+    # Documents perdus par une limite de depaquetage. Toujours annonce,
+    # jamais silencieux : c'est une perte, pas un filtrage.
+    truncated: int = 0
     planned: bool = False
 
     def count(self, action: str) -> int:
@@ -189,6 +198,7 @@ class MailWorker:
         max_per_cycle: int = 5,
         zip_limits: ZipLimits | None = None,
         calendar_check: str = "",
+        allowed_vat_rates: tuple[Decimal, ...] | None = None,
     ) -> None:
         self._api_key = api_key
         self._chat_id = chat_id
@@ -200,6 +210,7 @@ class MailWorker:
         self._drive_folder = drive_folder
         self._max_per_cycle = max_per_cycle
         self._zip_limits = zip_limits or ZipLimits()
+        self._vat_rates = tuple(allowed_vat_rates) if allowed_vat_rates else ()
         self._client = None
         self._pipeline: DocumentPipeline | None = None
         self._startup_done = False
@@ -236,6 +247,7 @@ class MailWorker:
                 self, db_path=self._db_path, chat_id=self._chat_id,
                 spreadsheet_id=self._spreadsheet_id, company=self._company,
                 drive_root=self._drive_folder,
+                allowed_vat_rates=self._vat_rates or None,
             )
         return self._pipeline
 
@@ -537,6 +549,18 @@ class MailWorker:
                 continue
             report = collect_documents(name, content, limits=self._zip_limits)
             summary.rejected.extend(report.rejected)
+            if report.truncated:
+                # Une archive tronquee est une PERTE de documents, pas un
+                # rejet ordinaire. Elle etait auparavant diluee en une ligne
+                # par fichier ecarte, au milieu d'un resume deja trop long :
+                # personne ne la voyait. Elle a desormais son propre message,
+                # son propre niveau de journal, et un compte exact.
+                summary.truncated += report.truncated
+                logger.error(
+                    "Archive %s tronquee : %d document(s) NON traites "
+                    "(limite de %d fichiers). Aucun de ces documents n'a ete lu.",
+                    name, report.truncated, self._zip_limits.max_files,
+                )
             for file in report.files:
                 try:
                     summary.outcomes.append(
@@ -577,6 +601,14 @@ class MailWorker:
         silencieux = 0
         for outcome in summary.outcomes:
             fiche = store.get_document(self._db_path, outcome.doc_key) or {}
+            if str(fiche.get("superseded_by") or ""):
+                # Fichier deja connu, rattache a sa fiche canonique : rien
+                # n'a ete ecrit, rien n'a change. L'annoncer document par
+                # document reviendrait a envoyer trente-huit messages pour
+                # dire trente-huit fois "rien n'a bouge". Le compte figure
+                # dans le resume et dans les journaux ; c'est suffisant.
+                silencieux += 1
+                continue
             etat = notify_state_of(outcome, str(fiche.get("state") or ""))
             deja = str(fiche.get("last_notified_state") or "")
             if etat == deja:
@@ -948,10 +980,30 @@ def build_summary(summary: MailSummary) -> str:
         f"A valider                : {len(summary.to_review)}",
         f"En erreur                : {len(summary.errors) + len(summary.notified_rejected)}",
     ]
+    if summary.truncated:
+        # En TETE du resume, avant tout detail : une archive tronquee est
+        # une perte de documents, pas une ligne de plus dans une liste.
+        head.insert(1, "")
+        head.insert(
+            2,
+            f"ATTENTION : {summary.truncated} document(s) de l'archive n'ont "
+            f"PAS ete lus (limite de fichiers atteinte).",
+        )
+
     body: list[str] = []
-    for outcome in summary.imported + summary.classified:
+    detailles = summary.imported + summary.classified
+    # Resume COMPACT : au-dela de ce seuil, on donne le compte et non la
+    # liste. Un email de 38 documents produisait un message que Telegram
+    # refusait, et l'echec faisait tout disparaitre - resume compris.
+    for outcome in detailles[:MAX_DETAIL_LINES]:
         body.append("")
         body.append(format_outcome(outcome))
+    if len(detailles) > MAX_DETAIL_LINES:
+        body.append("")
+        body.append(
+            f"... et {len(detailles) - MAX_DETAIL_LINES} autre(s) document(s) "
+            f"importe(s) ou classe(s). Detail complet dans 14_IMPORTS_LOG."
+        )
     for outcome in summary.notified_outcomes:
         if outcome.action == ACTION_DUPLICATE:
             body.append("")
@@ -965,9 +1017,13 @@ def build_summary(summary: MailSummary) -> str:
             body.append(
                 f"{outcome.filename} : type non reconnu. Depose dans Drive / A verifier."
             )
-    for name, reason in summary.notified_rejected:
+    rejets = summary.notified_rejected
+    for name, reason in rejets[:MAX_DETAIL_LINES]:
         body.append("")
         body.append(f"{name} : ignore ({reason})")
+    if len(rejets) > MAX_DETAIL_LINES:
+        body.append("")
+        body.append(f"... et {len(rejets) - MAX_DETAIL_LINES} autre(s) rejet(s).")
     return f"{NL}".join(head + body)
 
 
