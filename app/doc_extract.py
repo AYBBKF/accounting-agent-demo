@@ -55,7 +55,14 @@ _PURE_AMOUNT_RE = re.compile(
 )
 _DATE_RE = re.compile(r"\b(\d{2})[/\-.](\d{2})[/\-.](\d{4})\b")
 _ISO_DATE_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
-_ICE_RE = re.compile(r"\bICE\s*:?\s*([0-9]{6,20})\b", re.I)
+# L'ICE (identifiant commun d'entreprise, 15 chiffres au Maroc) peut etre
+# etiquete de plusieurs facons sur une VRAIE facture : "ICE : 00234...",
+# mais aussi "ICE fournisseur : 00234..." ou "ICE client : 00345...". On
+# tolere donc un qualificatif (mot + separateurs) entre "ICE" et le nombre,
+# sur la MEME ligne (pas de saut de ligne), sans jamais traverser vers un
+# autre nombre. Les factures synthetiques n'utilisaient que "ICE :", ce qui
+# masquait ce trou face aux factures reelles.
+_ICE_RE = re.compile(r"\bICE\b[^\d\n]{0,25}?([0-9]{8,20})\b", re.I)
 
 
 @dataclass
