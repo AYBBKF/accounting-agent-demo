@@ -68,3 +68,31 @@ def test_a_failed_write_is_attempted_exactly_once(gateway):
     with pytest.raises(MailWorkerError):
         _run(gw, "GOOGLESHEETS_VALUES_UPDATE")
     assert len(gw.calls) == 1
+
+
+def test_a_rate_limit_is_not_retried(monkeypatch):
+    """Insister pendant la fenetre de quota la repousse : on sort tout de suite."""
+    from app.mail_worker import MailWorker, RateLimited
+
+    monkeypatch.setattr("app.mail_worker.time.sleep", lambda _s: None)
+
+    class Limited:
+        def __init__(self):
+            self.calls = []
+
+        def _execute_once(self, slug, arguments):
+            self.calls.append(slug)
+            raise RateLimited("Quota atteint.")
+
+    gw = Limited()
+    with pytest.raises(RateLimited):
+        MailWorker.execute(gw, "GOOGLESHEETS_BATCH_GET", {})
+    assert len(gw.calls) == 1
+
+
+def test_rate_limit_messages_are_recognised():
+    from app.mail_worker import looks_rate_limited
+
+    assert looks_rate_limited("HTTP 429: User-rate limit exceeded.  Retry after 2026-08-28T00:32:45Z")
+    assert looks_rate_limited("Quota exceeded for quota metric")
+    assert not looks_rate_limited("Requested entity was not found")

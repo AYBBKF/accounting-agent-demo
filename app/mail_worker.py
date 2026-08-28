@@ -125,6 +125,10 @@ def is_silent_rejection(reason: str) -> bool:
     return any(motif in reason for motif in SILENT_REJECTIONS)
 
 
+class MailWorkerError(RuntimeError):
+    """Erreur destinee aux logs / au client, jamais porteuse de secret."""
+
+
 # Reprise des appels de LECTURE uniquement (voir MailWorker.execute).
 _READ_RETRY_ATTEMPTS = 3
 _READ_RETRY_BACKOFF_SECONDS = 2.0
@@ -149,8 +153,20 @@ def is_retryable_read(slug: str) -> bool:
     return slug in _RETRYABLE_READ_SLUGS
 
 
-class MailWorkerError(RuntimeError):
-    """Erreur destinee aux logs / au client, jamais porteuse de secret."""
+class RateLimited(MailWorkerError):
+    """Quota de l'API atteint : reessayer tout de suite est contre-productif."""
+
+
+def looks_rate_limited(reason: str) -> bool:
+    """L'API annonce-t-elle un quota atteint ?
+
+    Le fournisseur repond "HTTP 429: User-rate limit exceeded. Retry after
+    <date>". Chaque nouvel appel repousse cette date : insister pendant la
+    fenetre de blocage EMPECHE le quota de se liberer. On sort donc
+    immediatement, et le cycle suivant retentera plus tard.
+    """
+    bas = (reason or "").lower()
+    return "429" in bas or "rate limit" in bas or "quota" in bas
 
 
 @dataclass
@@ -322,6 +338,9 @@ class MailWorker:
         for attempt in range(1, attempts + 1):
             try:
                 return self._execute_once(slug, arguments)
+            except RateLimited:
+                # Quota atteint : ne PAS consommer les tentatives restantes.
+                raise
             except MailWorkerError as exc:
                 last = exc
                 if attempt >= attempts:
@@ -348,10 +367,12 @@ class MailWorker:
         if not result.get("successful", False):
             # Le motif rendu par l'API est journalise : sans lui, un quota
             # depasse et une erreur de droits etaient indiscernables.
+            reason = str(result.get("error") or "")
             logger.warning(
-                "Outil '%s' en echec (user=%s): %s",
-                slug, self.user_id, str(result.get("error") or "")[:200],
+                "Outil '%s' en echec (user=%s): %s", slug, self.user_id, reason[:200],
             )
+            if looks_rate_limited(reason):
+                raise RateLimited(f"Quota atteint sur '{slug}'.")
             raise MailWorkerError(f"L'outil '{slug}' a echoue.")
         return result.get("data") or {}
 
