@@ -276,11 +276,81 @@ def strip_label(raw: str, label: str) -> str:
     return remainder
 
 
+# Intitules de COLONNE reconnus. La lecture par colonne n'est tentee que sur
+# ces cellules-la : se contenter de "ligne sans chiffre" prenait la VALEUR
+# d'un libelle pour un en-tete ("Facture d'origine" / "NON PRECISEE") et
+# rattachait l'avoir a un montant au lieu d'une facture.
+_TABLE_HEADER_CELLS = frozenset({
+    "NUMERO", "NUMERO DE FACTURE", "NUMERO DE PIECE", "NO", "N",
+    "DATE", "DATE DE FACTURE", "DATE DU DOCUMENT", "DATE D'EMISSION",
+    "ECHEANCE", "DATE D'ECHEANCE", "DATE LIMITE DE PAIEMENT",
+    "REFERENCE", "LIBELLE", "LIBELLE / REFERENCE", "DEBIT", "CREDIT",
+    "INVOICE NUMBER", "INVOICE DATE", "DUE DATE",
+})
+
+
+def _header_run(lines: list[Line], index: int) -> list[int]:
+    """Bloc contigu de cellules d'EN-TETE auquel appartient `index`.
+
+    Une cellule d'en-tete est une ligne dont le texte normalise est un
+    intitule de colonne CONNU. Le bloc s'arrete a la premiere ligne qui n'en
+    est pas un : les valeurs commencent la.
+    """
+    def is_header(k: int) -> bool:
+        text = lines[k].text.strip()
+        return bool(text) and normalize(text) in _TABLE_HEADER_CELLS
+
+    if not is_header(index):
+        return []
+    start = index
+    while start - 1 >= 0 and is_header(start - 1):
+        start -= 1
+    end = index
+    while end + 1 < len(lines) and is_header(end + 1):
+        end += 1
+    return list(range(start, end + 1))
+
+
+def column_table_value(lines: list[Line], index: int) -> tuple[str, int] | None:
+    """Valeur d'un en-tete de tableau dispose en COLONNES.
+
+    Mise en page tres courante des factures reelles : une ligne par cellule
+    d'en-tete, puis une ligne par cellule de valeur.
+
+        NUMERO / DATE / ECHEANCE
+        F2026-1101 / 15/08/2026 / 15/09/2026
+
+    Le libelle et sa valeur ne sont donc PAS voisins : ils sont separes par
+    les autres en-tetes. Lire "la ligne suivante" rendait ECHEANCE comme date
+    du document, et la facture partait en quarantaine "date illisible" alors
+    que la date etait parfaitement lisible.
+
+    On n'applique la lecture par colonne que si l'en-tete compte AU MOINS
+    deux cellules (un vrai tableau) et si le bloc de valeurs qui suit a
+    exactement la meme largeur. Sinon on ne devine rien.
+    """
+    header = _header_run(lines, index)
+    if len(header) < 2:
+        return None
+    values: list[Line] = []
+    for line in lines[header[-1] + 1:]:
+        if not line.text.strip():
+            continue
+        values.append(line)
+        if len(values) == len(header):
+            break
+    if len(values) != len(header):
+        return None
+    chosen = values[header.index(index)]
+    return chosen.text.strip(), chosen.page
+
+
 def value_after(lines: list[Line], label: str) -> tuple[str, int] | None:
     """Valeur associee a un libelle, avec la page ou elle a ete trouvee.
 
-    Gere les deux mises en page rencontrees : "Libelle : valeur" et
-    "Libelle" seul avec la valeur sur la ligne suivante non vide.
+    Gere les trois mises en page rencontrees : "Libelle : valeur",
+    "Libelle" seul avec la valeur sur la ligne suivante, et le tableau en
+    colonnes (en-tetes groupes, puis valeurs groupees).
     """
     target = normalize(label)
     for i, line in enumerate(lines):
@@ -290,6 +360,9 @@ def value_after(lines: list[Line], label: str) -> tuple[str, int] | None:
         remainder = strip_label(line.text, label)
         if remainder:
             return remainder, line.page
+        column = column_table_value(lines, i)
+        if column is not None:
+            return column
         for nxt in lines[i + 1:]:
             if nxt.text.strip():
                 return nxt.text.strip(), nxt.page
@@ -411,9 +484,16 @@ def party(lines: list[Line], labels: tuple[str, ...]) -> tuple[str | None, str |
                 if m:
                     ice = m.group(1)
                     break
-                if any(normalize(nxt.text).startswith(normalize(l)) for l in
-                       ("CLIENT", "FOURNISSEUR", "EMETTEUR", "ACHETEUR", "IMPORTER",
-                        "BENEFICIAIRE", "EXPORTER")):
+                # On s'arrete au bloc SUIVANT, reconnu par une ligne qui est
+                # le libelle de role lui-meme. Un simple `startswith` coupait
+                # la recherche sur la raison sociale du tiers quand elle
+                # commence par ce mot ("CLIENT NOVA SARL") : l'ICE, ecrit
+                # deux lignes plus bas, n'etait alors jamais lu.
+                voisin = normalize(nxt.text)
+                if any(voisin == normalize(l) or voisin.startswith(normalize(l) + " :")
+                       or voisin.startswith(normalize(l) + ":")
+                       for l in ("CLIENT", "FOURNISSEUR", "EMETTEUR", "ACHETEUR",
+                                 "IMPORTER", "BENEFICIAIRE", "EXPORTER")):
                     break
             return (name or None), ice, line.page
     return None, None, 1
@@ -513,13 +593,21 @@ def extract_vat(lines: list[Line]) -> tuple[Decimal | None, Amount | None]:
     rate: Decimal | None = None
     amount: Amount | None = None
     for i, line in enumerate(lines):
-        m = re.match(r"^TVA\s*(\d+(?:[.,]\d+)?)\s*%\s*(.*)$", line.norm)
+        # La ligne de TVA est reconnue par sa FORME ("TVA ... %"), pas par la
+        # syntaxe du taux. Un taux illisible ("TVA 2E+1 %", taux barre,
+        # scanne de travers) ne doit pas faire disparaitre la ligne entiere :
+        # sinon le MONTANT de TVA n'est plus lu, le controle
+        # "HT + TVA = TTC" ne s'execute plus, et une facture aux totaux
+        # incoherents passe en comptabilite sans etre vue. On lit donc le
+        # montant meme quand le taux reste inconnu.
+        m = re.match(r"^TVA\b(?P<taux>[^%\d]*(?:\d[^%]*)?)%(?P<reste>.*)$", line.norm)
         if not m:
             continue
-        parsed_rate = parse_money(m.group(1))
+        candidat = (m.group("taux") or "").strip()
+        parsed_rate = parse_money(candidat) if re.fullmatch(r"\d+(?:[.,]\d+)?", candidat) else None
         if parsed_rate:
             rate = parsed_rate[0]
-        trailing = m.group(2)
+        trailing = m.group("reste")
         if re.search(r"\d", trailing):
             parsed = parse_money(trailing)
             if parsed:
@@ -536,6 +624,11 @@ def extract_vat(lines: list[Line]) -> tuple[Decimal | None, Amount | None]:
         break
     if amount is None:
         amount = amount_after(lines, "TVA")
+        if amount is not None and "%" in (amount.label or ""):
+            # La ligne relue porte un pourcentage : c'est le TAUX, pas un
+            # montant. Le retenir donnait une TVA de 1,00 MAD et fabriquait
+            # un faux ecart "HT + TVA != TTC" sur des factures saines.
+            amount = None
         if amount is not None and rate is not None and abs(amount.value) == rate:
             # On a relu le taux, pas un montant : on prefere ne rien affirmer.
             amount = None
@@ -663,6 +756,8 @@ REQUIRED_FIELDS = {
 _NUMBER_LABELS = (
     "Numero de facture", "Numero du recu", "Numero d'avoir", "Numero de devis",
     "Numero de commande", "Numero export", "Invoice number", "Numero de bon",
+    # En-tete de tableau nu ("NUMERO"), avant le tres generique "Reference".
+    "Numero", "No de facture", "N de facture", "Facture no",
     "Reference",
 )
 _DATE_LABELS = (
@@ -804,9 +899,21 @@ def extract_document(
     kind = classification.doc_type
 
     # --- identite -------------------------------------------------------
-    numero = _first_value(lines, _NUMBER_LABELS)
-    if numero:
-        doc.numero = numero[0].split()[0] if numero[0] else None
+    # Un numero doit RESSEMBLER a une reference. Sans ce controle, le
+    # libelle generique "Reference" attrapait "Reference de paiement :
+    # F2026-1101" et, le libelle ne faisant qu'un mot, il restait "de
+    # paiement : F2026-1101" : la facture etait comptabilisee sous le
+    # numero "de". On essaie donc les libelles dans l'ordre et on retient
+    # le premier candidat exploitable.
+    doc.numero = None
+    for label in _NUMBER_LABELS:
+        found = value_after(lines, label)
+        if not found:
+            continue
+        candidate = (found[0].split() or [""])[0].strip(" .:;,")
+        if plausible_reference(candidate):
+            doc.numero = candidate
+            break
     found_date = _first_value(lines, _DATE_LABELS)
     doc.date_document = parse_date(found_date[0]) if found_date else None
     due = _first_value(lines, _DUE_LABELS)

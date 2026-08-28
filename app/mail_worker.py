@@ -15,6 +15,8 @@ journalise ni renvoye dans un message.
 """
 from __future__ import annotations
 
+import time
+
 import hashlib
 from decimal import Decimal
 import json
@@ -121,6 +123,30 @@ def notify_state_of(outcome: "DocumentOutcome", state: str = "") -> str:
 
 def is_silent_rejection(reason: str) -> bool:
     return any(motif in reason for motif in SILENT_REJECTIONS)
+
+
+# Reprise des appels de LECTURE uniquement (voir MailWorker.execute).
+_READ_RETRY_ATTEMPTS = 3
+_READ_RETRY_BACKOFF_SECONDS = 2.0
+
+# Un outil est retentable s'il ne modifie RIEN. La liste est explicite :
+# deduire "lecture" d'un nom serait un pari, et se tromper sur une ecriture
+# creerait des doublons comptables.
+_RETRYABLE_READ_SLUGS = frozenset({
+    "GOOGLESHEETS_BATCH_GET",
+    "GOOGLESHEETS_GET_SPREADSHEET_INFO",
+    "GOOGLESHEETS_GET_SHEET_NAMES",
+    "GOOGLEDRIVE_FIND_FOLDER",
+    "GMAIL_FETCH_EMAILS",
+    "GMAIL_FETCH_MESSAGE_BY_MESSAGE_ID",
+    "GMAIL_GET_ATTACHMENT",
+    "GOOGLECALENDAR_FIND_EVENT",
+})
+
+
+def is_retryable_read(slug: str) -> bool:
+    """Vrai si l'outil est une lecture sans effet de bord."""
+    return slug in _RETRYABLE_READ_SLUGS
 
 
 class MailWorkerError(RuntimeError):
@@ -280,7 +306,36 @@ class MailWorker:
         return self._client
 
     def execute(self, slug: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        """Appel Composio, isole par `user_id = telegram_<chat_id>`."""
+        """Appel Composio, isole par `user_id = telegram_<chat_id>`.
+
+        Les appels de LECTURE sont retentes : un lot de documents enchaine
+        des centaines de lectures Sheets en quelques secondes et l'API
+        repond alors ponctuellement en erreur (quota par minute). Sans
+        reprise, un simple hoquet de lecture faisait echouer le document
+        entier ("GOOGLESHEETS_BATCH_GET a echoue") alors que rien n'etait
+        anormal dans la piece. Les ECRITURES ne sont jamais retentees : une
+        ecriture donnee pour perdue peut avoir abouti, et la rejouer
+        creerait une seconde ligne comptable.
+        """
+        attempts = _READ_RETRY_ATTEMPTS if is_retryable_read(slug) else 1
+        last: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                return self._execute_once(slug, arguments)
+            except MailWorkerError as exc:
+                last = exc
+                if attempt >= attempts:
+                    break
+                pause = _READ_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                logger.info(
+                    "Lecture '%s' en echec (essai %d/%d), nouvelle tentative dans %.1fs",
+                    slug, attempt, attempts, pause,
+                )
+                time.sleep(pause)
+        assert last is not None
+        raise last
+
+    def _execute_once(self, slug: str, arguments: dict[str, Any]) -> dict[str, Any]:
         client = self._ensure_client()
         path = COMPOSIO_TOOLS_EXECUTE_PATH.format(tool_slug=slug)
         try:
@@ -291,7 +346,12 @@ class MailWorker:
             logger.warning("Outil '%s' injoignable (user=%s): %s", slug, self.user_id, exc)
             raise MailWorkerError(f"Appel '{slug}' impossible.") from exc
         if not result.get("successful", False):
-            logger.warning("Outil '%s' en echec (user=%s)", slug, self.user_id)
+            # Le motif rendu par l'API est journalise : sans lui, un quota
+            # depasse et une erreur de droits etaient indiscernables.
+            logger.warning(
+                "Outil '%s' en echec (user=%s): %s",
+                slug, self.user_id, str(result.get("error") or "")[:200],
+            )
             raise MailWorkerError(f"L'outil '{slug}' a echoue.")
         return result.get("data") or {}
 
