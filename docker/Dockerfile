@@ -5,6 +5,16 @@ RUN groupadd --gid 1000 appuser && \
 
 WORKDIR /app
 
+# Outils OCR systeme : tesseract (moteur, francais + anglais) et poppler
+# (rasterisation des PDF scannes). Indispensables pour lire une facture
+# photographiee ; sans eux, toute image partirait en quarantaine.
+RUN apt-get update && apt-get install --no-install-recommends -y \
+        tesseract-ocr \
+        tesseract-ocr-fra \
+        tesseract-ocr-eng \
+        poppler-utils \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 

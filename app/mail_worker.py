@@ -15,7 +15,11 @@ journalise ni renvoye dans un message.
 """
 from __future__ import annotations
 
+import re
+import time
+
 import hashlib
+from decimal import Decimal
 import json
 import logging
 import os
@@ -24,6 +28,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app import doc_store as store
+from app import doc_vision
 from app import doc_vault as vault
 from app.attachments import (
     DocumentFile,
@@ -63,6 +68,11 @@ NOTIFY_NEW = ""
 NOTIFY_COMPLETED = "completed"
 NOTIFY_WAITING = "waiting_validation"
 NOTIFY_SKIPPED = "skipped"
+
+# Nombre maximal de lignes de detail dans un resume Telegram. Au-dela,
+# on annonce le compte : le detail exhaustif vit dans 14_IMPORTS_LOG et
+# dans les journaux serveur, pas dans un message de conversation.
+MAX_DETAIL_LINES = 10
 NOTIFY_PARTIAL = "partial"
 NOTIFY_FAILED = "failed"
 NOTIFY_REJECTED = "rejected"
@@ -71,7 +81,13 @@ NOTIFY_REJECTED = "rejected"
 # normalement un manifeste, un README ou une somme de controle. Ce ne sont
 # pas des documents, leur presence n'est pas une anomalie.
 SILENT_REJECTIONS = (
+    # Membre de ZIP qui n'est ni PDF ni image (README, manifeste, CSV, somme
+    # de controle). Les deux libelles - avant et apres l'ajout des images -
+    # restent reconnus pour ne rien annoncer.
+    "n'est ni un PDF ni une image (signature invalide)",
     "n'est pas un PDF (signature invalide)",
+    # Piece jointe directe qui n'est ni document ni archive.
+    "piece jointe ignoree : ni PDF, ni image, ni archive ZIP",
     "piece jointe ignoree : ni PDF ni archive ZIP",
 )
 
@@ -111,8 +127,74 @@ def is_silent_rejection(reason: str) -> bool:
     return any(motif in reason for motif in SILENT_REJECTIONS)
 
 
+# Bornes de date que l'exploitant peut poser lui-meme dans la requete
+# configuree. Si l'une d'elles est presente, le curseur n'en ajoute pas une
+# seconde : deux `after:` dans la meme requete rendent un resultat VIDE.
+_HAS_DATE_BOUND = re.compile(r"\b(?:after|before|newer_than|older_than):", re.I)
+
+
 class MailWorkerError(RuntimeError):
     """Erreur destinee aux logs / au client, jamais porteuse de secret."""
+
+
+# Reprise des appels de LECTURE uniquement (voir MailWorker.execute).
+_READ_RETRY_ATTEMPTS = 3
+_READ_RETRY_BACKOFF_SECONDS = 2.0
+
+# Un outil est retentable s'il ne modifie RIEN. La liste est explicite :
+# deduire "lecture" d'un nom serait un pari, et se tromper sur une ecriture
+# creerait des doublons comptables.
+_RETRYABLE_READ_SLUGS = frozenset({
+    "GOOGLESHEETS_BATCH_GET",
+    "GOOGLESHEETS_GET_SPREADSHEET_INFO",
+    "GOOGLESHEETS_GET_SHEET_NAMES",
+    "GOOGLEDRIVE_FIND_FOLDER",
+    "GMAIL_FETCH_EMAILS",
+    "GMAIL_FETCH_MESSAGE_BY_MESSAGE_ID",
+    "GMAIL_GET_ATTACHMENT",
+    "GOOGLECALENDAR_FIND_EVENT",
+})
+
+
+def is_retryable_read(slug: str) -> bool:
+    """Vrai si l'outil est une lecture sans effet de bord."""
+    return slug in _RETRYABLE_READ_SLUGS
+
+
+# Lectures Google Sheets. Leur quota est un compteur GLISSANT PAR MINUTE qui
+# se libere tout seul : contrairement au quota Gmail, attendre le fait
+# disparaitre. Un lot de treize pieces enchaine plusieurs centaines de
+# lectures et touche ce plafond en fin de traitement ; sans attente, le
+# rapprochement bancaire s'interrompait au milieu et le journal
+# 08_RAPPROCHEMENT restait vide alors que les rapprochements etaient justes.
+_SHEETS_READ_SLUGS = frozenset({
+    "GOOGLESHEETS_BATCH_GET",
+    "GOOGLESHEETS_GET_SPREADSHEET_INFO",
+    "GOOGLESHEETS_GET_SHEET_NAMES",
+})
+_SHEETS_QUOTA_ATTEMPTS = 4
+_SHEETS_QUOTA_PAUSE_SECONDS = 20.0
+
+
+def is_sheets_read(slug: str) -> bool:
+    """Vrai si l'outil est une LECTURE Sheets, dont le quota se libere seul."""
+    return slug in _SHEETS_READ_SLUGS
+
+
+class RateLimited(MailWorkerError):
+    """Quota de l'API atteint : reessayer tout de suite est contre-productif."""
+
+
+def looks_rate_limited(reason: str) -> bool:
+    """L'API annonce-t-elle un quota atteint ?
+
+    Le fournisseur repond "HTTP 429: User-rate limit exceeded. Retry after
+    <date>". Chaque nouvel appel repousse cette date : insister pendant la
+    fenetre de blocage EMPECHE le quota de se liberer. On sort donc
+    immediatement, et le cycle suivant retentera plus tard.
+    """
+    bas = (reason or "").lower()
+    return "429" in bas or "rate limit" in bas or "quota" in bas
 
 
 @dataclass
@@ -132,6 +214,9 @@ class MailSummary:
     # Rejets reellement dignes d'un message (les membres non-PDF d'un ZIP
     # sont ecartes en amont, silencieusement).
     notifiable_rejected: list[tuple[str, str]] = field(default_factory=list)
+    # Documents perdus par une limite de depaquetage. Toujours annonce,
+    # jamais silencieux : c'est une perte, pas un filtrage.
+    truncated: int = 0
     planned: bool = False
 
     def count(self, action: str) -> int:
@@ -189,7 +274,13 @@ class MailWorker:
         max_per_cycle: int = 5,
         zip_limits: ZipLimits | None = None,
         calendar_check: str = "",
+        allowed_vat_rates: tuple[Decimal, ...] | None = None,
+        vision: Any | None = None,
+        vision_max_calls: int = 0,
     ) -> None:
+        self._vision = vision
+        # Budget d'appels au niveau vision, remis a zero a CHAQUE email.
+        self._vision_budget = doc_vision.VisionBudget(vision_max_calls)
         self._api_key = api_key
         self._chat_id = chat_id
         self._db_path = db_path
@@ -200,6 +291,7 @@ class MailWorker:
         self._drive_folder = drive_folder
         self._max_per_cycle = max_per_cycle
         self._zip_limits = zip_limits or ZipLimits()
+        self._vat_rates = tuple(allowed_vat_rates) if allowed_vat_rates else ()
         self._client = None
         self._pipeline: DocumentPipeline | None = None
         self._startup_done = False
@@ -236,6 +328,8 @@ class MailWorker:
                 self, db_path=self._db_path, chat_id=self._chat_id,
                 spreadsheet_id=self._spreadsheet_id, company=self._company,
                 drive_root=self._drive_folder,
+                allowed_vat_rates=self._vat_rates or None,
+                vision=self._vision, vision_budget=self._vision_budget,
             )
         return self._pipeline
 
@@ -262,7 +356,61 @@ class MailWorker:
         return self._client
 
     def execute(self, slug: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        """Appel Composio, isole par `user_id = telegram_<chat_id>`."""
+        """Appel Composio, isole par `user_id = telegram_<chat_id>`.
+
+        Les appels de LECTURE sont retentes : un lot de documents enchaine
+        des centaines de lectures Sheets en quelques secondes et l'API
+        repond alors ponctuellement en erreur (quota par minute). Sans
+        reprise, un simple hoquet de lecture faisait echouer le document
+        entier ("GOOGLESHEETS_BATCH_GET a echoue") alors que rien n'etait
+        anormal dans la piece. Les ECRITURES ne sont jamais retentees : une
+        ecriture donnee pour perdue peut avoir abouti, et la rejouer
+        creerait une seconde ligne comptable.
+        """
+        attempts = _READ_RETRY_ATTEMPTS if is_retryable_read(slug) else 1
+        last: Exception | None = None
+        quota_wait = 0
+        attempt = 0
+        while attempt < attempts:
+            attempt += 1
+            try:
+                return self._execute_once(slug, arguments)
+            except RateLimited as exc:
+                # Quota Gmail : chaque appel repousse la fenetre, on sort.
+                # Quota de LECTURE Sheets : le compteur est par minute et se
+                # libere seul, alors on patiente au lieu d'abandonner un
+                # rapprochement a moitie fait. Aucune ecriture n'est jamais
+                # concernee : rejouer une ecriture creerait une double
+                # ecriture comptable.
+                if not is_sheets_read(slug) or quota_wait >= _SHEETS_QUOTA_ATTEMPTS:
+                    raise
+                quota_wait += 1
+                logger.info(
+                    "Quota de lecture Sheets atteint sur '%s' "
+                    "(attente %d/%d, %.0fs)",
+                    slug, quota_wait, _SHEETS_QUOTA_ATTEMPTS,
+                    _SHEETS_QUOTA_PAUSE_SECONDS,
+                )
+                time.sleep(_SHEETS_QUOTA_PAUSE_SECONDS)
+                last = exc
+                # L'attente d'un quota n'est pas un essai rate : elle ne
+                # doit pas consommer les tentatives de relecture.
+                attempt -= 1
+                continue
+            except MailWorkerError as exc:
+                last = exc
+                if attempt >= attempts:
+                    break
+                pause = _READ_RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                logger.info(
+                    "Lecture '%s' en echec (essai %d/%d), nouvelle tentative dans %.1fs",
+                    slug, attempt, attempts, pause,
+                )
+                time.sleep(pause)
+        assert last is not None
+        raise last
+
+    def _execute_once(self, slug: str, arguments: dict[str, Any]) -> dict[str, Any]:
         client = self._ensure_client()
         path = COMPOSIO_TOOLS_EXECUTE_PATH.format(tool_slug=slug)
         try:
@@ -273,7 +421,14 @@ class MailWorker:
             logger.warning("Outil '%s' injoignable (user=%s): %s", slug, self.user_id, exc)
             raise MailWorkerError(f"Appel '{slug}' impossible.") from exc
         if not result.get("successful", False):
-            logger.warning("Outil '%s' en echec (user=%s)", slug, self.user_id)
+            # Le motif rendu par l'API est journalise : sans lui, un quota
+            # depasse et une erreur de droits etaient indiscernables.
+            reason = str(result.get("error") or "")
+            logger.warning(
+                "Outil '%s' en echec (user=%s): %s", slug, self.user_id, reason[:200],
+            )
+            if looks_rate_limited(reason):
+                raise RateLimited(f"Quota atteint sur '{slug}'.")
             raise MailWorkerError(f"L'outil '{slug}' a echoue.")
         return result.get("data") or {}
 
@@ -334,7 +489,30 @@ class MailWorker:
         )
 
     def effective_query(self) -> str:
-        return f"{self._query} after:{store.query_floor(self.cursor())}"
+        """Requete Gmail reellement envoyee, curseur compris.
+
+        Deux pieges reels, verifies contre l'API :
+
+          - Gmail ne rend AUCUN message pour `after:0`. La borne est
+            rejetee, pas interpretee comme "depuis toujours".
+          - deux bornes `after:` dans la meme requete ne se combinent pas :
+            l'ensemble resultat est VIDE. Une borne posee par
+            l'exploitant dans la requete configuree etait donc annulee par
+            celle du curseur, et le worker ne trouvait plus jamais rien -
+            en silence, sans erreur.
+
+        Quand la requete configuree porte deja sa propre borne de date,
+        c'est elle qui fait foi et le curseur n'en ajoute pas une seconde.
+        C'est aussi le seul moyen de faire relire une periode passee dans
+        un environnement neuf, dont le curseur demarre a l'instant present.
+        La deduplication reste seule garante contre la double ecriture.
+        """
+        if _HAS_DATE_BOUND.search(self._query):
+            return self._query
+        floor = store.query_floor(self.cursor())
+        if floor <= 0:
+            return self._query
+        return f"{self._query} after:{floor}"
 
     def rewind(self, hours: int = 24) -> int:
         """Recul volontaire du curseur (/reprocess). Les documents deja
@@ -356,16 +534,28 @@ class MailWorker:
             "GMAIL_FETCH_MESSAGE_BY_MESSAGE_ID", {"message_id": message_id, "format": "full"}
         )
 
+    # Extensions et types MIME des pieces jointes exploitables. Les images
+    # (facture photographiee) sont selectionnees comme les PDF : la decision
+    # finale PDF/image/ZIP se prend en aval sur la SIGNATURE binaire, mais le
+    # premier tri, cote Gmail, se fait sur le nom et le type annonce.
+    _KEEP_EXTENSIONS = (".pdf", ".zip", ".png", ".jpg", ".jpeg")
+    _KEEP_MIMES = frozenset({
+        "application/pdf",
+        "application/zip",
+        "application/x-zip-compressed",
+        "image/png",
+        "image/jpeg",
+        "image/jpg",
+    })
+
     @staticmethod
     def attachments_of(message: dict[str, Any]) -> list[dict[str, Any]]:
-        """Toutes les pieces jointes exploitables : PDF et archives ZIP."""
+        """Pieces jointes exploitables : PDF, archives ZIP et images (PNG/JPEG)."""
         keep = []
         for att in message.get("attachmentList") or []:
             name = str(att.get("filename") or "").lower()
             mime = str(att.get("mimeType") or "").lower()
-            if name.endswith(".pdf") or name.endswith(".zip") or mime in (
-                "application/pdf", "application/zip", "application/x-zip-compressed",
-            ):
+            if name.endswith(MailWorker._KEEP_EXTENSIONS) or mime in MailWorker._KEEP_MIMES:
                 keep.append(att)
         return keep
 
@@ -518,6 +708,8 @@ class MailWorker:
 
     def process_message(self, message_id: str) -> tuple[MailSummary, int]:
         """Traite toutes les pieces jointes d'un email, independamment."""
+        # Le budget de relecture visuelle est propre a CHAQUE email.
+        self._vision_budget.reset()
         message = self.fetch_message(message_id)
         message.setdefault("messageId", message_id)
         summary = MailSummary(
@@ -537,6 +729,18 @@ class MailWorker:
                 continue
             report = collect_documents(name, content, limits=self._zip_limits)
             summary.rejected.extend(report.rejected)
+            if report.truncated:
+                # Une archive tronquee est une PERTE de documents, pas un
+                # rejet ordinaire. Elle etait auparavant diluee en une ligne
+                # par fichier ecarte, au milieu d'un resume deja trop long :
+                # personne ne la voyait. Elle a desormais son propre message,
+                # son propre niveau de journal, et un compte exact.
+                summary.truncated += report.truncated
+                logger.error(
+                    "Archive %s tronquee : %d document(s) NON traites "
+                    "(limite de %d fichiers). Aucun de ces documents n'a ete lu.",
+                    name, report.truncated, self._zip_limits.max_files,
+                )
             for file in report.files:
                 try:
                     summary.outcomes.append(
@@ -577,6 +781,14 @@ class MailWorker:
         silencieux = 0
         for outcome in summary.outcomes:
             fiche = store.get_document(self._db_path, outcome.doc_key) or {}
+            if str(fiche.get("superseded_by") or ""):
+                # Fichier deja connu, rattache a sa fiche canonique : rien
+                # n'a ete ecrit, rien n'a change. L'annoncer document par
+                # document reviendrait a envoyer trente-huit messages pour
+                # dire trente-huit fois "rien n'a bouge". Le compte figure
+                # dans le resume et dans les journaux ; c'est suffisant.
+                silencieux += 1
+                continue
             etat = notify_state_of(outcome, str(fiche.get("state") or ""))
             deja = str(fiche.get("last_notified_state") or "")
             if etat == deja:
@@ -948,10 +1160,30 @@ def build_summary(summary: MailSummary) -> str:
         f"A valider                : {len(summary.to_review)}",
         f"En erreur                : {len(summary.errors) + len(summary.notified_rejected)}",
     ]
+    if summary.truncated:
+        # En TETE du resume, avant tout detail : une archive tronquee est
+        # une perte de documents, pas une ligne de plus dans une liste.
+        head.insert(1, "")
+        head.insert(
+            2,
+            f"ATTENTION : {summary.truncated} document(s) de l'archive n'ont "
+            f"PAS ete lus (limite de fichiers atteinte).",
+        )
+
     body: list[str] = []
-    for outcome in summary.imported + summary.classified:
+    detailles = summary.imported + summary.classified
+    # Resume COMPACT : au-dela de ce seuil, on donne le compte et non la
+    # liste. Un email de 38 documents produisait un message que Telegram
+    # refusait, et l'echec faisait tout disparaitre - resume compris.
+    for outcome in detailles[:MAX_DETAIL_LINES]:
         body.append("")
         body.append(format_outcome(outcome))
+    if len(detailles) > MAX_DETAIL_LINES:
+        body.append("")
+        body.append(
+            f"... et {len(detailles) - MAX_DETAIL_LINES} autre(s) document(s) "
+            f"importe(s) ou classe(s). Detail complet dans 14_IMPORTS_LOG."
+        )
     for outcome in summary.notified_outcomes:
         if outcome.action == ACTION_DUPLICATE:
             body.append("")
@@ -965,9 +1197,13 @@ def build_summary(summary: MailSummary) -> str:
             body.append(
                 f"{outcome.filename} : type non reconnu. Depose dans Drive / A verifier."
             )
-    for name, reason in summary.notified_rejected:
+    rejets = summary.notified_rejected
+    for name, reason in rejets[:MAX_DETAIL_LINES]:
         body.append("")
         body.append(f"{name} : ignore ({reason})")
+    if len(rejets) > MAX_DETAIL_LINES:
+        body.append("")
+        body.append(f"... et {len(rejets) - MAX_DETAIL_LINES} autre(s) rejet(s).")
     return f"{NL}".join(head + body)
 
 

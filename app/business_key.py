@@ -85,6 +85,26 @@ def business_document_key(fiche: dict) -> str:
     return f"{LEVEL_BUSINESS}:" + "|".join(parts)
 
 
+def business_identity(fiche: dict) -> str:
+    """L'identite COMPTABLE seule : ni empreinte, ni identifiant Gmail.
+
+    `business_document_key` s'arrete au premier barreau disponible, donc
+    presque toujours sur l'empreinte du fichier. C'est ce qu'on veut pour
+    reconnaitre un fichier identique - mais pas pour reconnaitre un MEME
+    DOCUMENT arrive sous deux fichiers differents (re-export, re-scan,
+    tampon appose). Ici on force la descente au niveau metier.
+
+    Rend une chaine vide si l'identite comptable n'est pas etablie : dans
+    le doute, deux documents restent deux documents.
+    """
+    allege = {
+        cle: valeur for cle, valeur in fiche.items()
+        if cle not in ("file_sha256", "gmail_message_id")
+    }
+    cle = business_document_key(allege)
+    return cle if cle.startswith(f"{LEVEL_BUSINESS}:") else ""
+
+
 def completeness(fiche: dict) -> tuple:
     """Score de completude, pour choisir la fiche CANONIQUE d'un groupe.
 

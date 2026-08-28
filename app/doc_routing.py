@@ -45,6 +45,7 @@ TAB_SUPPLIERS = "03_FOURNISSEURS"
 TAB_SALES = "04_FACTURES_VENTES"
 TAB_PURCHASES = "05_FACTURES_ACHATS"
 TAB_BANK = "06_RELEVE_BANCAIRE"
+TAB_RECONCILIATION = "08_RAPPROCHEMENT"
 TAB_IMPORTS_LOG = "14_IMPORTS_LOG"
 TAB_INVOICE_LINES = "16_LIGNES_FACTURES"
 
@@ -311,6 +312,18 @@ def build_bank_rows(
     rows: list[list[object]] = []
     for offset, line in enumerate(doc.bank_lines):
         serial = to_serial(line.date_operation) if line.date_operation else ""
+        # Un solde n'est ecrit QUE si le releve en annonce un. Auparavant, un
+        # releve sans colonne Solde voyait son unique montant recopie ici :
+        # le classeur affirmait un solde que le document ne donnait nulle
+        # part. Un mouvement dont le sens reste indetermine reste visible
+        # dans le statut, sans etre range d'office en debit ou en credit.
+        # Seul un MOUVEMENT dont le sens n'a pas pu etre etabli est signale.
+        # Une ligne de solde initial n'a legitimement ni debit ni credit :
+        # elle n'a rien a valider.
+        statut = "Non rapproche"
+        montant = getattr(line, "mouvement", None)
+        if line.debit is None and line.credit is None and montant is not None:
+            statut = f"Sens a valider - montant {montant} {line.devise}".strip()
         rows.append([
             f"TX-{start_index + offset:04d}",
             account,
@@ -320,11 +333,11 @@ def build_bank_rows(
             line.reference,
             to_number(line.debit) if line.debit is not None else "",
             to_number(line.credit) if line.credit is not None else "",
-            to_number(line.solde),
+            to_number(line.solde) if line.solde is not None else "",
             "",
             "",
             "",
-            "Non rapproche",
+            statut,
         ])
     return rows
 

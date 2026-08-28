@@ -71,9 +71,17 @@ def to_serial(value: date) -> int:
     return (value - _SHEETS_EPOCH).days
 
 
-def to_number(value: Decimal | None) -> float | None:
-    """Decimal -> nombre JSON, uniquement au moment de l'ecriture."""
-    return None if value is None else float(value)
+def to_number(value: Decimal | None) -> float | str:
+    """Decimal -> nombre JSON, uniquement au moment de l'ecriture.
+
+    Une valeur INCONNUE devient une cellule VIDE, jamais `None` : l'API
+    Sheets refuse `null` dans un tableau de valeurs et rejette alors la
+    ligne ENTIERE ("Input should be a valid string on parameter
+    values.0.7.str"). Comme une ecriture n'est jamais rejouee, la facture
+    ne partait pas du tout en comptabilite - silencieusement. Un taux de
+    TVA illisible ne doit couter que sa propre cellule, pas l'ecriture.
+    """
+    return "" if value is None else float(value)
 
 
 def _sequence(existing: list[str], pattern: re.Pattern[str]) -> int:

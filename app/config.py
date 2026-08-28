@@ -27,11 +27,24 @@ class Settings(BaseSettings):
     openai_timeout_seconds: float = Field(default=60.0, alias="OPENAI_TIMEOUT_SECONDS")
     openai_max_output_tokens: int = Field(default=2000, alias="OPENAI_MAX_OUTPUT_TOKENS")
     openai_reasoning_effort: str = Field(default="none", alias="OPENAI_REASONING_EFFORT")
+    # Escalade de lecture. Terra relit le TEXTE, Sol relit l'IMAGE ORIGINALE.
+    # Sol est le niveau le plus couteux : son nombre d'appels est plafonne
+    # PAR EMAIL, sans quoi un lot de photos illisibles le declencherait
+    # autant de fois qu'il contient de pieces.
+    openai_model_terra: str = Field(default="gpt-5.6-terra", alias="OPENAI_MODEL_TERRA")
+    openai_model_sol: str = Field(default="gpt-5.6-sol", alias="OPENAI_MODEL_SOL")
+    vision_escalation_enabled: bool = Field(default=True, alias="VISION_ESCALATION_ENABLED")
+    vision_max_calls_per_email: int = Field(default=6, alias="VISION_MAX_CALLS_PER_EMAIL")
 
     # --- Donnees / TVA (configurable, jamais code en dur) ---
     db_path: str = Field(default="/app/data/demo.db", alias="DB_PATH")
     default_vat_rate: Decimal = Field(default=Decimal("20.0"), alias="DEFAULT_VAT_RATE")
     vat_rates_available: str = Field(default="0,7,10,20", alias="VAT_RATES_AVAILABLE")
+    # Limites de depaquetage ZIP. Seul le NOMBRE de fichiers est
+    # remonte ; le volume total reste a 60 Mo, ce qui borne la bombe
+    # de decompression independamment du nombre de membres.
+    zip_max_files: int = Field(default=120, alias="ZIP_MAX_FILES")
+    zip_max_total_mb: int = Field(default=60, alias="ZIP_MAX_TOTAL_MB")
     reconciliation_window_days: int = Field(default=5, alias="RECONCILIATION_WINDOW_DAYS")
     reconciliation_amount_tolerance: Decimal = Field(
         default=Decimal("0.01"), alias="RECONCILIATION_AMOUNT_TOLERANCE"
@@ -95,15 +108,28 @@ class Settings(BaseSettings):
     # boite ; et l'anti-doublon par empreinte du fichier puis par
     # (identifiant du tiers + numero du document).
     #
-    # L'accolade forme un OU : `{filename:pdf filename:zip}` retient aussi
-    # bien un email ne portant que des PDF, qu'un email ne portant qu'une
-    # archive ZIP, que les deux a la fois. Sans elle, un pack envoye en ZIP
-    # seul n'etait jamais vu par le worker, alors meme que le code sait
-    # depuis toujours ouvrir les archives.
+    # L'accolade forme un OU : `{filename:pdf filename:zip filename:png
+    # filename:jpg filename:jpeg}` retient aussi bien un email ne portant
+    # que des PDF, qu'un email ne portant qu'une archive ZIP, qu'un email ne
+    # portant qu'une facture PHOTOGRAPHIEE (PNG/JPG/JPEG), ou n'importe quelle
+    # combinaison. Sans elle, un pack envoye en ZIP seul, ou une photo de
+    # facture seule, n'etait jamais vu par le worker, alors meme que le code
+    # sait ouvrir les archives et, desormais, ocreiser les images.
     gmail_watch_enabled: bool = Field(default=True, alias="GMAIL_WATCH_ENABLED")
     gmail_watch_chat_id: int = Field(default=0, alias="GMAIL_WATCH_CHAT_ID")
+    # Long polling Telegram. A desactiver UNIQUEMENT pour un conteneur de
+    # verification qui partage le jeton du bot de production : deux
+    # long-pollers sur un meme jeton se disputent getUpdates (409) et
+    # casseraient la production. L'ENVOI de messages, lui, ne conflicte
+    # pas ; il reste actif.
+    telegram_polling_enabled: bool = Field(
+        default=True, alias="TELEGRAM_POLLING_ENABLED"
+    )
     gmail_watch_query: str = Field(
-        default="in:inbox has:attachment {filename:pdf filename:zip}",
+        default=(
+            "in:inbox has:attachment "
+            "{filename:pdf filename:zip filename:png filename:jpg filename:jpeg}"
+        ),
         alias="GMAIL_WATCH_QUERY",
     )
     gmail_watch_interval_seconds: int = Field(default=60, alias="GMAIL_WATCH_INTERVAL_SECONDS")
@@ -118,6 +144,19 @@ class Settings(BaseSettings):
         if not raw:
             return set()
         return {int(x.strip()) for x in raw.split(",") if x.strip()}
+
+    def zip_limits(self) -> "ZipLimits":
+        """Limites de depaquetage effectives, protections comprises.
+
+        Profondeur, ratio de compression et taille unitaire ne sont PAS
+        configurables : ce sont des protections, pas des reglages.
+        """
+        from app.attachments import ZipLimits
+
+        return ZipLimits(
+            max_files=int(self.zip_max_files),
+            max_total_bytes=int(self.zip_max_total_mb) * 1024 * 1024,
+        )
 
     def vat_rates(self) -> list[Decimal]:
         return [Decimal(x.strip()) for x in self.vat_rates_available.split(",") if x.strip()]

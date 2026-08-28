@@ -126,7 +126,7 @@ class FakeMailWorker(MailWorker):
         raise AssertionError(f"outil Gmail non simule : {slug}")
 
     def upload(self, *, name: str, mimetype: str, content: bytes) -> str:
-        assert mimetype == "application/pdf"
+        assert mimetype in ("application/pdf", "image/png", "image/jpeg")
         key = f"s3/{len(self.uploaded)}/{name}"
         self.uploaded[key] = content
         return key

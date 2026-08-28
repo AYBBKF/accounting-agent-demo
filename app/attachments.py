@@ -25,8 +25,32 @@ from dataclasses import dataclass, field
 
 PDF_MAGIC = b"%PDF"
 
+# Signatures binaires des images acceptees. Comme pour le PDF, une image se
+# reconnait a sa signature, jamais a son extension : un fichier renomme
+# ".pdf" mais porteur d'un en-tete PNG est traite comme une image, et
+# inversement. JPEG couvre aussi bien le JFIF que l'Exif (photo de telephone).
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+JPEG_MAGIC = b"\xff\xd8\xff"
+
+# Garde-fou anti-bombe de decompression pour les images : une image de
+# quelques kilo-octets peut se decompresser en centaines de millions de
+# pixels et epuiser la memoire. Toute image dont largeur x hauteur depasse
+# ce plafond est REFUSEE (ligne tracable en quarantaine), jamais ouverte en
+# grand. 40 Mpx laisse passer une photo 7360x5000 d'un reflex, tout en
+# fermant la porte aux images pieges.
+MAX_IMAGE_PIXELS = 40_000_000
+
 # Limites par defaut, surchargeables par la configuration.
-MAX_FILES = 25
+#
+# MAX_FILES est passe de 25 a 120 : un ZIP comptable mensuel de 38
+# pieces etait tronque en silence a 25, et les 13 documents restants
+# n'ont jamais ete lus. La marge tient compte des envois annuels.
+#
+# MAX_TOTAL_BYTES reste DELIBEREMENT a 60 Mo. Relever le nombre de
+# fichiers sans relever le volume total garde la protection anti-bombe
+# exactement aussi serree qu'avant : 120 fichiers ne peuvent toujours
+# pas depasser 60 Mo decompresses.
+MAX_FILES = 120
 MAX_FILE_BYTES = 15 * 1024 * 1024
 MAX_TOTAL_BYTES = 60 * 1024 * 1024
 MAX_DEPTH = 2
@@ -91,9 +115,18 @@ class ExtractionReport:
 
     files: list[DocumentFile] = field(default_factory=list)
     rejected: list[tuple[str, str]] = field(default_factory=list)
+    # Nombre de fichiers ECARTES par la seule limite de comptage. Compte a
+    # part, parce que ce rejet-la n'est pas de meme nature que les autres :
+    # le document etait valide, il a juste ete refuse par un plafond. Le
+    # noyer parmi les rejets ordinaires est ce qui l'a rendu invisible.
+    truncated: int = 0
 
     def reject(self, name: str, reason: str) -> None:
         self.rejected.append((name, reason))
+
+    def reject_over_limit(self, name: str, limit: int) -> None:
+        self.truncated += 1
+        self.rejected.append((name, f"limite de {limit} fichiers atteinte"))
 
 
 def sha256_of(content: bytes) -> str:
@@ -107,6 +140,30 @@ def is_pdf(content: bytes) -> bool:
 
 def is_zip(content: bytes) -> bool:
     return content[:2] == b"PK"
+
+
+def is_image(content: bytes) -> bool:
+    """Une image PNG ou JPEG, reconnue a sa signature, jamais a son extension.
+
+    Une facture photographiee arrive comme une piece jointe image directe :
+    elle doit etre acceptee et OCRisee comme un PDF, pas ignoree.
+    """
+    return content[:8] == PNG_MAGIC or content[:3] == JPEG_MAGIC
+
+
+def content_mimetype(content: bytes) -> str:
+    """Type MIME reel d'un document, deduit de sa SIGNATURE.
+
+    Sert a l'archivage Drive : une image stockee sous `application/pdf`
+    donnerait un fichier illisible. Le type suit le contenu, jamais le nom.
+    """
+    if is_pdf(content):
+        return "application/pdf"
+    if content[:8] == PNG_MAGIC:
+        return "image/png"
+    if content[:3] == JPEG_MAGIC:
+        return "image/jpeg"
+    return "application/octet-stream"
 
 
 def idempotency_key(
@@ -178,7 +235,7 @@ def extract_pdfs_from_zip(
             continue
         name = info.filename
         if accepted >= limits.max_files:
-            report.reject(name, f"limite de {limits.max_files} fichiers atteinte")
+            report.reject_over_limit(name, limits.max_files)
             continue
         if not _is_safe_member_name(name):
             report.reject(name, "chemin non sur (absolu, remontee ou lien)")
@@ -219,8 +276,11 @@ def extract_pdfs_from_zip(
                 depth=depth + 1, report=report, member_prefix=f"{member_path}/",
             )
             continue
-        if not is_pdf(data):
-            report.reject(name, "n'est pas un PDF (signature invalide)")
+        # Un lot comptable mensuel peut melanger PDF et photos de factures
+        # dans la meme archive : les deux signatures sont acceptees, tout le
+        # reste est refuse par la signature, pas par l'extension.
+        if not (is_pdf(data) or is_image(data)):
+            report.reject(name, "n'est ni un PDF ni une image (signature invalide)")
             continue
 
         accepted += 1
@@ -240,10 +300,15 @@ def collect_documents(
     report = ExtractionReport()
     if is_zip(content):
         return extract_pdfs_from_zip(content, container=filename, limits=limits, report=report)
-    if is_pdf(content):
+    if is_pdf(content) or is_image(content):
+        # PDF comme image (facture photographiee) suivent la meme route :
+        # les octets ORIGINAUX sont conserves tels quels, donc l'empreinte
+        # sha256 et l'anti-doublon restent exacts. C'est l'extraction, en
+        # aval, qui choisit couche texte (PDF) ou OCR d'image selon la
+        # signature du contenu.
         report.files.append(DocumentFile(filename=filename, content=content, source="attachment"))
         return report
-    report.reject(filename, "piece jointe ignoree : ni PDF ni archive ZIP")
+    report.reject(filename, "piece jointe ignoree : ni PDF, ni image, ni archive ZIP")
     return report
 
 

@@ -55,7 +55,14 @@ _PURE_AMOUNT_RE = re.compile(
 )
 _DATE_RE = re.compile(r"\b(\d{2})[/\-.](\d{2})[/\-.](\d{4})\b")
 _ISO_DATE_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
-_ICE_RE = re.compile(r"\bICE\s*:?\s*([0-9]{6,20})\b", re.I)
+# L'ICE (identifiant commun d'entreprise, 15 chiffres au Maroc) peut etre
+# etiquete de plusieurs facons sur une VRAIE facture : "ICE : 00234...",
+# mais aussi "ICE fournisseur : 00234..." ou "ICE client : 00345...". On
+# tolere donc un qualificatif (mot + separateurs) entre "ICE" et le nombre,
+# sur la MEME ligne (pas de saut de ligne), sans jamais traverser vers un
+# autre nombre. Les factures synthetiques n'utilisaient que "ICE :", ce qui
+# masquait ce trou face aux factures reelles.
+_ICE_RE = re.compile(r"\bICE\b[^\d\n]{0,25}?([0-9]{8,20})\b", re.I)
 
 
 @dataclass
@@ -108,9 +115,12 @@ class DocumentLine:
 class BankLine:
     """Operation d'un releve bancaire.
 
-    Le sens (debit/credit) n'est jamais devine a partir d'une position de
-    colonne - la couche texte ne la conserve pas. Il est deduit de la
-    VARIATION DU SOLDE, puis recoupe avec le montant lu.
+    Le sens (debit/credit) vient d'abord de la COLONNE reellement occupee
+    par le montant dans le PDF, ensuite seulement de la variation du solde.
+    Un montant dont la colonne reste indeterminee est conserve comme
+    `mouvement` a valider : il n'est JAMAIS transforme en solde. Ecrire un
+    mouvement dans la colonne "Solde" revenait a affirmer un solde que le
+    document n'annonce nulle part.
     """
 
     date_operation: date | None
@@ -122,6 +132,12 @@ class BankLine:
     devise: str
     page: int
     inferred_direction: bool = False
+    # Montant lu dont le sens n'a pas pu etre etabli.
+    mouvement: Decimal | None = None
+
+    @property
+    def sens_indetermine(self) -> bool:
+        return self.debit is None and self.credit is None and self.mouvement is not None
 
 
 @dataclass
@@ -129,7 +145,8 @@ class ExtractedDocument:
     """Tout ce qui a pu etre lu, plus ce qui manque et ce qui cloche."""
 
     classification: Classification
-    text_source: str = "native"          # "native" ou "ocr"
+    text_source: str = "native"          # "native", "ocr" ou "vision:<niveau>"
+    raw_text: str = ""                   # texte lu, pour une relecture eventuelle
     pages: int = 1
 
     numero: str | None = None
@@ -269,11 +286,81 @@ def strip_label(raw: str, label: str) -> str:
     return remainder
 
 
+# Intitules de COLONNE reconnus. La lecture par colonne n'est tentee que sur
+# ces cellules-la : se contenter de "ligne sans chiffre" prenait la VALEUR
+# d'un libelle pour un en-tete ("Facture d'origine" / "NON PRECISEE") et
+# rattachait l'avoir a un montant au lieu d'une facture.
+_TABLE_HEADER_CELLS = frozenset({
+    "NUMERO", "NUMERO DE FACTURE", "NUMERO DE PIECE", "NO", "N",
+    "DATE", "DATE DE FACTURE", "DATE DU DOCUMENT", "DATE D'EMISSION",
+    "ECHEANCE", "DATE D'ECHEANCE", "DATE LIMITE DE PAIEMENT",
+    "REFERENCE", "LIBELLE", "LIBELLE / REFERENCE", "DEBIT", "CREDIT",
+    "INVOICE NUMBER", "INVOICE DATE", "DUE DATE",
+})
+
+
+def _header_run(lines: list[Line], index: int) -> list[int]:
+    """Bloc contigu de cellules d'EN-TETE auquel appartient `index`.
+
+    Une cellule d'en-tete est une ligne dont le texte normalise est un
+    intitule de colonne CONNU. Le bloc s'arrete a la premiere ligne qui n'en
+    est pas un : les valeurs commencent la.
+    """
+    def is_header(k: int) -> bool:
+        text = lines[k].text.strip()
+        return bool(text) and normalize(text) in _TABLE_HEADER_CELLS
+
+    if not is_header(index):
+        return []
+    start = index
+    while start - 1 >= 0 and is_header(start - 1):
+        start -= 1
+    end = index
+    while end + 1 < len(lines) and is_header(end + 1):
+        end += 1
+    return list(range(start, end + 1))
+
+
+def column_table_value(lines: list[Line], index: int) -> tuple[str, int] | None:
+    """Valeur d'un en-tete de tableau dispose en COLONNES.
+
+    Mise en page tres courante des factures reelles : une ligne par cellule
+    d'en-tete, puis une ligne par cellule de valeur.
+
+        NUMERO / DATE / ECHEANCE
+        F2026-1101 / 15/08/2026 / 15/09/2026
+
+    Le libelle et sa valeur ne sont donc PAS voisins : ils sont separes par
+    les autres en-tetes. Lire "la ligne suivante" rendait ECHEANCE comme date
+    du document, et la facture partait en quarantaine "date illisible" alors
+    que la date etait parfaitement lisible.
+
+    On n'applique la lecture par colonne que si l'en-tete compte AU MOINS
+    deux cellules (un vrai tableau) et si le bloc de valeurs qui suit a
+    exactement la meme largeur. Sinon on ne devine rien.
+    """
+    header = _header_run(lines, index)
+    if len(header) < 2:
+        return None
+    values: list[Line] = []
+    for line in lines[header[-1] + 1:]:
+        if not line.text.strip():
+            continue
+        values.append(line)
+        if len(values) == len(header):
+            break
+    if len(values) != len(header):
+        return None
+    chosen = values[header.index(index)]
+    return chosen.text.strip(), chosen.page
+
+
 def value_after(lines: list[Line], label: str) -> tuple[str, int] | None:
     """Valeur associee a un libelle, avec la page ou elle a ete trouvee.
 
-    Gere les deux mises en page rencontrees : "Libelle : valeur" et
-    "Libelle" seul avec la valeur sur la ligne suivante non vide.
+    Gere les trois mises en page rencontrees : "Libelle : valeur",
+    "Libelle" seul avec la valeur sur la ligne suivante, et le tableau en
+    colonnes (en-tetes groupes, puis valeurs groupees).
     """
     target = normalize(label)
     for i, line in enumerate(lines):
@@ -283,6 +370,9 @@ def value_after(lines: list[Line], label: str) -> tuple[str, int] | None:
         remainder = strip_label(line.text, label)
         if remainder:
             return remainder, line.page
+        column = column_table_value(lines, i)
+        if column is not None:
+            return column
         for nxt in lines[i + 1:]:
             if nxt.text.strip():
                 return nxt.text.strip(), nxt.page
@@ -404,9 +494,16 @@ def party(lines: list[Line], labels: tuple[str, ...]) -> tuple[str | None, str |
                 if m:
                     ice = m.group(1)
                     break
-                if any(normalize(nxt.text).startswith(normalize(l)) for l in
-                       ("CLIENT", "FOURNISSEUR", "EMETTEUR", "ACHETEUR", "IMPORTER",
-                        "BENEFICIAIRE", "EXPORTER")):
+                # On s'arrete au bloc SUIVANT, reconnu par une ligne qui est
+                # le libelle de role lui-meme. Un simple `startswith` coupait
+                # la recherche sur la raison sociale du tiers quand elle
+                # commence par ce mot ("CLIENT NOVA SARL") : l'ICE, ecrit
+                # deux lignes plus bas, n'etait alors jamais lu.
+                voisin = normalize(nxt.text)
+                if any(voisin == normalize(l) or voisin.startswith(normalize(l) + " :")
+                       or voisin.startswith(normalize(l) + ":")
+                       for l in ("CLIENT", "FOURNISSEUR", "EMETTEUR", "ACHETEUR",
+                                 "IMPORTER", "BENEFICIAIRE", "EXPORTER")):
                     break
             return (name or None), ice, line.page
     return None, None, 1
@@ -506,13 +603,21 @@ def extract_vat(lines: list[Line]) -> tuple[Decimal | None, Amount | None]:
     rate: Decimal | None = None
     amount: Amount | None = None
     for i, line in enumerate(lines):
-        m = re.match(r"^TVA\s*(\d+(?:[.,]\d+)?)\s*%\s*(.*)$", line.norm)
+        # La ligne de TVA est reconnue par sa FORME ("TVA ... %"), pas par la
+        # syntaxe du taux. Un taux illisible ("TVA 2E+1 %", taux barre,
+        # scanne de travers) ne doit pas faire disparaitre la ligne entiere :
+        # sinon le MONTANT de TVA n'est plus lu, le controle
+        # "HT + TVA = TTC" ne s'execute plus, et une facture aux totaux
+        # incoherents passe en comptabilite sans etre vue. On lit donc le
+        # montant meme quand le taux reste inconnu.
+        m = re.match(r"^TVA\b(?P<taux>[^%\d]*(?:\d[^%]*)?)%(?P<reste>.*)$", line.norm)
         if not m:
             continue
-        parsed_rate = parse_money(m.group(1))
+        candidat = (m.group("taux") or "").strip()
+        parsed_rate = parse_money(candidat) if re.fullmatch(r"\d+(?:[.,]\d+)?", candidat) else None
         if parsed_rate:
             rate = parsed_rate[0]
-        trailing = m.group(2)
+        trailing = m.group("reste")
         if re.search(r"\d", trailing):
             parsed = parse_money(trailing)
             if parsed:
@@ -529,6 +634,11 @@ def extract_vat(lines: list[Line]) -> tuple[Decimal | None, Amount | None]:
         break
     if amount is None:
         amount = amount_after(lines, "TVA")
+        if amount is not None and "%" in (amount.label or ""):
+            # La ligne relue porte un pourcentage : c'est le TAUX, pas un
+            # montant. Le retenir donnait une TVA de 1,00 MAD et fabriquait
+            # un faux ecart "HT + TVA != TTC" sur des factures saines.
+            amount = None
         if amount is not None and rate is not None and abs(amount.value) == rate:
             # On a relu le taux, pas un montant : on prefere ne rien affirmer.
             amount = None
@@ -595,10 +705,7 @@ def extract_bank_lines(lines: list[Line], devise: str) -> tuple[list[BankLine], 
                     debit = abs(movement)
         previous_balance = balance
 
-        reference = ""
-        m = re.search(r"\b([A-Z]{2,}[-_][A-Z0-9\-_]+)\b", libelle)
-        if m:
-            reference = m.group(1)
+        reference = bank_reference(libelle)
         entries.append(
             BankLine(
                 date_operation=operation_date, libelle=libelle, reference=reference,
@@ -607,6 +714,176 @@ def extract_bank_lines(lines: list[Line], devise: str) -> tuple[list[BankLine], 
             )
         )
     return entries, anomalies
+
+
+# Reference de piece citee dans un libelle bancaire. Deux formes reelles :
+# "REL-BP-2026-08" (lettres puis separateur) et "F2026-1101" (une a quatre
+# lettres collees a l'annee). Ne reconnaitre que la premiere laissait tous
+# les virements de facture sans reference, donc sans rapprochement possible.
+_BANK_REFERENCE_RES = (
+    re.compile(r"\b([A-Z]{2,}[-_][A-Z0-9\-_]+)\b"),
+    re.compile(r"\b([A-Z]{1,4}\d{2,}[-_][A-Z0-9]{2,})\b"),
+)
+
+
+def bank_reference(libelle: str) -> str:
+    """Reference de document citee par un libelle bancaire, sinon "" ."""
+    texte = (libelle or "").upper()
+    for motif in _BANK_REFERENCE_RES:
+        found = motif.search(texte)
+        if found:
+            return found.group(1)
+    return ""
+
+
+# --- releve bancaire : lecture PAR COLONNES --------------------------------
+
+
+@dataclass
+class Cell:
+    """Un fragment de texte du PDF avec sa position reelle sur la page."""
+
+    page: int
+    x: float
+    y: float
+    text: str
+
+    @property
+    def norm(self) -> str:
+        return normalize(self.text)
+
+
+def read_pdf_cells(data: bytes) -> list[Cell]:
+    """Fragments de texte avec leurs coordonnees.
+
+    La couche texte d'un PDF conserve la position de chaque fragment ; c'est
+    `extract_text()` qui l'aplatit. Sans elle, impossible de savoir si
+    "6 000,00 MAD" est ecrit dans la colonne Debit ou dans la colonne
+    Credit - et le sens de l'operation etait alors perdu.
+    """
+    try:
+        from pypdf import PdfReader
+    except ImportError:  # pragma: no cover - dependance manquante
+        return []
+    import io
+
+    cellules: list[Cell] = []
+    try:
+        reader = PdfReader(io.BytesIO(data))
+        for numero, page in enumerate(reader.pages, start=1):
+            def visiteur(text, cm, tm, font, size, _page=numero):
+                contenu = (text or "").strip()
+                if contenu:
+                    cellules.append(Cell(page=_page, x=float(tm[4]), y=float(tm[5]), text=contenu))
+
+            page.extract_text(visitor_text=visiteur)
+    except Exception:  # noqa: BLE001 - PDF corrompu : on retombe sur le texte plat
+        return []
+    return cellules
+
+
+# Tolerance verticale pour regrouper des fragments sur une meme ligne.
+_ROW_TOLERANCE = 3.0
+
+_BANK_HEADERS = {"DEBIT": "debit", "CREDIT": "credit", "SOLDE": "solde"}
+
+
+def _group_rows(cells: list[Cell]) -> list[list[Cell]]:
+    lignes: list[list[Cell]] = []
+    for cellule in sorted(cells, key=lambda c: (c.page, -c.y, c.x)):
+        if lignes and lignes[-1][0].page == cellule.page and abs(lignes[-1][0].y - cellule.y) <= _ROW_TOLERANCE:
+            lignes[-1].append(cellule)
+        else:
+            lignes.append([cellule])
+    for ligne in lignes:
+        ligne.sort(key=lambda c: c.x)
+    return lignes
+
+
+def _bank_columns(rows: list[list[Cell]]) -> tuple[dict[str, float], int]:
+    """Position en x des colonnes Debit / Credit / Solde, et l'index de l'en-tete."""
+    for index, ligne in enumerate(rows):
+        trouve = {}
+        for cellule in ligne:
+            role = _BANK_HEADERS.get(cellule.norm)
+            if role:
+                trouve[role] = cellule.x
+        if "debit" in trouve and "credit" in trouve:
+            return trouve, index
+    return {}, -1
+
+
+def _closest_column(x: float, colonnes: dict[str, float]) -> str | None:
+    """Colonne dont l'origine precede le montant et lui est la plus proche.
+
+    Un montant est cale a DROITE dans sa colonne : son x de depart est donc
+    toujours superieur ou egal a celui de l'intitule, et inferieur a celui
+    de la colonne suivante.
+    """
+    candidates = [(nom, ox) for nom, ox in colonnes.items() if x >= ox - 2.0]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item[1])[0]
+
+
+def extract_bank_lines_by_column(
+    cells: list[Cell], devise: str
+) -> tuple[list[BankLine], list[str]]:
+    """Operations d'un releve, sens deduit de la COLONNE occupee.
+
+    Chaque montant est rattache a la colonne Debit, Credit ou Solde selon sa
+    position reelle. Un montant dont la colonne reste indeterminee est
+    conserve comme mouvement a valider, avec une anomalie tracable : on ne
+    fabrique jamais un solde, et une seule operation douteuse ne bloque pas
+    le reste du releve.
+    """
+    rows = _group_rows(cells)
+    colonnes, entete = _bank_columns(rows)
+    if not colonnes or entete < 0:
+        return [], []
+
+    anomalies: list[str] = []
+    operations: list[BankLine] = []
+    for ligne in rows[entete + 1:]:
+        dates = [c for c in ligne if _DATE_RE.fullmatch(c.text.strip())]
+        montants = [c for c in ligne if is_amount_line(Line(page=c.page, text=c.text))]
+        if not dates or not montants:
+            continue
+        operation_date = parse_date(dates[0].text)
+        libelles = [c.text.strip() for c in ligne if c not in dates and c not in montants]
+        libelle = libelles[0] if libelles else ""
+
+        debit = credit = solde = mouvement = None
+        courante = devise
+        for cellule in montants:
+            parsed = parse_money(cellule.text)
+            if not parsed:
+                continue
+            valeur, monnaie = parsed
+            courante = monnaie or courante
+            colonne = _closest_column(cellule.x, colonnes)
+            if colonne == "debit":
+                debit = abs(valeur)
+            elif colonne == "credit":
+                credit = abs(valeur)
+            elif colonne == "solde":
+                solde = valeur
+            else:
+                mouvement = abs(valeur)
+                anomalies.append(
+                    f"operation du {operation_date} : montant {valeur} hors des colonnes "
+                    "Debit et Credit, sens a valider"
+                )
+
+        reference = bank_reference(libelle)
+        operations.append(
+            BankLine(
+                date_operation=operation_date, libelle=libelle, reference=reference,
+                debit=debit, credit=credit, solde=solde, devise=courante,
+                page=ligne[0].page, inferred_direction=False, mouvement=mouvement,
+            )
+        )
+    return operations, anomalies
 
 
 def check_bank_totals(doc: "ExtractedDocument", lines: list[Line]) -> list[str]:
@@ -656,6 +933,8 @@ REQUIRED_FIELDS = {
 _NUMBER_LABELS = (
     "Numero de facture", "Numero du recu", "Numero d'avoir", "Numero de devis",
     "Numero de commande", "Numero export", "Invoice number", "Numero de bon",
+    # En-tete de tableau nu ("NUMERO"), avant le tres generique "Reference".
+    "Numero", "No de facture", "N de facture", "Facture no",
     "Reference",
 )
 _DATE_LABELS = (
@@ -781,7 +1060,8 @@ def _first_value(lines: list[Line], labels: tuple[str, ...]) -> tuple[str, int] 
 
 
 def extract_document(
-    pages: list[str], *, company: str = "X BLASTE", text_source: str = "native"
+    pages: list[str], *, company: str = "X BLASTE", text_source: str = "native",
+    cells: list["Cell"] | None = None,
 ) -> ExtractedDocument:
     """Classe puis extrait un document. Ne devine jamais un montant absent."""
     joined = "\n".join(pages)
@@ -792,14 +1072,27 @@ def extract_document(
     classification = classify(joined, company=company)
     lines = build_lines(pages)
     doc = ExtractedDocument(
-        classification=classification, text_source=text_source, pages=len(pages)
+        classification=classification, text_source=text_source, pages=len(pages),
+        raw_text=joined,
     )
     kind = classification.doc_type
 
     # --- identite -------------------------------------------------------
-    numero = _first_value(lines, _NUMBER_LABELS)
-    if numero:
-        doc.numero = numero[0].split()[0] if numero[0] else None
+    # Un numero doit RESSEMBLER a une reference. Sans ce controle, le
+    # libelle generique "Reference" attrapait "Reference de paiement :
+    # F2026-1101" et, le libelle ne faisant qu'un mot, il restait "de
+    # paiement : F2026-1101" : la facture etait comptabilisee sous le
+    # numero "de". On essaie donc les libelles dans l'ordre et on retient
+    # le premier candidat exploitable.
+    doc.numero = None
+    for label in _NUMBER_LABELS:
+        found = value_after(lines, label)
+        if not found:
+            continue
+        candidate = (found[0].split() or [""])[0].strip(" .:;,")
+        if plausible_reference(candidate):
+            doc.numero = candidate
+            break
     found_date = _first_value(lines, _DATE_LABELS)
     doc.date_document = parse_date(found_date[0]) if found_date else None
     due = _first_value(lines, _DUE_LABELS)
@@ -875,7 +1168,16 @@ def extract_document(
 
     # --- contenu --------------------------------------------------------
     if kind == BANK_STATEMENT:
-        doc.bank_lines, bank_anomalies = extract_bank_lines(lines, doc.devise or "MAD")
+        # La position reelle des colonnes prime : elle DIT le sens de
+        # l'operation. La deduction par variation de solde ne sert que si le
+        # releve ne porte pas d'en-tetes Debit/Credit exploitables.
+        par_colonne, bank_anomalies = (
+            extract_bank_lines_by_column(cells, doc.devise or "MAD") if cells else ([], [])
+        )
+        if par_colonne:
+            doc.bank_lines = par_colonne
+        else:
+            doc.bank_lines, bank_anomalies = extract_bank_lines(lines, doc.devise or "MAD")
         doc.anomalies.extend(bank_anomalies)
         doc.anomalies.extend(check_bank_totals(doc, lines))
         period = _first_value(lines, ("Periode",))
@@ -953,11 +1255,90 @@ def extract_from_pdf_bytes(
     """Lit un PDF : couche texte native, puis OCR si elle est insuffisante."""
     pages = read_pdf_pages(data)
     source = "native"
+    cells = read_pdf_cells(data)
     if ocr and not _has_usable_text(pages):
         ocr_pages = ocr_pdf_pages(data)
         if _has_usable_text(ocr_pages):
-            pages, source = ocr_pages, "ocr"
-    return extract_document(pages, company=company, text_source=source)
+            pages, source, cells = ocr_pages, "ocr", []
+    return extract_document(pages, company=company, text_source=source, cells=cells)
+
+
+def read_image_text(data: bytes) -> str:
+    """OCR d'une image (facture photographiee), avec garde-fous.
+
+    Trois refus, tous par une erreur CLAIRE et non par un abandon silencieux,
+    pour que l'appelant inscrive une ligne tracable en quarantaine :
+      - une image trop grande (bombe de decompression) est refusee AVANT
+        d'etre ouverte en grand ;
+      - une image corrompue ou illisible leve ;
+      - un moteur OCR absent ou en echec leve.
+    """
+    try:
+        from PIL import Image  # type: ignore
+    except ImportError as exc:  # pragma: no cover - dependance manquante
+        raise DocumentExtractError(f"Dependance Pillow manquante: {exc}") from exc
+    import io
+
+    from app.attachments import MAX_IMAGE_PIXELS
+
+    # Plafonner Pillow AVANT tout decodage complet : une image piege ne doit
+    # jamais etre ouverte en grand.
+    # Pillow leve de lui-meme une DecompressionBombError au-dela de 2x ce
+    # plafond ; notre controle explicite couvre la zone entre le plafond et
+    # ce double. Les deux menent au MEME message clair (trop volumineuse),
+    # jamais au message generique d'image corrompue.
+    Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            width, height = img.size
+            if width * height > MAX_IMAGE_PIXELS:
+                raise DocumentExtractError(
+                    f"image trop volumineuse ({width}x{height} pixels, "
+                    f"plafond {MAX_IMAGE_PIXELS} pixels)"
+                )
+            img.load()
+            frame = img.convert("RGB")
+    except DocumentExtractError:
+        raise
+    except Image.DecompressionBombError as exc:
+        raise DocumentExtractError(
+            f"image trop volumineuse (bombe de decompression, plafond "
+            f"{MAX_IMAGE_PIXELS} pixels)"
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 - image corrompue / illisible
+        raise DocumentExtractError("image illisible ou corrompue.") from exc
+
+    try:
+        import pytesseract  # type: ignore
+    except ImportError as exc:  # pragma: no cover - dependance manquante
+        raise DocumentExtractError(f"Dependance pytesseract manquante: {exc}") from exc
+
+    # On vise le francais, mais un serveur ou le pack `fra` manque ne doit pas
+    # renvoyer TOUTES les images en quarantaine : on retombe alors sur `eng`,
+    # qui lit tout aussi bien les caracteres latins d'une facture. Seul un
+    # echec des DEUX est un vrai echec OCR.
+    last_error: Exception | None = None
+    for lang in ("fra+eng", "eng"):
+        try:
+            return pytesseract.image_to_string(frame, lang=lang)
+        except Exception as exc:  # noqa: BLE001 - langue absente ou moteur en echec
+            last_error = exc
+    raise DocumentExtractError("OCR de l'image en echec.") from last_error
+
+
+def extract_from_image_bytes(
+    data: bytes, *, company: str = "X BLASTE", ocr: bool = True
+) -> ExtractedDocument:
+    """Lit une facture photographiee (PNG/JPEG) par OCR, comme un PDF scanne.
+
+    Le texte OCR passe ENSUITE par le meme moteur de classification et
+    d'extraction que les PDF : memes controles comptables, meme seuil de
+    confiance, meme politique de quarantaine. Une image sans texte
+    exploitable leve `DocumentExtractError` et part en validation humaine
+    avec une raison tracable.
+    """
+    text = read_image_text(data)
+    return extract_document([text], company=company, text_source="ocr")
 
 
 # Un PDF scanne renvoie quelques caracteres parasites : on exige un minimum

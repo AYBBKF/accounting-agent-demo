@@ -188,14 +188,15 @@ def test_the_known_supplier_is_reused_and_never_duplicated(pipeline, workbook):
 def test_an_unknown_supplier_is_created_from_a_clean_invoice(pipeline, workbook):
     """Un fournisseur inconnu entre au classeur - si la facture est SAINE.
 
-    L'ancienne version de ce test creait la fiche depuis une facture dont
-    HT + TVA ne faisait pas le TTC : elle ne pouvait le faire que parce
-    qu'un bouton Telegram forcait l'ecriture. Ce chemin n'existe plus.
+    La fiche tiers est bien creee : identifier le fournisseur et
+    comptabiliser sa facture sont deux decisions distinctes. Depuis que
+    l'ICE fournisseur est exigible, la premiere a lieu et la seconde
+    attend - la fiche existe, l'ecriture comptable non.
     """
-    run(pipeline, SANS_ICE)               # EXPRESS SERVICE, ICE absent
+    run(pipeline, ACHAT)                  # ATLAS BUREAU SARL, ICE present
     created = workbook.rows("03_FOURNISSEURS")[-1]
-    assert created[0] == "FRS-007"
-    assert created[1] == "EXPRESS SERVICE"
+    assert created[1] == "ATLAS BUREAU SARL"
+    assert created[2]                     # ICE reellement lu, pas invente
 
 
 def test_an_incoherent_invoice_never_creates_a_supplier(pipeline, workbook):
@@ -424,48 +425,45 @@ def test_the_tolerance_is_explicit_and_absorbs_a_rounding_cent():
 
 # === 12. ICE manquant : signale, jamais bloquant =========================
 
-def test_a_missing_ice_alone_is_imported_automatically(pipeline, workbook):
-    """RECETTE 2 : l'absence d'ICE seule ne demande plus rien.
+def test_a_supplier_invoice_without_a_usable_ice_is_never_booked(pipeline, workbook):
+    """CONTRAT INVERSE : l'ICE fournisseur conditionne l'ecriture.
 
-    FAC-TEST-2026-004 : montants coherents, fournisseur EXPRESS SERVICE
-    lisible. Il n'y a aucune decision comptable a prendre, donc aucune
-    raison de reveiller le client. Une fiche provisoire est creee, son ICE
-    porte "A completer", et l'avertissement voyage avec le document.
+    Ce test disait exactement le contraire jusqu'ici - "l'absence d'ICE
+    seule ne demande plus rien" - et c'est ce contrat qui a laisse passer
+    en comptabilite cinq charges imputees a des fournisseurs sans ICE.
+    Cote FOURNISSEUR, l'ICE conditionne la deductibilite de la TVA : une
+    charge sans lui n'est pas justifiable. Elle part donc en quarantaine.
+
+    Cote CLIENT, rien ne change : l'ICE y reste un avertissement.
     """
+    outcome = run(pipeline, SANS_ICE)     # EXPRESS SERVICE, ICE absent
+    assert outcome.action == ACTION_REVIEW
+    assert outcome.tab == ""
+    assert workbook.writes_to("05_FACTURES_ACHATS") == []
+    assert any("ICE exploitable" in r for r in outcome.reasons)
+
+
+def test_the_ice_refusal_names_the_supplier_it_could_not_justify(pipeline):
+    """Le motif doit etre exploitable tel quel par le comptable."""
     outcome = run(pipeline, SANS_ICE)
-    assert outcome.action == ACTION_AUTO
-    assert outcome.tab == "05_FACTURES_ACHATS"
-    assert outcome.reasons == []
-
-    row = workbook.row("05_FACTURES_ACHATS", outcome.row_index)
-    assert row[2] == "FAC-TEST-2026-004"
-    assert row[4] == "EXPRESS SERVICE"
-
-    created = workbook.rows("03_FOURNISSEURS")[-1]
-    assert created[0] == "FRS-007"                 # identifiant interne provisoire
-    assert created[1] == "EXPRESS SERVICE"
-    assert created[2] == "A completer"             # ni vide ni invente
-
-    assert any("ICE absent" in w for w in outcome.warnings)
+    motif = " | ".join(outcome.reasons)
+    assert "EXPRESS SERVICE" in motif
+    assert "fournisseur" in motif.lower()
 
 
-def test_the_missing_ice_warning_reaches_the_import_log(pipeline, workbook):
-    outcome = run(pipeline, SANS_ICE)
-    detail = workbook.rows("14_IMPORTS_LOG")[-1][5]
-    assert "Avertissement" in detail and "ICE absent" in detail
-    assert outcome.stable_id
+def test_a_known_supplier_without_ice_is_still_not_enough_to_book(pipeline, workbook):
+    """Une fiche existante ne remplace pas l'ICE ABSENT DU DOCUMENT.
 
-
-def test_a_known_supplier_without_ice_is_reused_not_duplicated(pipeline, workbook):
-    """Regle 1 : nom normalise unique -> on reutilise la fiche existante."""
-    before = len(workbook.rows("03_FOURNISSEURS"))
+    La fiche interne peut avoir ete creee a la main, sans preuve. C'est le
+    document qui doit porter l'ICE : sinon l'ecriture s'appuierait sur une
+    saisie, pas sur une piece.
+    """
     workbook.tabs["03_FOURNISSEURS"].append(
         ["FRS-099", "EXPRESS SERVICE", "", "", "", "", 30]
     )
     outcome = run(pipeline, SANS_ICE)
-    assert outcome.action == ACTION_AUTO
-    assert workbook.row("05_FACTURES_ACHATS", outcome.row_index)[3] == "FRS-099"
-    assert len(workbook.rows("03_FOURNISSEURS")) == before + 1   # la seule ajoutee ici
+    assert outcome.action == ACTION_REVIEW
+    assert workbook.writes_to("05_FACTURES_ACHATS") == []
 
 
 def test_several_suppliers_with_the_same_name_do_require_a_decision(pipeline, workbook):

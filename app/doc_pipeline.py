@@ -17,16 +17,23 @@ par ce module.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from app import doc_store as store
-from app.attachments import DocumentFile, idempotency_key
-from app.doc_extract import ExtractedDocument, extract_from_pdf_bytes
+from app.attachments import DocumentFile, content_mimetype, idempotency_key, is_image
+from app.business_key import business_identity
+from app import doc_vision
+from app.doc_extract import (
+    ExtractedDocument,
+    extract_from_image_bytes,
+    extract_from_pdf_bytes,
+)
 from app.doc_policy import (
     NotWritable,
     assert_writable,
@@ -43,6 +50,7 @@ from app.doc_routing import (
     CUSTOMS_SPEC,
     NEW_TAB_SPECS,
     TAB_BANK,
+    TAB_RECONCILIATION,
     TAB_CLIENTS,
     TAB_CREDIT_NOTES,
     TAB_CUSTOMS,
@@ -201,6 +209,42 @@ class DocumentOutcome:
         return LABELS.get(self.doc_type, self.doc_type)
 
 
+def _stamp_micro() -> str:
+    """Horodatage UTC a la microseconde, utilisable comme nom d'onglet."""
+    return (
+        datetime.now(timezone.utc).isoformat()
+        .replace(":", "-").replace(".", "-")
+    )
+
+
+def _trim(lignes: list[list[Any]]) -> list[list[Any]]:
+    """Retire les cellules vides de fin de chaque ligne.
+
+    Une lecture A1:Z rend des lignes completees a vingt-six colonnes. Les
+    recopier telles quelles ferait d'une restauration une ligne de huit
+    colonnes suivie de dix-huit cellules vides : le contenu serait le bon,
+    l'onglet ne serait plus le meme.
+    """
+    propres: list[list[Any]] = []
+    for ligne in lignes:
+        copie = list(ligne)
+        while copie and str(copie[-1]) == "":
+            copie.pop()
+        propres.append(copie)
+    return propres
+
+
+def _last_column(lignes: list[list[Any]]) -> str:
+    """Derniere colonne REELLEMENT occupee par un bloc de lignes.
+
+    Ecrire systematiquement jusqu'a Z ajouterait des cellules vides a
+    droite de chaque ligne restauree : le contenu serait juste, la
+    comparaison avec l'original ne le serait plus.
+    """
+    largeur = max((len(l) for l in lignes), default=1)
+    return chr(ord("A") + max(0, min(largeur, 26) - 1))
+
+
 class DocumentPipeline:
     """Traite un document de bout en bout, avec reprise a l'etape exacte."""
 
@@ -213,6 +257,10 @@ class DocumentPipeline:
         spreadsheet_id: str,
         company: str = "X BLASTE",
         drive_root: str = "XBLASTE - Factures",
+        allowed_vat_rates: tuple[Decimal, ...] | None = None,
+        today: Callable[[], date] | None = None,
+        vision: Any | None = None,
+        vision_budget: Any | None = None,
     ) -> None:
         self._gw = gateway
         self._db = db_path
@@ -222,6 +270,16 @@ class DocumentPipeline:
         self._drive_root = drive_root
         self._tabs_cache: list[str] | None = None
         self._folder_cache: dict[str, str] = {}
+        # Taux de TVA autorises et horloge, INJECTES. Le pipeline ne lit ni
+        # la configuration ni l'heure au moment de decider : sans cela, un
+        # test de "facture datee dans le futur" cesserait de passer le jour
+        # ou cette date devient le passe.
+        self._vat_rates = tuple(allowed_vat_rates) if allowed_vat_rates else ()
+        self._today = today or date.today
+        # Escalade de lecture (Terra puis Sol). Absente => comportement
+        # deterministe strictement inchange.
+        self._vision = vision
+        self._vision_budget = vision_budget
 
     # -- utilitaires Sheets ------------------------------------------------
 
@@ -657,7 +715,7 @@ class DocumentPipeline:
         args: dict[str, Any] = {
             "source_url": source_url,
             "name": file.filename,
-            "mime_type": "application/pdf",
+            "mime_type": content_mimetype(file.content) if file.content else "application/pdf",
         }
         if target:
             args["parent_folder_id"] = target
@@ -675,9 +733,10 @@ class DocumentPipeline:
         upload = getattr(self._gw, "upload", None)
         if upload is None:
             return ""
+        mimetype = content_mimetype(file.content)
         try:
             key = upload(
-                name=file.filename, mimetype="application/pdf", content=file.content
+                name=file.filename, mimetype=mimetype, content=file.content
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("Depot du contenu de %s impossible: %s", file.display_name, exc)
@@ -687,7 +746,7 @@ class DocumentPipeline:
         args: dict[str, Any] = {
             "file_to_upload": {
                 "name": file.filename,
-                "mimetype": "application/pdf",
+                "mimetype": mimetype,
                 "s3key": key,
             }
         }
@@ -801,6 +860,15 @@ class DocumentPipeline:
             outcome.reasons = ["document deja traite lors d'un cycle precedent"]
             return outcome
         resuming = bool(existing and existing["state"] in store.STATES_AFTER_SHEET)
+        # Un document deja gare en quarantaine ("a verifier") est reexamine a
+        # chaque cycle, ce qui est voulu : un humain peut avoir corrige la
+        # piece. Mais les OCTETS n'ont pas change - la cle d'idempotence
+        # inclut leur empreinte - donc une relecture Terra/Sol rendrait
+        # exactement le meme resultat. La refaire toutes les cinq minutes
+        # facturerait indefiniment un appel de vision pour rien.
+        deja_en_quarantaine = bool(
+            existing and existing["state"] == store.NEEDS_REVIEW
+        )
         if not existing:
             store.claim_document(
                 self._db, doc_key, self._chat_id,
@@ -825,14 +893,50 @@ class DocumentPipeline:
             )
         store.set_state(self._db, doc_key, store.DOWNLOADED)
 
+        # --- meme fichier, deja connu et pas encore comptabilise -----------
+        # Ce controle est place AVANT l'extraction, et l'ordre est le
+        # correctif lui-meme. Place apres, il n'etait jamais atteint quand
+        # l'extraction levait : un PDF illisible renvoye dans un second
+        # email repartait de zero et laissait une seconde trace.
+        #
+        # Il ne peut pas non plus etre fondu dans la deduplication
+        # comptable : un document en quarantaine n'a rien ecrit, et
+        # l'annoncer "deja importe" serait faux. On rattache la nouvelle
+        # fiche a sa canonique, on la CONSERVE pour l'audit, et on ne
+        # touche a aucun onglet.
+        if not resuming:
+            twin = store.find_open_twin(
+                self._db, self._chat_id, file.sha256, exclude_key=doc_key
+            )
+            if twin is not None:
+                return self._attach_to_twin(outcome, twin)
+
         # --- extraction ---------------------------------------------------
+        # PDF et image partagent la meme suite : seule la PORTE d'entree
+        # differe (couche texte du PDF, ou OCR de l'image), choisie sur la
+        # signature du contenu et non sur l'extension. Tout ce qui suit -
+        # controles comptables, seuil de confiance, quarantaine - est
+        # identique. Une image illisible tombe dans le meme `except` qu'un
+        # PDF illisible et laisse donc, elle aussi, une ligne rouge tracable.
         try:
-            doc = extract_from_pdf_bytes(file.content, company=self._company)
-        except Exception as exc:  # noqa: BLE001 - PDF illisible
+            if is_image(file.content):
+                doc = extract_from_image_bytes(file.content, company=self._company)
+            else:
+                doc = extract_from_pdf_bytes(file.content, company=self._company)
+            if not deja_en_quarantaine:
+                self.escalate_reading(doc, file)
+        except Exception as exc:  # noqa: BLE001 - PDF/image illisible
+            # Un document illisible n'est pas un document perdu. Il laisse
+            # UNE ligne rouge, comme toute piece que le bot refuse de
+            # comptabiliser : sans elle, le comptable ne saurait jamais
+            # qu'un fichier lui est parvenu sans avoir pu etre lu.
             store.set_state(self._db, doc_key, store.FAILED, error=str(exc))
             outcome.action = ACTION_REVIEW
+            outcome.pending_review = True
             outcome.error = str(exc)
             outcome.reasons = [f"document illisible : {exc}"]
+            fiche = store.get_document(self._db, doc_key) or {}
+            self._quarantine(outcome, message, fiche)
             return outcome
 
         outcome.document = doc
@@ -857,6 +961,7 @@ class DocumentPipeline:
             if same_file and same_file["doc_key"] != doc_key:
                 duplicates.certain = True
                 duplicates.existing_ref = same_file["stable_id"] or same_file["doc_key"][:12]
+                duplicates.existing_key = str(same_file["doc_key"])
             else:
                 same_business = store.find_by_business_key(
                     self._db, self._chat_id, doc.doc_type, doc.numero or ""
@@ -864,6 +969,7 @@ class DocumentPipeline:
                 if same_business and same_business["doc_key"] != doc_key:
                     duplicates.certain = True
                     duplicates.existing_ref = same_business["stable_id"] or ""
+                    duplicates.existing_key = str(same_business["doc_key"])
 
         # --- tiers ----------------------------------------------------------
         party = PartyMatch()
@@ -892,6 +998,8 @@ class DocumentPipeline:
             party_ambiguous=party.ambiguous,
             party_reason=party.reason,
             receipt_matches=len(receipt_matches),
+            today=self._today(),
+            allowed_vat_rates=self._vat_rates or None,
         )
         decision = decide(doc, context)
         outcome.action = decision.action
@@ -902,7 +1010,15 @@ class DocumentPipeline:
         if decision.action == ACTION_DUPLICATE:
             # Meme validee, une facture deja enregistree n'est jamais ecrite
             # deux fois : ce serait une double ecriture comptable.
+            #
+            # La fiche est CONSERVEE et rattachee a sa canonique. Sans ce
+            # rattachement, l'audit voyait bien qu'un second exemplaire
+            # etait arrive, mais rien ne disait duquel il etait le double.
             store.set_state(self._db, doc_key, store.DUPLICATE)
+            if duplicates.existing_key:
+                store.update_document(
+                    self._db, doc_key, superseded_by=duplicates.existing_key
+                )
             outcome.stable_id = decision.existing_ref
             return outcome
 
@@ -1119,11 +1235,24 @@ class DocumentPipeline:
             return
 
         if kind == BANK_STATEMENT:
-            written, start = self.write_bank_statement(doc)
+            written, start = self.write_bank_statement(doc, doc_key=outcome.doc_key)
             outcome.tab = TAB_BANK
             outcome.row_index = start
             outcome.stable_id = doc.numero or f"REL-{year}"
             outcome.reasons.append(f"{written} operation(s) bancaire(s) ecrite(s)")
+            if written:
+                # Le rapprochement ne bloque JAMAIS l'ecriture du releve : une
+                # operation qu'on ne sait pas rattacher reste "Non rapproche".
+                try:
+                    rapproches = self.reconcile_bank_lines(doc, first_row=start)
+                except Exception as exc:  # noqa: BLE001 - jamais bloquant
+                    logger.warning("Rapprochement bancaire non effectue : %s", exc)
+                else:
+                    if rapproches:
+                        outcome.reasons.append(
+                            f"{len(rapproches)} rapprochement(s) : "
+                            + ", ".join(r["numero"] for r in rapproches)
+                        )
             return
 
         if kind == PAYMENT_RECEIPT:
@@ -1181,6 +1310,77 @@ class DocumentPipeline:
             store.update_document(self._db, outcome.doc_key, log_row=log_row)
         self._quarantine(outcome, message, known)
 
+    def _business_identity(self, outcome: DocumentOutcome) -> str:
+        """Identite comptable d'un document, telle qu'on la figera en base.
+
+        Construite a partir de l'`outcome`, donc des valeurs REELLEMENT
+        lues dans le PDF. Une identite vide est un refus de conclure : on
+        preferera toujours deux lignes a une fusion abusive.
+        """
+        doc = outcome.document
+        return business_identity({
+            "doc_type": outcome.doc_type,
+            "numero": outcome.numero,
+            "party_id": outcome.tiers,
+            "date_document": str(getattr(doc, "date_document", "") or ""),
+            "montant_ttc": outcome.montant_ttc,
+        })
+
+    def _existing_review_row(self, empreinte: str, doc_key: str) -> tuple[int, str] | None:
+        """Une ligne de quarantaine existe-t-elle deja pour CE document ?
+
+        La comparaison porte sur l'identite comptable stockee, jamais sur
+        le `doc_key` : celui-ci contient l'identifiant du message Gmail et
+        change donc d'un email a l'autre. C'est exactement ce qui produisait
+        deux lignes rouges pour une seule facture envoyee deux fois.
+
+        Rend (ligne, cle canonique), ou None si rien de fiable.
+        """
+        if not empreinte:
+            return None
+        for fiche in store.list_quarantined(self._db, self._chat_id):
+            if str(fiche.get("doc_key")) == doc_key:
+                continue
+            if str(fiche.get("business_key") or "") == empreinte:
+                return int(fiche["review_row"]), str(fiche["doc_key"])
+        return None
+
+    def _attach_to_twin(
+        self, outcome: DocumentOutcome, twin: dict[str, Any]
+    ) -> DocumentOutcome:
+        """Rattache une relecture a la fiche canonique du meme fichier.
+
+        Trois garanties, et la troisieme est la moins evidente :
+          - aucune ecriture, nulle part ;
+          - la fiche secondaire N'EST PAS supprimee : elle porte
+            `superseded_by`, donc l'audit sait que ce fichier est bien
+            arrive une seconde fois, et par quel email ;
+          - l'`outcome` pointe vers la ligne de quarantaine DEJA existante,
+            pour que le resume dise ou regarder au lieu d'annoncer un
+            import qui n'a pas eu lieu.
+        """
+        canonique = str(twin["doc_key"])
+        store.update_document(
+            self._db, outcome.doc_key,
+            superseded_by=canonique, state=store.SUPERSEDED,
+        )
+        ligne = int(twin.get("review_row") or 0)
+        outcome.action = ACTION_DUPLICATE
+        outcome.stable_id = str(twin.get("stable_id") or "")
+        if ligne:
+            outcome.tab = TAB_REVIEW
+            outcome.row_index = ligne
+        emplacement = f" ({TAB_REVIEW} ligne {ligne})" if ligne else ""
+        outcome.reasons = [
+            f"fichier identique deja enregistre sous {canonique[:12]}"
+            f"{emplacement} : aucune nouvelle ligne, aucune ecriture"
+        ]
+        logger.info(
+            "Document %s rattache a %s%s : fiche conservee, marquee superseded_by",
+            outcome.doc_key[:12], canonique[:12], emplacement,
+        )
+        return outcome
+
     def _quarantine(
         self,
         outcome: DocumentOutcome,
@@ -1199,6 +1399,28 @@ class DocumentPipeline:
         """
         if int(known.get("review_row") or 0):
             return
+
+        # Une ligne par document PHYSIQUE, pas par relecture. Le meme
+        # document peut revenir sous un fichier different - re-export,
+        # re-scan, tampon appose - donc avec une autre empreinte. Son
+        # identite COMPTABLE, elle, ne bouge pas.
+        empreinte = self._business_identity(outcome)
+        jumeau = self._existing_review_row(empreinte, outcome.doc_key)
+        if jumeau is not None:
+            ligne, canonique = jumeau
+            store.update_document(
+                self._db, outcome.doc_key,
+                review_row=ligne, superseded_by=canonique,
+            )
+            outcome.tab = TAB_REVIEW
+            outcome.row_index = ligne
+            logger.info(
+                "Document %s : meme identite metier que %s, ligne %s reutilisee "
+                "dans %s (aucune ligne ajoutee)",
+                outcome.doc_key[:12], canonique[:12], ligne, TAB_REVIEW,
+            )
+            return
+
         entry = ReviewEntry(
             doc_key=outcome.doc_key,
             detected_at=_now_iso(),
@@ -1222,7 +1444,10 @@ class DocumentPipeline:
                 entry.short_key, TAB_REVIEW, exc,
             )
             return
-        store.update_document(self._db, outcome.doc_key, review_row=row_index)
+        store.update_document(
+            self._db, outcome.doc_key,
+            review_row=row_index, business_key=empreinte,
+        )
 
     def _archive_for_review(
         self, file: DocumentFile, doc: ExtractedDocument, source_url: str, doc_key: str
@@ -1438,16 +1663,123 @@ class DocumentPipeline:
             self.mark_new_row(LIGNES_TAB, start + offset, "I")
         return len(rows)
 
-    def write_bank_statement(self, doc: ExtractedDocument) -> tuple[int, int]:
-        """Ecrit les operations nouvelles. Les operations deja connues sont
-        ignorees grace a leur empreinte : deux releves qui se chevauchent ne
-        creent pas de doublon."""
+    def _signal_bank_repeat(
+        self, doc: ExtractedDocument, account: str, line: Any, proprietaire: str
+    ) -> None:
+        """Inscrit un double paiement possible dans `21_A_VERIFIER`.
+
+        La cle de la ligne derive de l'EMPREINTE du mouvement : relire le
+        meme releve ne cree donc jamais une seconde alerte pour le meme
+        double paiement. Aucun montant n'entre en comptabilite : comme
+        toute ligne de quarantaine, ils sont ecrits en texte.
+        """
+        empreinte = bank_line_fingerprint(account, line)
+        libelle = str(getattr(line, "libelle", "") or "")
+        montant = getattr(line, "debit", None) or getattr(line, "credit", None)
+        jour = (
+            line.date_operation.isoformat()
+            if getattr(line, "date_operation", None) else ""
+        )
+        entry = ReviewEntry(
+            doc_key=hashlib.sha256(
+                f"double-paiement|{empreinte}".encode("utf-8")
+            ).hexdigest(),
+            detected_at=_now_iso(),
+            type_label="Double paiement possible",
+            numero=str(getattr(line, "reference", "") or ""),
+            tiers=account,
+            devise="MAD",
+            montant_ttc=montant,
+            reasons=[
+                f"operation identique a une operation deja enregistree "
+                f"({jour} - {libelle}) : double paiement possible",
+                "les deux mouvements sont conserves ; aucun n'a ete supprime",
+                f"premier enregistrement : {(proprietaire or 'releve anterieur')[:12]}",
+            ],
+            filename=f"{account} - {jour}",
+        )
+        try:
+            self.write_review(entry)
+        except Exception as exc:  # noqa: BLE001 - le cycle ne meurt jamais
+            logger.warning(
+                "Double paiement non inscrit dans %s (reessai au prochain "
+                "cycle) : %s", TAB_REVIEW, exc,
+            )
+
+    def write_bank_statement(
+        self, doc: ExtractedDocument, *, doc_key: str = ""
+    ) -> tuple[int, int]:
+        """Ecrit les operations d'un releve, et SIGNALE les repetitions.
+
+        L'ancien comportement retirait de la liste toute operation dont
+        l'empreinte etait deja connue - sans journal, sans anomalie, sans
+        trace. Deux cas radicalement differents subissaient le meme sort :
+
+          - le MEME releve reecrit (reprise, second passage) : la ligne
+            existante est la bonne, il n'y a rien a ajouter ;
+          - un mouvement REELLEMENT repete (deux virements identiques le
+            meme jour au meme fournisseur) : c'est peut-etre un double
+            paiement, et le supprimer revenait a effacer la preuve.
+
+        Desormais le second cas est ECRIT et signale en quarantaine. Le bot
+        ne decide pas s'il s'agit d'une erreur : il refuse seulement de
+        faire disparaitre un mouvement bancaire.
+        """
         account = doc.destinataire or "Banque Principale DEMO"
-        fresh = [
-            line for line in doc.bank_lines
-            if store.claim_bank_line(self._db, self._chat_id,
-                                     bank_line_fingerprint(account, line))
-        ]
+        fresh: list[Any] = []
+        repetees: list[tuple[Any, str]] = []
+
+        # Chaque OCCURRENCE d'un mouvement recoit sa propre empreinte :
+        # `<empreinte>#1`, `<empreinte>#2`... Sans ce rang, deux lignes
+        # identiques dans un meme releve partageaient une seule empreinte :
+        # la premiere la reservait, la seconde etait consideree comme
+        # "nouvelle" a CHAQUE relecture, et le rejeu du meme document
+        # ajoutait une ligne de plus a chaque tour (2, puis 3, puis 4...).
+        #
+        # Avec le rang, la reservation couvre autant d'occurrences qu'il y
+        # en a reellement : relire le meme releve n'en reserve aucune de
+        # plus, donc n'ecrit plus rien.
+        rangs: dict[str, int] = {}
+        for line in doc.bank_lines:
+            base = bank_line_fingerprint(account, line)
+            rangs[base] = rangs.get(base, 0) + 1
+            rang = rangs[base]
+            empreinte = f"{base}#{rang}"
+            repetition = rang > 1        # deja vue DANS CE RELEVE
+
+            if store.claim_bank_line(
+                self._db, self._chat_id, empreinte, doc_key=doc_key
+            ):
+                fresh.append(line)
+                if repetition:
+                    # Occurrence nouvelle, mais mouvement deja vu ici : on
+                    # l'ecrit ET on le signale.
+                    repetees.append((line, doc_key))
+                continue
+
+            proprietaire = store.bank_line_owner(self._db, empreinte)
+            if doc_key and proprietaire == doc_key:
+                # Cette occurrence precise a deja ete ecrite par CE
+                # document : relire n'ajoute rien, et ne realerte pas.
+                logger.info(
+                    "Releve %s : occurrence %d deja ecrite par ce meme "
+                    "document, ignoree (aucun doublon cree)",
+                    doc_key[:12], rang,
+                )
+                continue
+            # Un AUTRE document porte deja cette operation : chevauchement
+            # de releves ou paiement repete. On ecrit et on signale.
+            fresh.append(line)
+            repetees.append((line, proprietaire))
+
+        for line, proprietaire in repetees:
+            logger.warning(
+                "Double paiement possible sur %s : operation identique a une "
+                "operation deja enregistree par %s. Les DEUX mouvements sont "
+                "conserves.", account, (proprietaire or "un releve anterieur")[:12],
+            )
+            self._signal_bank_repeat(doc, account, line, proprietaire)
+
         if not fresh:
             return 0, 0
         subset = ExtractedDocument(classification=doc.classification)
@@ -1458,6 +1790,362 @@ class DocumentPipeline:
         for offset in range(len(rows)):
             self.mark_new_row(TAB_BANK, start + offset, "M")
         return len(rows), start
+
+    # -- escalade de lecture Luna -> Terra -> Sol --------------------------
+
+    def escalate_reading(self, doc: ExtractedDocument, file: Any) -> None:
+        """Relit un document que la lecture deterministe n'a pas su lire.
+
+        On monte d'un niveau seulement si c'est necessaire, et on s'ARRETE
+        des qu'un niveau rend un resultat qui franchit les six controles
+        comptables. Sol recoit les OCTETS DE L'IMAGE ORIGINALE, jamais le
+        texte OCR degrade : c'est lui le probleme.
+        """
+        if self._vision is None or not getattr(self._vision, "available", False):
+            return
+        raisons = doc_vision.escalation_reasons(doc)
+        if not raisons:
+            return
+        logger.info(
+            "Lecture a escalader (%s) : %s",
+            getattr(file, "filename", "?"), ", ".join(raisons),
+        )
+
+        niveaux = []
+        texte = getattr(doc, "raw_text", "") or ""
+        if texte.strip():
+            niveaux.append(("terra", lambda: self._vision.read_text(texte)))
+        if is_image(file.content):
+            niveaux.append((
+                "sol",
+                lambda: self._vision.read_image(file.content, content_mimetype(file.content)),
+            ))
+
+        for nom, appel in niveaux:
+            if nom == "sol":
+                if self._vision_budget is not None and not self._vision_budget.take():
+                    logger.warning("Budget vision epuise : %s reste en quarantaine",
+                                   getattr(file, "filename", "?"))
+                    doc.anomalies.append("relecture visuelle non effectuee : budget epuise")
+                    return
+            resultat = appel()
+            if resultat is None or resultat.is_empty:
+                continue
+            echecs = doc_vision.validate(
+                resultat, today=self._today(), allowed_rates=self._vat_rates,
+                allowed_currencies=("MAD",),
+            )
+            if echecs:
+                logger.info("Niveau %s rejete pour %s : %s", nom,
+                            getattr(file, "filename", "?"), " | ".join(echecs))
+                continue
+            doc_vision.apply_vision(doc, resultat)
+            logger.info(
+                "Niveau %s retenu pour %s : numero=%s HT=%s TVA=%s TTC=%s (confiance %.0f%%)",
+                nom, getattr(file, "filename", "?"), doc.numero,
+                doc.montant_ht and doc.montant_ht.value,
+                doc.montant_tva and doc.montant_tva.value,
+                doc.montant_ttc and doc.montant_ttc.value,
+                resultat.confidence * 100,
+            )
+            return
+
+    # -- rapprochement bancaire --------------------------------------------
+
+    def reconcile_bank_lines(
+        self, doc: ExtractedDocument, *, first_row: int
+    ) -> list[dict[str, Any]]:
+        """Rapproche les operations ecrites avec les factures deja comptabilisees.
+
+        Une correspondance n'est retenue que si TROIS elements concordent :
+        la REFERENCE citee par le libelle, le MONTANT au centime, et le SENS
+        de l'operation - un debit ne peut solder qu'une facture d'achat, un
+        credit qu'une facture de vente. Deux factures candidates, ou un sens
+        indetermine, ne rapprochent rien : le classeur garde "Non rapproche"
+        plutot qu'un lien invente.
+        """
+        rapproches: list[dict[str, Any]] = []
+        factures = {
+            TAB_PURCHASES: self._read(f"{TAB_PURCHASES}!A2:Q400"),
+            TAB_SALES: self._read(f"{TAB_SALES}!A2:Q400"),
+        }
+        for offset, line in enumerate(doc.bank_lines):
+            if not line.reference:
+                continue
+            if line.debit is not None:
+                tab, montant = TAB_PURCHASES, line.debit
+            elif line.credit is not None:
+                tab, montant = TAB_SALES, line.credit
+            else:
+                continue  # sens indetermine : on ne rapproche pas
+
+            voulue = normalize(line.reference)
+            candidates = []
+            for index, row in enumerate(factures[tab]):
+                if len(row) < 10 or not row[0]:
+                    continue
+                if normalize(str(row[2])) != voulue:
+                    continue
+                try:
+                    ttc = Decimal(str(row[9]).replace("\u202f", "").replace(",", ".").split()[0])
+                except Exception:  # noqa: BLE001 - cellule non numerique
+                    continue
+                if abs(abs(ttc) - abs(montant)) <= Decimal("0.01"):
+                    candidates.append((index + 2, row))
+            if len(candidates) != 1:
+                continue
+
+            row_index, row = candidates[0]
+            bank_row = first_row + offset
+            self._write(
+                f"{TAB_BANK}!L{bank_row}:M{bank_row}",
+                [[str(row[2]), "Rapproche"]],
+            )
+            self.settle_invoice(tab, row_index, abs(montant))
+            rapproches.append({
+                "tab": tab, "row": row_index, "numero": str(row[2]),
+                "tiers": str(row[4]) if len(row) > 4 else "",
+                "montant": abs(montant), "date": str(row[1]),
+                "sens": "Debit" if tab == TAB_PURCHASES else "Credit",
+            })
+
+        if rapproches:
+            depart = self.next_row(TAB_RECONCILIATION)
+            lignes = [[
+                "Facture d'achat" if r["tab"] == TAB_PURCHASES else "Facture de vente",
+                r["tab"], r["numero"], r["tiers"], to_number(r["montant"]),
+                r["date"], "Oui", f"Rapproche ({r['sens']})",
+            ] for r in rapproches]
+            self._write(
+                f"{TAB_RECONCILIATION}!A{depart}:H{depart + len(lignes) - 1}", lignes
+            )
+        return rapproches
+
+    # -- outillage du nettoyage audite -------------------------------------
+
+    def read_tab(self, tab: str) -> list[list[Any]]:
+        """Contenu brut d'un onglet, en-tete compris. Lecture seule."""
+        return self._read(f"{tab}!A1:Z2000")
+
+    def ensure_tab_with_headers(self, tab: str, headers: list[str]) -> None:
+        """Cree un onglet SIMPLE s'il manque. N'en modifie jamais un existant.
+
+        Distinct de `ensure_tab`, qui reclame une specification complete de
+        formats : le journal d'annulations ne porte que du texte, et lui
+        inventer des formats de devise serait le rendre trompeur.
+        """
+        if tab in self.tabs():
+            return
+        self._gw.execute(
+            "GOOGLESHEETS_ADD_SHEET",
+            {"spreadsheet_id": self._sheet, "title": tab, "force_unique": False},
+        )
+        colonne = chr(ord("A") + len(headers) - 1)
+        self._write(f"{tab}!A1:{colonne}1", [headers])
+        self._tabs_cache = None
+
+    def backup_tab(self, tab: str) -> str:
+        """Copie relue d'UN onglet quelconque, avant toute modification.
+
+        Generalise `backup_review_tab` a tous les onglets que le nettoyage
+        touche. Une sauvegarde du seul `21_A_VERIFIER` ne protegeait pas
+        `05_FACTURES_ACHATS`, `16_LIGNES_FACTURES` ni `14_IMPORTS_LOG`,
+        qui sont pourtant modifies eux aussi : le rollback etait donc
+        incomplet par construction.
+
+        Rend le nom de la copie, ou une chaine vide si l'onglet n'existe
+        pas. Leve si la copie ne se relit pas a l'identique.
+        """
+        if tab not in self.tabs(refresh=True):
+            logger.info("Onglet %s absent : aucune sauvegarde necessaire", tab)
+            return ""
+        lignes = _trim(self._read(f"{tab}!A1:Z5000"))
+        if not lignes:
+            logger.info("Onglet %s vide : rien a sauvegarder", tab)
+            return ""
+
+        # Horodatage a la MICROSECONDE : deux sauvegardes prises dans la
+        # meme seconde porteraient le meme nom, et la seconde ecrirait dans
+        # l'onglet de la premiere - exactement ce qu'une sauvegarde ne doit
+        # jamais faire.
+        nom = f"{tab}_BACKUP_{_stamp_micro()}"
+        if nom in self.tabs(refresh=True):
+            raise PipelineError(f"un onglet nomme {nom} existe deja.")
+        self._gw.execute(
+            "GOOGLESHEETS_ADD_SHEET",
+            {"spreadsheet_id": self._sheet, "title": nom, "force_unique": False},
+        )
+        self._tabs_cache = None
+        derniere = _last_column(lignes)
+        self._write(f"{nom}!A1:{derniere}{len(lignes)}", lignes)
+
+        relu = _trim(self._read(f"{nom}!A1:{derniere}5000"))
+        if len(relu) != len(lignes):
+            raise PipelineError(
+                f"Sauvegarde {nom} incomplete : {len(relu)} lignes relues "
+                f"sur {len(lignes)} attendues."
+            )
+        # On compare aussi le CONTENU, pas seulement le compte : une copie
+        # qui a le bon nombre de lignes vides ne serait pas une copie.
+        if relu != lignes:
+            raise PipelineError(
+                f"Sauvegarde {nom} differente de l'original : restauration "
+                f"impossible, aucune modification ne sera faite."
+            )
+        logger.info(
+            "Onglet %s sauvegarde dans %s | %d ligne(s) relues et comparees",
+            tab, nom, len(lignes),
+        )
+        return nom
+
+    def restore_tab(self, tab: str, backup: str) -> int:
+        """Restaure un onglet depuis sa copie. Rend le nombre de lignes.
+
+        Le rollback n'est pas une idee : c'est cette fonction, et elle est
+        testee en restaurant reellement des onglets modifies.
+        """
+        lignes = _trim(self._read(f"{backup}!A1:Z5000"))
+        if not lignes:
+            raise PipelineError(f"Sauvegarde {backup} vide : rien a restaurer.")
+        actuelles = _trim(self._read(f"{tab}!A1:Z5000"))
+        if actuelles:
+            # On efface TOUTE la surface actuelle, y compris les colonnes
+            # ajoutees par l'annulation : restaurer sans effacer laisserait
+            # la mention "ANNULEE APRES CONTROLE" a cote des montants
+            # revenus, ce qui serait pire que les deux etats separes.
+            self._gw.execute(
+                "GOOGLESHEETS_CLEAR_VALUES",
+                {
+                    "spreadsheet_id": self._sheet,
+                    "range": f"{tab}!A1:{_last_column(actuelles)}"
+                             f"{max(len(actuelles), len(lignes))}",
+                },
+            )
+        self._write(f"{tab}!A1:{_last_column(lignes)}{len(lignes)}", lignes)
+        logger.info("Onglet %s restaure depuis %s | %d ligne(s)", tab, backup, len(lignes))
+        return len(lignes)
+
+    def rewrite_review_rows(self, entries: list[ReviewEntry]) -> list[int]:
+        """Reconstruit `21_A_VERIFIER` a partir des SEULES entrees donnees.
+
+        L'ancienne migration marquait les doublons en base et croyait en
+        avoir fini : l'onglet, lui, gardait ses lignes secondaires. On
+        efface donc les lignes - jamais l'en-tete - et on les reecrit dans
+        l'ordre, sans trou.
+
+        Rend la liste des numeros de ligne attribues, dans le meme ordre
+        que `entries`. L'appelant DOIT s'en servir pour recalculer les
+        `review_row` stockes : apres un compactage, les positions memorisees
+        ne valent plus rien.
+        """
+        self.ensure_review_tab()
+        avant = self.clear_review_rows()
+        lignes: list[int] = []
+        for position, entry in enumerate(entries, start=2):
+            self._write(
+                f"{TAB_REVIEW}!A{position}:{REVIEW_LAST_COL}{position}",
+                [build_review_row(entry)],
+            )
+            self._paint_review_row(position)
+            lignes.append(position)
+
+        # Le surplus est efface APRES la reecriture. Composio n'expose
+        # aucune suppression de ligne : les lignes excedentaires restent
+        # dans la grille mais VIDES, donc en fin d'onglet, et une lecture
+        # n'en rend aucune. Aucun trou ne subsiste entre deux lignes
+        # ecrites, ce qui est la propriete qui compte.
+        fin = avant + 1
+        derniere = len(lignes) + 1
+        if fin > derniere:
+            self._gw.execute(
+                "GOOGLESHEETS_CLEAR_VALUES",
+                {
+                    "spreadsheet_id": self._sheet,
+                    "range": f"{TAB_REVIEW}!A{derniere + 1}:{REVIEW_LAST_COL}{fin}",
+                },
+            )
+        logger.info(
+            "Onglet %s reconstruit : %d ligne(s) canonique(s), %d ligne(s) "
+            "excedentaire(s) effacees, aucun trou intercale",
+            TAB_REVIEW, len(lignes), max(0, fin - derniere),
+        )
+        return lignes
+
+    def append_cancellation(
+        self, tab: str, identifiant: str, motif: str, avant: str
+    ) -> int:
+        """Conserve l'image AVANT annulation d'une ligne.
+
+        C'est ce qui distingue une annulation d'un effacement : sans cette
+        trace, plus rien ne permettrait de reconstruire la ligne d'origine
+        si la decision se revelait mauvaise.
+        """
+        from app.cleanup_migration import TAB_CANCELLATIONS
+
+        return self.append_row(
+            TAB_CANCELLATIONS,
+            [_now_iso(), tab, identifiant, motif, avant],
+            "E",
+        )
+
+    def neutralize_amounts(self, tab: str, identifiant: str, motif: str) -> int:
+        """Sort les montants d'une ligne des totaux, sans supprimer la ligne.
+
+        Toute valeur NUMERIQUE est vidée - c'est elle, et elle seule, qui
+        entre dans une somme. L'identifiant, les libelles et les dates
+        restent lisibles, et le motif est inscrit en fin de ligne.
+
+        La ligne n'est jamais supprimee : une suppression decalerait toutes
+        les suivantes, et les references notees ailleurs pointeraient alors
+        vers la mauvaise ecriture.
+        """
+        if tab not in self.tabs():
+            return 0
+        # Les lignes sont TRIMEES avant reecriture. Sans cela, une lecture
+        # A1:Z rendait des lignes de vingt-six colonnes, la mention
+        # d'annulation etait ajoutee en vingt-septieme position - donc en
+        # colonne AA, hors de la plage relue ensuite - et un second passage
+        # ne voyait plus qu'une ligne deja annulee l'avait ete.
+        lignes = _trim(self.read_tab(tab))
+        touchees = 0
+        for index, ligne in enumerate(lignes[1:], start=2):
+            if not ligne or str(ligne[0]).strip() != identifiant:
+                continue
+            neutralisee: list[Any] = [ligne[0]]
+            for cellule in ligne[1:]:
+                neutralisee.append(
+                    "" if isinstance(cellule, (int, float)) else cellule
+                )
+            neutralisee.append(f"ANNULEE APRES CONTROLE - {motif}")
+            if len(neutralisee) > 26:
+                raise PipelineError(
+                    f"{tab} : ligne trop large pour porter la mention "
+                    f"d'annulation ({len(neutralisee)} colonnes)."
+                )
+            colonne = chr(ord("A") + len(neutralisee) - 1)
+            self._write(f"{tab}!A{index}:{colonne}{index}", [neutralisee])
+            touchees += 1
+        return touchees
+
+    def mark_import_log(self, reference: str, statut: str) -> bool:
+        """Marque une entree de `14_IMPORTS_LOG`. Ne la retire JAMAIS.
+
+        Le journal d'import est la memoire de ce que le bot a fait. En
+        retirer une ligne parce qu'elle s'est revelee fausse reviendrait a
+        effacer la trace de l'erreur en meme temps que l'erreur.
+        """
+        from app.cleanup_migration import TAB_IMPORTS
+
+        if TAB_IMPORTS not in self.tabs():
+            return False
+        lignes = self.read_tab(TAB_IMPORTS)
+        marquee = False
+        for index, ligne in enumerate(lignes[1:], start=2):
+            if len(ligne) < 3 or str(ligne[2]).strip() != reference:
+                continue
+            self._write(f"{TAB_IMPORTS}!D{index}:D{index}", [[statut]])
+            marquee = True
+        return marquee
 
     def append_row(self, tab: str, values: list[Any], width: str) -> int:
         self.ensure_tab(tab)

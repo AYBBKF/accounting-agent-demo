@@ -36,11 +36,15 @@ SKIPPED = "skipped"
 DUPLICATE = "duplicate"
 PARTIAL = "partial"
 FAILED = "failed"
+# Fiche conservee pour l'audit, mais rattachee a une fiche canonique :
+# le MEME fichier etait deja connu, dans un autre email ou hors ZIP.
+# On ne supprime jamais la fiche secondaire, on la marque.
+SUPERSEDED = "superseded"
 
 ALL_STATES = (
     DETECTED, DOWNLOADED, EXTRACTED, VALIDATED, SHEET_WRITTEN, DETAILS_WRITTEN,
     DRIVE_ARCHIVED, CALENDAR_CREATED, LOGGED, COMPLETED, NEEDS_REVIEW, SKIPPED,
-    DUPLICATE, PARTIAL, FAILED,
+    DUPLICATE, PARTIAL, FAILED, SUPERSEDED,
 )
 
 # Etats a partir desquels la ligne comptable EXISTE deja : on ne la reecrit
@@ -49,7 +53,21 @@ STATES_AFTER_SHEET = frozenset({
     SHEET_WRITTEN, DETAILS_WRITTEN, DRIVE_ARCHIVED, CALENDAR_CREATED, LOGGED,
     PARTIAL,
 })
-TERMINAL_STATES = frozenset({COMPLETED, SKIPPED, DUPLICATE})
+TERMINAL_STATES = frozenset({COMPLETED, SKIPPED, DUPLICATE, SUPERSEDED})
+
+# Etats OUVERTS : le document existe, il n'a produit AUCUNE ecriture
+# comptable, et il attend encore quelque chose - une verification
+# humaine, un classement, ou une reprise apres echec. C'est exactement
+# la population que l'ancienne deduplication ne regardait pas : elle ne
+# reconnaissait un fichier deja vu que s'il avait ete COMPTABILISE.
+# Le meme PDF renvoye hors ZIP repartait donc de zero et creait une
+# seconde ligne rouge dans 21_A_VERIFIER.
+#
+# SKIPPED porte le document de type inconnu, FAILED le document dont la
+# lecture a echoue : tous deux se dupliquaient de la meme facon.
+OPEN_STATES = frozenset({
+    DETECTED, DOWNLOADED, EXTRACTED, VALIDATED, NEEDS_REVIEW, SKIPPED, FAILED,
+})
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS documents (
@@ -87,6 +105,7 @@ CREATE TABLE IF NOT EXISTS bank_line_fingerprints (
     fingerprint TEXT PRIMARY KEY,
     chat_id TEXT NOT NULL,
     row_index INTEGER,
+    doc_key TEXT,
     created_at TEXT NOT NULL
 );
 
@@ -128,6 +147,12 @@ _ADDED_COLUMNS = (
     ("member_path", "TEXT"),
     ("local_path", "TEXT"),
     ("review_archive", "INTEGER DEFAULT 0"),
+    # Identite COMPTABLE du document, figee au moment ou il entre en
+    # quarantaine. Le `doc_key` contient l'identifiant du message
+    # Gmail : il change d'un email a l'autre pour un meme document.
+    # Cette colonne, elle, permet de retrouver la ligne 21_A_VERIFIER
+    # deja ouverte pour ce document et de ne pas en creer une seconde.
+    ("business_key", "TEXT"),
     # Idempotence des NOTIFICATIONS. Sans ces colonnes, chaque cycle Gmail
     # renvoyait les memes messages : l'etat du document etait connu, mais
     # jamais l'etat DEJA NOTIFIE.
@@ -154,6 +179,11 @@ def ensure_schema(db_path: str) -> None:
         for column, kind in _ADDED_COLUMNS:
             if column not in existing:
                 conn.execute(f"ALTER TABLE documents ADD COLUMN {column} {kind}")
+        colonnes_bancaires = {
+            row[1] for row in conn.execute("PRAGMA table_info(bank_line_fingerprints)")
+        }
+        if "doc_key" not in colonnes_bancaires:
+            conn.execute("ALTER TABLE bank_line_fingerprints ADD COLUMN doc_key TEXT")
         conn.commit()
 
 
@@ -212,7 +242,7 @@ def update_document(db_path: str, doc_key: str, **fields: Any) -> None:
         "lines_written", "drive_link", "calendar_event", "log_row", "payload",
         "error", "attachment_id", "parent_attachment_id", "parent_filename",
         "member_path", "local_path", "review_archive", "review_row",
-        "superseded_by",
+        "superseded_by", "business_key",
     )
     columns = [k for k in fields if k in allowed]
     if not columns:
@@ -270,6 +300,60 @@ def find_by_sha256(db_path: str, chat_id: int, file_sha256: str) -> dict[str, An
         return dict(row) if row else None
 
 
+def find_open_twin(
+    db_path: str, chat_id: int, file_sha256: str, *, exclude_key: str = ""
+) -> dict[str, Any] | None:
+    """Le MEME fichier est-il deja connu, sans avoir rien produit ?
+
+    Complement indispensable de `find_by_sha256`, qui ne regarde que les
+    documents deja COMPTABILISES. Un document en quarantaine, de type
+    inconnu, ou dont la lecture a echoue, restait invisible : le meme PDF
+    renvoye dans un second email repartait de zero et ajoutait une seconde
+    ligne rouge dans `21_A_VERIFIER` pour un seul document physique.
+
+    On rend la fiche CANONIQUE, c'est-a-dire la plus ancienne, et jamais
+    une fiche deja rattachee a une autre : sans cela une chaine de
+    rattachements pourrait se former et le lien remonterait a un document
+    lui-meme secondaire.
+    """
+    import sqlite3
+
+    if not file_sha256:
+        return None
+    placeholders = ",".join("?" * len(OPEN_STATES))
+    with connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM documents WHERE chat_id = ? AND file_sha256 = ? "
+            f"AND state IN ({placeholders}) "
+            "AND (superseded_by IS NULL OR superseded_by = '') "
+            "AND doc_key != ? ORDER BY created_at LIMIT 1",
+            (str(chat_id), file_sha256, *sorted(OPEN_STATES), exclude_key or ""),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def list_quarantined(db_path: str, chat_id: int) -> list[dict[str, Any]]:
+    """Fiches qui occupent DEJA une ligne de `21_A_VERIFIER`.
+
+    Sert a garantir une ligne par document PHYSIQUE : avant d'en ecrire une
+    nouvelle, on cherche parmi celles-ci un document de meme identite
+    metier. Les fiches rattachees sont exclues - leur ligne est celle de
+    leur canonique.
+    """
+    import sqlite3
+
+    with connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT * FROM documents WHERE chat_id = ? AND review_row > 0 "
+            "AND (superseded_by IS NULL OR superseded_by = '') "
+            "ORDER BY created_at",
+            (str(chat_id),),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
 def find_by_business_key(
     db_path: str, chat_id: int, doc_type: str, numero: str
 ) -> dict[str, Any] | None:
@@ -285,6 +369,21 @@ def find_by_business_key(
             "AND UPPER(numero) = UPPER(?) AND stable_id IS NOT NULL AND stable_id != '' "
             "ORDER BY created_at LIMIT 1",
             (str(chat_id), doc_type, numero),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def find_by_stable_id(db_path: str, stable_id: str) -> dict[str, Any] | None:
+    """Retrouve la fiche d'une ecriture par son identifiant comptable."""
+    import sqlite3
+
+    if not stable_id:
+        return None
+    with connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM documents WHERE stable_id = ? ORDER BY created_at LIMIT 1",
+            (stable_id,),
         ).fetchone()
         return dict(row) if row else None
 
@@ -391,21 +490,41 @@ def list_by_message(db_path: str, chat_id: int, gmail_message_id: str) -> list[d
 
 # --- lignes bancaires -----------------------------------------------------
 
-def claim_bank_line(db_path: str, chat_id: int, fingerprint: str, row_index: int = 0) -> bool:
+def claim_bank_line(
+    db_path: str, chat_id: int, fingerprint: str, row_index: int = 0,
+    doc_key: str = "",
+) -> bool:
     """Reserve une operation bancaire. False si elle existe deja.
 
-    Deux releves qui se chevauchent ne creent pas deux fois la meme ligne.
+    On memorise DESORMAIS quel document l'a reservee. Sans cette
+    information, deux situations opposees etaient indiscernables :
+      - le meme releve reecrit, ou la ligne existante est la bonne ;
+      - un mouvement REELLEMENT repete, qui doit etre signale.
+    L'ancien code les traitait toutes deux en supprimant la seconde ligne,
+    en silence.
     """
     if not fingerprint:
         return True
     with connect(db_path) as conn:
         cur = conn.execute(
             "INSERT OR IGNORE INTO bank_line_fingerprints "
-            "(fingerprint, chat_id, row_index, created_at) VALUES (?,?,?,?)",
-            (fingerprint, str(chat_id), row_index, _now()),
+            "(fingerprint, chat_id, row_index, doc_key, created_at) VALUES (?,?,?,?,?)",
+            (fingerprint, str(chat_id), row_index, doc_key or "", _now()),
         )
         conn.commit()
         return cur.rowcount == 1
+
+
+def bank_line_owner(db_path: str, fingerprint: str) -> str:
+    """Quel document a enregistre cette operation en premier ?"""
+    if not fingerprint:
+        return ""
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT doc_key FROM bank_line_fingerprints WHERE fingerprint = ?",
+            (fingerprint,),
+        ).fetchone()
+        return str(row[0] or "") if row else ""
 
 
 # --- evenements Calendar --------------------------------------------------

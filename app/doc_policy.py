@@ -24,6 +24,8 @@ bouton.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import re
+from datetime import date, timedelta
 from decimal import Decimal
 
 from app.doc_extract import CURRENCIES, ExtractedDocument
@@ -65,19 +67,47 @@ PARTY_NAME_STOPWORDS = frozenset({
     "EN", "FR", "DE", "ES", "IT", "TVA", "VAT", "HT", "TTC", "NON", "OUI",
     "N/A", "NA", "SA", "SARL", "SAS", "LTD", "GMBH", "INC", "CO", "TOTAL",
     "FACTURE", "INVOICE", "CLIENT", "FOURNISSEUR", "SUPPLIER", "CUSTOMER",
+    # Mentions GENERIQUES : elles ressemblent a une raison sociale et n'en
+    # sont pas. "SARL" seul a suffi a ouvrir une fiche fournisseur.
+    "SARL AU", "SNC", "SCI", "SPA", "BV", "NV", "AG", "OY", "AB", "PLC",
+    "SOCIETE", "SOCIETE ANONYME", "ENTREPRISE", "ETABLISSEMENT", "ETS",
+    "DIVERS", "AUTRE", "AUTRES", "INCONNU", "UNKNOWN", "ANONYME",
+    "FOURNISSEUR DIVERS", "CLIENT DIVERS", "SANS NOM", "NEANT", "NON PRECISE",
+})
+
+# Une raison sociale credible porte au moins un mot qui n'est pas une forme
+# juridique. "GLOBAL TECH PARTS LTD" en a trois ; "SARL" n'en a aucun.
+LEGAL_FORMS = frozenset({
+    "SA", "SARL", "SAS", "SASU", "SNC", "SCI", "SPA", "AU", "LTD", "LIMITED",
+    "GMBH", "INC", "CO", "CORP", "LLC", "BV", "NV", "AG", "PLC", "OY", "AB",
 })
 
 
 def usable_party_name(name: str | None) -> bool:
-    """Le nom identifie-t-il reellement un tiers ?"""
+    """Le nom identifie-t-il reellement un tiers ?
+
+    Trois refus successifs, du plus grossier au plus subtil :
+      - trop court ;
+      - mot-outil ou mention generique connue ;
+      - uniquement des formes juridiques, sans aucun mot propre.
+    """
     candidate = (name or "").strip().strip(":;,.").strip()
     if len(candidate) < MIN_PARTY_NAME_LENGTH:
         return False
-    return candidate.upper() not in PARTY_NAME_STOPWORDS
+    majuscules = candidate.upper()
+    if majuscules in PARTY_NAME_STOPWORDS:
+        return False
+    jetons = [j for j in re.split(r"[^0-9A-Za-z]+", majuscules) if j]
+    if not jetons:
+        return False
+    return any(jeton not in LEGAL_FORMS for jeton in jetons)
 
 
 # Types pour lesquels l'ICE du tiers est indispensable : ce sont ceux qui
 # creent ou completent une fiche tiers et une ecriture comptable.
+# Les seuls types qui portent legitimement un montant negatif.
+CREDIT_NOTE_TYPES = frozenset({SUPPLIER_CREDIT_NOTE, CLIENT_CREDIT_NOTE})
+
 NEEDS_PARTY_ID = frozenset({
     PURCHASE_INVOICE, SALES_INVOICE, SUPPLIER_CREDIT_NOTE, CLIENT_CREDIT_NOTE,
 })
@@ -88,6 +118,11 @@ class DuplicateState:
     certain: bool = False
     uncertain: bool = False
     existing_ref: str = ""
+    # Cle COMPLETE du document canonique. `existing_ref` est une reference
+    # lisible (identifiant comptable, prefixe) faite pour l'affichage ;
+    # elle ne permet pas de retrouver la fiche. Le rattachement d'audit,
+    # lui, a besoin de la vraie cle.
+    existing_key: str = ""
 
 
 @dataclass
@@ -104,6 +139,17 @@ class DecisionContext:
     # Taux de change disponible pour une facture en devise etrangere.
     exchange_rate: Decimal | None = None
     tolerance: Decimal = DEFAULT_TOLERANCE
+    # Jour de reference pour juger qu'une date est dans le futur. INJECTE,
+    # jamais lu depuis l'horloge : un module de decision qui consulte
+    # l'heure n'est pas testable deux fois de la meme facon.
+    today: date | None = None
+    # Taux de TVA autorises par la configuration du client. `None` signifie
+    # "non renseigne", donc regle inapplicable - et surtout pas "aucun taux
+    # autorise", qui refuserait toutes les factures.
+    allowed_vat_rates: tuple[Decimal, ...] | None = None
+    # Tolerance de dates futures, en jours. Zero par defaut : une facture
+    # datee de demain n'existe pas.
+    future_days_allowed: int = 0
 
 
 @dataclass
@@ -189,6 +235,55 @@ def decide(doc: ExtractedDocument, context: DecisionContext | None = None) -> De
                 f"HT + TVA ne correspond pas au TTC (ecart {ecart} > tolerance {ctx.tolerance})"
             )
 
+    # 4bis. Date dans le FUTUR. Une facture datee de demain n'existe pas :
+    #       soit la lecture s'est trompee d'annee - le cas reel etait une
+    #       facture 2026 lue "2027-01-15", qui a en plus fait basculer la
+    #       numerotation comptable en FA-2027-xxx - soit le document est
+    #       faux. Dans les deux cas, un humain doit regarder.
+    if doc.doc_type in ACCOUNTING_TYPES and doc.date_document and ctx.today:
+        limite = ctx.today + timedelta(days=max(0, ctx.future_days_allowed))
+        if doc.date_document > limite:
+            reasons.append(
+                f"document date dans le futur ({doc.date_document.isoformat()}, "
+                f"aujourd'hui {ctx.today.isoformat()})"
+            )
+
+    # 4ter. Taux de TVA hors des taux autorises par la configuration du
+    #       client. Un taux de 17 % au Maroc n'existe pas : c'est une
+    #       lecture erronee ou un document a verifier. La liste vient de
+    #       VAT_RATES_AVAILABLE, injectee ici - le module ne lit aucune
+    #       configuration lui-meme.
+    if (
+        doc.doc_type in ACCOUNTING_TYPES
+        and ctx.allowed_vat_rates
+        and doc.taux_tva is not None
+    ):
+        if Decimal(doc.taux_tva) not in ctx.allowed_vat_rates:
+            autorises = ", ".join(f"{taux}%" for taux in ctx.allowed_vat_rates)
+            reasons.append(
+                f"taux de TVA {doc.taux_tva}% absent des taux autorises "
+                f"({autorises})"
+            )
+
+    # 4quater. Montant NEGATIF sur un document qui n'est pas un avoir. Le
+    #          signe porte le sens comptable : une facture d'achat a -1 000
+    #          MAD creditee comme une charge inverse le resultat sans que
+    #          personne ne l'ait decide. Seul un avoir porte legitimement
+    #          un montant negatif.
+    if doc.doc_type in ACCOUNTING_TYPES and doc.doc_type not in CREDIT_NOTE_TYPES:
+        negatifs = [
+            nom for nom, montant in (
+                ("HT", doc.montant_ht), ("TVA", doc.montant_tva),
+                ("TTC", doc.montant_ttc),
+            )
+            if montant is not None and montant.value < 0
+        ]
+        if negatifs:
+            reasons.append(
+                f"montant {'/'.join(negatifs)} negatif sur un document qui "
+                f"n'est pas un avoir"
+            )
+
     # 5. Plusieurs montants possibles pour un meme champ.
     for name in doc.ambigus:
         reasons.append(f"plusieurs valeurs possibles pour {_label(name)}")
@@ -251,6 +346,15 @@ def decide(doc: ExtractedDocument, context: DecisionContext | None = None) -> De
             if not (party_name or "").strip():
                 # Ni ICE ni raison sociale : plus rien n'identifie le tiers.
                 reasons.append("tiers non identifiable (ni ICE ni raison sociale)")
+            elif doc.doc_type in (PURCHASE_INVOICE, SUPPLIER_CREDIT_NOTE):
+                # Cote FOURNISSEUR, l'ICE conditionne la deductibilite de la
+                # TVA : une charge imputee a un fournisseur sans ICE
+                # exploitable n'est pas justifiable devant l'administration.
+                # C'etait un simple avertissement ; c'est desormais un refus.
+                reasons.append(
+                    f"facture fournisseur sans ICE exploitable "
+                    f"(tiers lu : {party_name!r})"
+                )
             else:
                 warnings.append(
                     f"ICE absent du document : fiche tiers '{party_name}' a completer"
