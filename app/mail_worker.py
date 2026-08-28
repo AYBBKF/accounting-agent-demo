@@ -15,6 +15,7 @@ journalise ni renvoye dans un message.
 """
 from __future__ import annotations
 
+import re
 import time
 
 import hashlib
@@ -123,6 +124,12 @@ def notify_state_of(outcome: "DocumentOutcome", state: str = "") -> str:
 
 def is_silent_rejection(reason: str) -> bool:
     return any(motif in reason for motif in SILENT_REJECTIONS)
+
+
+# Bornes de date que l'exploitant peut poser lui-meme dans la requete
+# configuree. Si l'une d'elles est presente, le curseur n'en ajoute pas une
+# seconde : deux `after:` dans la meme requete rendent un resultat VIDE.
+_HAS_DATE_BOUND = re.compile(r"\b(?:after|before|newer_than|older_than):", re.I)
 
 
 class MailWorkerError(RuntimeError):
@@ -433,7 +440,30 @@ class MailWorker:
         )
 
     def effective_query(self) -> str:
-        return f"{self._query} after:{store.query_floor(self.cursor())}"
+        """Requete Gmail reellement envoyee, curseur compris.
+
+        Deux pieges reels, verifies contre l'API :
+
+          - Gmail ne rend AUCUN message pour `after:0`. La borne est
+            rejetee, pas interpretee comme "depuis toujours".
+          - deux bornes `after:` dans la meme requete ne se combinent pas :
+            l'ensemble resultat est VIDE. Une borne posee par
+            l'exploitant dans la requete configuree etait donc annulee par
+            celle du curseur, et le worker ne trouvait plus jamais rien -
+            en silence, sans erreur.
+
+        Quand la requete configuree porte deja sa propre borne de date,
+        c'est elle qui fait foi et le curseur n'en ajoute pas une seconde.
+        C'est aussi le seul moyen de faire relire une periode passee dans
+        un environnement neuf, dont le curseur demarre a l'instant present.
+        La deduplication reste seule garante contre la double ecriture.
+        """
+        if _HAS_DATE_BOUND.search(self._query):
+            return self._query
+        floor = store.query_floor(self.cursor())
+        if floor <= 0:
+            return self._query
+        return f"{self._query} after:{floor}"
 
     def rewind(self, hours: int = 24) -> int:
         """Recul volontaire du curseur (/reprocess). Les documents deja
