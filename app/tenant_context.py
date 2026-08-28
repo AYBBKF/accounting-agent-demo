@@ -154,6 +154,11 @@ class TenantContext:
             company_id=self.company_id,
         )
 
+    def rewind_cursor(self, seconds: int) -> int:
+        return store.rewind_cursor(
+            self.db_path, self.chat_id, seconds, company_id=self.company_id
+        )
+
     def notification_signature(self, message_id: str) -> str:
         return store.email_notification_signature(
             self.db_path, self.chat_id, message_id, company_id=self.company_id

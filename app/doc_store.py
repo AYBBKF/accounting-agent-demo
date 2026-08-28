@@ -663,22 +663,30 @@ def advance_cursor(
         conn.commit()
 
 
-def rewind_cursor(db_path: str, chat_id: int, seconds: int) -> int:
+def rewind_cursor(
+    db_path: str, chat_id: int, seconds: int, *, company_id: str = ""
+) -> int:
     """Recul volontaire du curseur (commande /reprocess).
 
     Les documents deja traites restent proteges par leur cle d'idempotence :
     reculer le curseur fait relire des emails, pas reecrire des lignes.
+
+    La portee est celle d'UNE entreprise. Sans elle, un `/reprocess`
+    demande pour une comptabilite reculait aussi le curseur de toutes
+    celles qui partagent le meme canal Telegram : elles relisaient des
+    semaines d'emails que personne n'avait demande de relire.
     """
+    portee, params = _scope(company_id)
     with connect(db_path) as conn:
         conn.execute(
             "UPDATE gmail_sync_state SET last_internal_date = MAX(0, last_internal_date - ?), "
-            "updated_at = ? WHERE chat_id = ?",
-            (int(seconds), _now(), str(chat_id)),
+            f"updated_at = ? WHERE chat_id = ?{portee}",
+            (int(seconds), _now(), str(chat_id), *params),
         )
         conn.commit()
         row = conn.execute(
-            "SELECT last_internal_date FROM gmail_sync_state WHERE chat_id = ?",
-            (str(chat_id),),
+            f"SELECT last_internal_date FROM gmail_sync_state WHERE chat_id = ?{portee}",
+            (str(chat_id), *params),
         ).fetchone()
         return int(row[0]) if row else 0
 

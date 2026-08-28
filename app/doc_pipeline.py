@@ -261,10 +261,18 @@ class DocumentPipeline:
         today: Callable[[], date] | None = None,
         vision: Any | None = None,
         vision_budget: Any | None = None,
+        company_id: str = "",
     ) -> None:
         self._gw = gateway
         self._db = db_path
         self._chat_id = chat_id
+        # Entreprise proprietaire de CE traitement. Toute recherche d'etat
+        # (doublon, jumeau ouvert, empreinte bancaire, quarantaine) est
+        # enfermee dedans : une piece envoyee a deux societes doit produire
+        # une ecriture dans CHACUNE, et jamais une seule "deja vue".
+        # Une chaine vide preserve exactement le comportement mono-entreprise
+        # d'avant la V2, le temps que la migration ait tourne.
+        self._company_id = company_id
         self._sheet = spreadsheet_id
         self._company = company
         self._drive_root = drive_root
@@ -280,6 +288,14 @@ class DocumentPipeline:
         # deterministe strictement inchange.
         self._vision = vision
         self._vision_budget = vision_budget
+
+    @property
+    def company_id(self) -> str:
+        return self._company_id
+
+    def _scope(self) -> dict[str, str]:
+        """Portee entreprise a joindre a CHAQUE recherche d'etat."""
+        return {"company_id": self._company_id}
 
     # -- utilitaires Sheets ------------------------------------------------
 
@@ -844,7 +860,9 @@ class DocumentPipeline:
         # empreinte du fichier) identifie la piece une fois pour toutes.
         # Sans cela, chaque cycle recreait un document neuf, les boutons
         # pointaient vers des cles mortes et les reprises n'aboutissaient pas.
-        known = store.find_by_message_and_sha(self._db, self._chat_id, message_id, file.sha256)
+        known = store.find_by_message_and_sha(
+            self._db, self._chat_id, message_id, file.sha256, **self._scope()
+        )
         if known is not None:
             doc_key = known["doc_key"]
         outcome = DocumentOutcome(doc_key=doc_key, filename=file.display_name)
@@ -878,6 +896,7 @@ class DocumentPipeline:
                 parent_attachment_id=parent_attachment_id or attachment_id,
                 parent_filename=parent_filename or file.container or file.filename,
                 member_path=file.member_path, local_path=local_path,
+                **self._scope(),
             )
         else:
             # Reprise : on rafraichit ce qui a pu changer cote Gmail
@@ -906,7 +925,8 @@ class DocumentPipeline:
         # touche a aucun onglet.
         if not resuming:
             twin = store.find_open_twin(
-                self._db, self._chat_id, file.sha256, exclude_key=doc_key
+                self._db, self._chat_id, file.sha256, exclude_key=doc_key,
+                **self._scope()
             )
             if twin is not None:
                 return self._attach_to_twin(outcome, twin)
@@ -957,14 +977,17 @@ class DocumentPipeline:
         # --- doublons ------------------------------------------------------
         duplicates = DuplicateState()
         if not resuming:
-            same_file = store.find_by_sha256(self._db, self._chat_id, file.sha256)
+            same_file = store.find_by_sha256(
+                self._db, self._chat_id, file.sha256, **self._scope()
+            )
             if same_file and same_file["doc_key"] != doc_key:
                 duplicates.certain = True
                 duplicates.existing_ref = same_file["stable_id"] or same_file["doc_key"][:12]
                 duplicates.existing_key = str(same_file["doc_key"])
             else:
                 same_business = store.find_by_business_key(
-                    self._db, self._chat_id, doc.doc_type, doc.numero or ""
+                    self._db, self._chat_id, doc.doc_type, doc.numero or "",
+                    **self._scope()
                 )
                 if same_business and same_business["doc_key"] != doc_key:
                     duplicates.certain = True
@@ -1338,7 +1361,7 @@ class DocumentPipeline:
         """
         if not empreinte:
             return None
-        for fiche in store.list_quarantined(self._db, self._chat_id):
+        for fiche in store.list_quarantined(self._db, self._chat_id, **self._scope()):
             if str(fiche.get("doc_key")) == doc_key:
                 continue
             if str(fiche.get("business_key") or "") == empreinte:
@@ -1748,7 +1771,7 @@ class DocumentPipeline:
             repetition = rang > 1        # deja vue DANS CE RELEVE
 
             if store.claim_bank_line(
-                self._db, self._chat_id, empreinte, doc_key=doc_key
+                self._db, self._chat_id, empreinte, doc_key=doc_key, **self._scope()
             ):
                 fresh.append(line)
                 if repetition:

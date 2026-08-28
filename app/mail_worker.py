@@ -277,7 +277,13 @@ class MailWorker:
         allowed_vat_rates: tuple[Decimal, ...] | None = None,
         vision: Any | None = None,
         vision_max_calls: int = 0,
+        company_id: str = "",
     ) -> None:
+        # Entreprise servie par CE worker. Elle scope le curseur Gmail, la
+        # memoire des notifications et toutes les recherches d'etat. Une
+        # chaine vide = comportement mono-entreprise d'avant la V2, conserve
+        # intact tant que la migration n'a pas tourne.
+        self._company_id = company_id
         self._vision = vision
         # Budget d'appels au niveau vision, remis a zero a CHAQUE email.
         self._vision_budget = doc_vision.VisionBudget(vision_max_calls)
@@ -307,6 +313,14 @@ class MailWorker:
         return bool(self._api_key) and bool(self._chat_id)
 
     @property
+    def company_id(self) -> str:
+        return self._company_id
+
+    def _scope(self) -> dict[str, str]:
+        """Portee entreprise a joindre a CHAQUE lecture ou ecriture d'etat."""
+        return {"company_id": self._company_id}
+
+    @property
     def poll_seconds(self) -> int:
         return self._poll_seconds
 
@@ -330,6 +344,7 @@ class MailWorker:
                 drive_root=self._drive_folder,
                 allowed_vat_rates=self._vat_rates or None,
                 vision=self._vision, vision_budget=self._vision_budget,
+                company_id=self._company_id,
             )
         return self._pipeline
 
@@ -485,7 +500,8 @@ class MailWorker:
     def cursor(self) -> dict[str, Any]:
         store.ensure_schema(self._db_path)
         return store.get_or_init_cursor(
-            self._db_path, self._chat_id, int(datetime.now(timezone.utc).timestamp())
+            self._db_path, self._chat_id,
+            int(datetime.now(timezone.utc).timestamp()), **self._scope()
         )
 
     def effective_query(self) -> str:
@@ -518,7 +534,9 @@ class MailWorker:
         """Recul volontaire du curseur (/reprocess). Les documents deja
         traites restent proteges par leur cle d'idempotence."""
         store.ensure_schema(self._db_path)
-        return store.rewind_cursor(self._db_path, self._chat_id, hours * 3600)
+        return store.rewind_cursor(
+            self._db_path, self._chat_id, hours * 3600, **self._scope()
+        )
 
     # -- lecture Gmail -----------------------------------------------------
 
@@ -638,7 +656,9 @@ class MailWorker:
                     message_id,
                 )
         if newest:
-            store.advance_cursor(self._db_path, self._chat_id, newest)
+            store.advance_cursor(
+                self._db_path, self._chat_id, newest, **self._scope()
+            )
         return summaries
 
     def run_startup_tasks(self) -> None:
@@ -812,13 +832,14 @@ class MailWorker:
                 repr(sorted(rejets)).encode("utf-8")
             ).hexdigest()
             connue = store.email_notification_signature(
-                self._db_path, self._chat_id, summary.message_id
+                self._db_path, self._chat_id, summary.message_id, **self._scope()
             )
             if signature == connue:
                 rejets = []
             else:
                 store.remember_email_notification(
-                    self._db_path, self._chat_id, summary.message_id, signature
+                    self._db_path, self._chat_id, summary.message_id, signature,
+                    **self._scope()
                 )
         summary.notifiable_rejected = rejets
         summary.planned = True
@@ -885,7 +906,7 @@ class MailWorker:
         """
         doc_key = idempotency_key(self.user_id, message_id, file.stable_ref, file.sha256)
         known = store.find_by_message_and_sha(
-            self._db_path, self._chat_id, message_id, file.sha256
+            self._db_path, self._chat_id, message_id, file.sha256, **self._scope()
         )
         if known is not None:
             doc_key = known["doc_key"]
