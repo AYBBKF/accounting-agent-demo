@@ -29,6 +29,7 @@ from app import doc_store as store
 from app.attachments import DocumentFile, content_mimetype, idempotency_key, is_image
 from app.business_key import business_identity
 from app import doc_vision
+from app import llm_usage
 from app.doc_extract import (
     ExtractedDocument,
     extract_from_image_bytes,
@@ -1816,6 +1817,34 @@ class DocumentPipeline:
 
     # -- escalade de lecture Luna -> Terra -> Sol --------------------------
 
+    def _journaliser_appel(
+        self, level: str, model: str, reason: str, outcome: str,
+        input_tokens: int, output_tokens: int, doc_key: str,
+    ) -> None:
+        """Impute UN appel de modele a l'entreprise en cours.
+
+        Sans entreprise (mode mono-entreprise d'avant la V2) il n'y a rien
+        a ventiler : on n'ecrit pas une ligne qu'on ne saurait pas lire.
+        Une panne du journal ne doit jamais faire perdre une lecture qui,
+        elle, a reussi.
+        """
+        if not self._company_id:
+            return
+        if not model and self._vision is not None:
+            model = getattr(self._vision, "model_for", lambda _l: "")(level)
+        try:
+            llm_usage.record_call(
+                self._db, company_id=self._company_id, level=level,
+                model=model or level, doc_key=doc_key, reason=reason,
+                outcome=outcome, input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                estimated_cost_usd=llm_usage.estimate_cost(
+                    model, input_tokens, output_tokens
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 - jamais bloquant
+            logger.warning("Journal des couts indisponible : %s", type(exc).__name__)
+
     def escalate_reading(self, doc: ExtractedDocument, file: Any) -> None:
         """Relit un document que la lecture deterministe n'a pas su lire.
 
@@ -1844,6 +1873,9 @@ class DocumentPipeline:
                 lambda: self._vision.read_image(file.content, content_mimetype(file.content)),
             ))
 
+        motif = _motif_escalade(raisons)
+        doc_key = getattr(file, "doc_key", "") or ""
+
         for nom, appel in niveaux:
             if nom == "sol":
                 if self._vision_budget is not None and not self._vision_budget.take():
@@ -1852,7 +1884,19 @@ class DocumentPipeline:
                     doc.anomalies.append("relecture visuelle non effectuee : budget epuise")
                     return
             resultat = appel()
-            if resultat is None or resultat.is_empty:
+            # CHAQUE tentative est imputee, y compris celles qui echouent :
+            # un appel refuse ou rejete a ete facture tout de meme, et une
+            # escalade qui coute sans rien rendre est exactement ce qu'on
+            # veut voir dans le journal.
+            if resultat is None:
+                self._journaliser_appel(nom, "", motif, llm_usage.OUTCOME_UNAVAILABLE,
+                                        0, 0, doc_key)
+                continue
+            if resultat.is_empty:
+                self._journaliser_appel(nom, resultat.model, motif,
+                                        llm_usage.OUTCOME_EMPTY,
+                                        resultat.input_tokens, resultat.output_tokens,
+                                        doc_key)
                 continue
             echecs = doc_vision.validate(
                 resultat, today=self._today(), allowed_rates=self._vat_rates,
@@ -1861,7 +1905,15 @@ class DocumentPipeline:
             if echecs:
                 logger.info("Niveau %s rejete pour %s : %s", nom,
                             getattr(file, "filename", "?"), " | ".join(echecs))
+                self._journaliser_appel(nom, resultat.model, motif,
+                                        llm_usage.OUTCOME_REJECTED,
+                                        resultat.input_tokens, resultat.output_tokens,
+                                        doc_key)
                 continue
+            self._journaliser_appel(nom, resultat.model, motif,
+                                    llm_usage.OUTCOME_ACCEPTED,
+                                    resultat.input_tokens, resultat.output_tokens,
+                                    doc_key)
             doc_vision.apply_vision(doc, resultat)
             logger.info(
                 "Niveau %s retenu pour %s : numero=%s HT=%s TVA=%s TTC=%s (confiance %.0f%%)",
@@ -2262,3 +2314,21 @@ def drive_link(uploaded: dict[str, Any]) -> str:
         if file_id:
             return f"https://drive.google.com/file/d/{file_id}/view"
     return ""
+
+
+def _motif_escalade(raisons: list[str]) -> str:
+    """Traduit les raisons libres en UN motif normalise.
+
+    Une chaine libre rendrait toute statistique impossible : on ne saurait
+    pas regrouper deux formulations du meme probleme.
+    """
+    texte = " ".join(raisons).lower()
+    if "incoherent" in texte:
+        return llm_usage.REASON_INCOHERENT_TOTALS
+    if "confiance" in texte:
+        return llm_usage.REASON_LOW_CONFIDENCE
+    if "illisible" in texte or "aucune lecture" in texte:
+        return llm_usage.REASON_UNREADABLE_IMAGE
+    if "absent" in texte:
+        return llm_usage.REASON_MISSING_FIELDS
+    return llm_usage.REASON_DIRECT

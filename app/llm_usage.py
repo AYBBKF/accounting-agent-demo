@@ -87,6 +87,55 @@ class UsageTotals:
     estimated_cost_usd: float = 0.0
 
 
+# --- tarification ---------------------------------------------------------
+#
+# Les prix ne sont PAS codes en dur : ils changent, et un prix invente
+# produirait un cout faux presente comme exact. Ils se declarent par
+# variable d'environnement, un modele a la fois :
+#
+#     LLM_PRICE_<MODELE>="<usd par million entree>,<usd par million sortie>"
+#
+# Le nom du modele est normalise en majuscules, les points et tirets
+# devenant des soulignes. Sans prix declare, le cout reste a 0.0 et les
+# TOKENS, eux, restent comptes : on prefere un cout absent a un cout faux.
+
+def _price_key(model: str) -> str:
+    propre = "".join(c if c.isalnum() else "_" for c in str(model).upper())
+    return f"LLM_PRICE_{propre}"
+
+
+def price_for(model: str, environ: dict[str, str] | None = None) -> tuple[float, float]:
+    """Prix (entree, sortie) en USD par MILLION de tokens, ou (0, 0)."""
+    import os
+
+    source = environ if environ is not None else os.environ
+    brut = str(source.get(_price_key(model), "")).strip()
+    if not brut:
+        return (0.0, 0.0)
+    morceaux = [m.strip() for m in brut.split(",")]
+    try:
+        entree = float(morceaux[0])
+        sortie = float(morceaux[1]) if len(morceaux) > 1 else entree
+    except (TypeError, ValueError):
+        return (0.0, 0.0)
+    return (max(0.0, entree), max(0.0, sortie))
+
+
+def estimate_cost(
+    model: str, input_tokens: int, output_tokens: int,
+    environ: dict[str, str] | None = None,
+) -> float:
+    """Cout estime d'un appel. 0.0 tant qu'aucun prix n'est declare."""
+    entree, sortie = price_for(model, environ)
+    if not entree and not sortie:
+        return 0.0
+    return round(
+        (max(0, int(input_tokens)) * entree + max(0, int(output_tokens)) * sortie)
+        / 1_000_000,
+        6,
+    )
+
+
 def record_call(
     db_path: str,
     *,
@@ -166,6 +215,27 @@ def calls_for_document(db_path: str, company_id: str, doc_key: str) -> int:
             (str(company_id), doc_key),
         ).fetchone()
     return int(row[0])
+
+
+def rows_for_document(
+    db_path: str, company_id: str, doc_key: str
+) -> list[dict[str, object]]:
+    """Le detail des appels d'UNE piece, dans l'ordre.
+
+    `calls_for_document` rend un compte ; l'audit d'une facture contestee
+    demande de voir quel modele a repondu quoi, pourquoi il a ete appele
+    et ce que sa reponse est devenue.
+    """
+    ensure_schema(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        lignes = conn.execute(
+            "SELECT level, model, reason, outcome, input_tokens, output_tokens,"
+            " estimated_cost_usd, created_at FROM llm_usage"
+            " WHERE company_id = ? AND doc_key = ? ORDER BY id",
+            (str(company_id), doc_key),
+        ).fetchall()
+    return [dict(ligne) for ligne in lignes]
 
 
 def levels_for_document(db_path: str, company_id: str, doc_key: str) -> tuple[str, ...]:

@@ -81,6 +81,12 @@ class VisionResult:
     data: dict[str, Any]
     confidence: float
     evidence: list[str] = field(default_factory=list)
+    # Ce qui a REELLEMENT ete facture. Sans ces trois champs, le journal
+    # des couts ne peut rien imputer : on saurait qu'un appel a eu lieu,
+    # pas ce qu'il a coute ni a quel modele.
+    model: str = ""
+    input_tokens: int = 0
+    output_tokens: int = 0
 
     @property
     def is_empty(self) -> bool:
@@ -127,6 +133,32 @@ def _decimal(value: Any) -> Decimal | None:
         return Decimal(str(value))
     except (InvalidOperation, ValueError):
         return None
+
+
+def _tokens_of(response: Any) -> tuple[int, int]:
+    """Tokens factures, quelle que soit la forme de la reponse.
+
+    Le SDK a change de nom de champ entre versions ; une absence ne doit
+    jamais faire echouer une lecture qui, elle, a reussi.
+    """
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return (0, 0)
+
+    def lire(*noms: str) -> int:
+        for nom in noms:
+            valeur = getattr(usage, nom, None)
+            if valeur is None and isinstance(usage, dict):
+                valeur = usage.get(nom)
+            if valeur is not None:
+                try:
+                    return int(valeur)
+                except (TypeError, ValueError):
+                    return 0
+        return 0
+
+    return (lire("input_tokens", "prompt_tokens"),
+            lire("output_tokens", "completion_tokens"))
 
 
 def escalation_reasons(doc: Any) -> list[str]:
@@ -308,6 +340,15 @@ class VisionExtractor:
             level="sol",
         )
 
+    def model_for(self, level: str) -> str:
+        """Modele reellement utilise a ce niveau.
+
+        Le journal des couts doit pouvoir nommer le modele meme quand
+        l'appel echoue : un appel refuse par le fournisseur est une
+        information, pas un trou.
+        """
+        return {"terra": self._terra, "sol": self._sol}.get(level, "")
+
     def _call(self, model: str, messages: list[dict[str, Any]], *, level: str) -> VisionResult | None:
         if self._client is None:
             return None
@@ -338,8 +379,12 @@ class VisionExtractor:
         except (json.JSONDecodeError, TypeError):
             logger.warning("Niveau %s : reponse non exploitable", level)
             return None
+        entree, sortie = _tokens_of(response)
         return VisionResult(
             level=level,
+            model=model,
+            input_tokens=entree,
+            output_tokens=sortie,
             data=data,
             confidence=float(data.get("confidence") or 0.0),
             evidence=list(data.get("evidence") or []),
