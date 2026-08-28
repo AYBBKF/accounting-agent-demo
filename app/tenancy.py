@@ -33,14 +33,22 @@ LEGACY_COMPANY_ID = "xblaste"
 # Tables ou `company_id` s'ajoute simplement en colonne.
 _TABLES_A_COLONNE = (
     "documents",
-    "bank_line_fingerprints",
-    "calendar_events",
 )
 
 # Tables dont la CLE PRIMAIRE doit inclure `company_id`. SQLite ne sait
 # pas modifier une cle primaire en place : on reconstruit, et on garde
 # l'ancienne table sous un autre nom plutot que de la detruire.
-_TABLES_A_RECONSTRUIRE = ("email_notifications", "gmail_sync_state")
+# `bank_line_fingerprints` et `calendar_events` en font partie pour une
+# raison decouverte en test : leur cle primaire etait GLOBALE. Deux
+# societes qui ont un compte dans la meme banque produisent la meme
+# empreinte pour le meme type de mouvement ; la seconde etait alors
+# rejetee en silence et sa ligne bancaire disparaissait.
+_TABLES_A_RECONSTRUIRE = (
+    "email_notifications",
+    "gmail_sync_state",
+    "bank_line_fingerprints",
+    "calendar_events",
+)
 
 _SUFFIXE_LEGACY = "_legacy_v1"
 
@@ -66,6 +74,27 @@ _NOUVELLES_TABLES = {
             PRIMARY KEY (company_id, chat_id)
         )
     """,
+    "bank_line_fingerprints": """
+        CREATE TABLE bank_line_fingerprints (
+            company_id TEXT NOT NULL,
+            fingerprint TEXT NOT NULL,
+            chat_id TEXT NOT NULL,
+            row_index INTEGER,
+            doc_key TEXT,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (company_id, fingerprint)
+        )
+    """,
+    "calendar_events": """
+        CREATE TABLE calendar_events (
+            company_id TEXT NOT NULL,
+            event_key TEXT NOT NULL,
+            chat_id TEXT NOT NULL,
+            event_id TEXT,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (company_id, event_key)
+        )
+    """,
 }
 
 # Index scopes par entreprise. Ce sont eux qui rendent structurellement
@@ -81,10 +110,6 @@ _INDEX = (
     " ON documents(company_id, gmail_message_id)",
     "CREATE INDEX IF NOT EXISTS idx_documents_company_business"
     " ON documents(company_id, doc_type, numero)",
-    "CREATE INDEX IF NOT EXISTS idx_bank_company"
-    " ON bank_line_fingerprints(company_id, fingerprint)",
-    "CREATE INDEX IF NOT EXISTS idx_calendar_company"
-    " ON calendar_events(company_id, event_key)",
 )
 
 

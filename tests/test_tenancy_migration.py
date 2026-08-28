@@ -220,3 +220,45 @@ def test_la_migration_accepte_un_autre_identifiant(legacy_db):
     rapport = tenancy.migrate_to_multi_tenant(legacy_db, company_id="v2-smoke")
     assert rapport.company_id == "v2-smoke"
     assert tenancy.company_counts(legacy_db)["documents"] == {"v2-smoke": 2}
+
+
+def test_les_empreintes_bancaires_deviennent_uniques_par_entreprise(legacy_db):
+    """Regression : la cle primaire etait GLOBALE.
+
+    Deux societes ayant un compte dans la meme banque produisent la meme
+    empreinte pour un meme type de mouvement. Avant correction, la
+    seconde etait rejetee en silence et sa ligne bancaire disparaissait.
+    """
+    tenancy.migrate_to_multi_tenant(legacy_db)
+    with sqlite3.connect(legacy_db) as conn:
+        maintenant = "2026-08-28T00:00:00+00:00"
+        conn.execute(
+            "INSERT INTO bank_line_fingerprints (company_id, fingerprint,"
+            " chat_id, row_index, doc_key, created_at) VALUES (?,?,?,?,?,?)",
+            ("fluxintelligent", "emp-1", "999653395", 2, "cle-f", maintenant),
+        )
+        conn.commit()
+        total = conn.execute(
+            "SELECT COUNT(*) FROM bank_line_fingerprints WHERE fingerprint = 'emp-1'"
+        ).fetchone()[0]
+    assert total == 2, "la meme empreinte doit coexister dans deux entreprises"
+
+    # Mais le rejeu dans la MEME entreprise reste refuse.
+    with sqlite3.connect(legacy_db) as conn:
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO bank_line_fingerprints (company_id, fingerprint,"
+                " chat_id, row_index, doc_key, created_at) VALUES (?,?,?,?,?,?)",
+                ("xblaste", "emp-1", "999653395", 9, "cle-x2",
+                 "2026-08-28T00:00:00+00:00"),
+            )
+
+
+def test_les_quatre_tables_reconstruites_gardent_leur_sauvegarde(legacy_db):
+    rapport = tenancy.migrate_to_multi_tenant(legacy_db)
+    attendues = {
+        "email_notifications_legacy_v1",
+        "gmail_sync_state_legacy_v1",
+        "bank_line_fingerprints_legacy_v1",
+    }
+    assert attendues <= set(rapport.legacy_tables_kept)

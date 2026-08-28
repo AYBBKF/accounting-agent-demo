@@ -172,6 +172,33 @@ _ADDED_COLUMNS = (
 )
 
 
+
+# --- portee par entreprise (multi-tenant) ---------------------------------
+#
+# Chaque recherche qui DECIDE d'une ecriture comptable - doublon physique,
+# doublon metier, jumeau ouvert, reprise - doit rester enfermee dans
+# l'entreprise routee. Deux societes peuvent legitimement recevoir la meme
+# facture, portant le meme numero et le meme hash : sans cette portee, la
+# seconde serait prise pour un doublon de la premiere et ne serait jamais
+# comptabilisee.
+#
+# `company_id=""` conserve exactement l'ancien comportement, ce qui permet
+# a la base mono-entreprise et a ses tests de continuer a fonctionner sans
+# modification pendant la migration.
+
+def _scope(company_id: str) -> tuple[str, tuple[str, ...]]:
+    """Fragment SQL et parametres qui enferment une requete dans un tenant."""
+    if not company_id:
+        return "", ()
+    return " AND company_id = ?", (str(company_id),)
+
+
+def _has_company_column(conn: Any, table: str) -> bool:
+    return any(
+        row[1] == "company_id" for row in conn.execute(f"PRAGMA table_info({table})")
+    )
+
+
 def ensure_schema(db_path: str) -> None:
     with connect(db_path) as conn:
         conn.executescript(SCHEMA)
@@ -203,6 +230,7 @@ def claim_document(
     parent_filename: str = "",
     member_path: str = "",
     local_path: str = "",
+    company_id: str = "",
 ) -> bool:
     """Reserve un document. True s'il est nouveau, False s'il est deja connu.
 
@@ -210,15 +238,19 @@ def claim_document(
     reserver le meme document.
     """
     with connect(db_path) as conn:
+        colonnes = ("doc_key, chat_id, gmail_message_id, attachment_id, file_sha256,"
+                    " filename, container, parent_attachment_id, parent_filename,"
+                    " member_path, local_path, state, created_at, updated_at")
+        valeurs = [doc_key, str(chat_id), gmail_message_id, attachment_id, file_sha256,
+                   filename, container, parent_attachment_id, parent_filename,
+                   member_path, local_path, DETECTED, _now(), _now()]
+        if _has_company_column(conn, "documents"):
+            colonnes += ", company_id"
+            valeurs.append(str(company_id))
+        trous = ",".join("?" * len(valeurs))
         cur = conn.execute(
-            "INSERT OR IGNORE INTO documents "
-            "(doc_key, chat_id, gmail_message_id, attachment_id, file_sha256, "
-            " filename, container, parent_attachment_id, parent_filename, "
-            " member_path, local_path, state, created_at, updated_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (doc_key, str(chat_id), gmail_message_id, attachment_id, file_sha256,
-             filename, container, parent_attachment_id, parent_filename,
-             member_path, local_path, DETECTED, _now(), _now()),
+            f"INSERT OR IGNORE INTO documents ({colonnes}) VALUES ({trous})",
+            tuple(valeurs),
         )
         conn.commit()
         return cur.rowcount == 1
@@ -285,23 +317,28 @@ def release_document(db_path: str, doc_key: str) -> None:
         conn.commit()
 
 
-def find_by_sha256(db_path: str, chat_id: int, file_sha256: str) -> dict[str, Any] | None:
-    """Le meme fichier a-t-il deja ete traite, meme via un autre email ?"""
+def find_by_sha256(
+    db_path: str, chat_id: int, file_sha256: str, *, company_id: str = ""
+) -> dict[str, Any] | None:
+    """Le meme fichier a-t-il deja ete traite, DANS CETTE ENTREPRISE ?"""
     import sqlite3
 
+    portee, params = _scope(company_id)
     with connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
             "SELECT * FROM documents WHERE chat_id = ? AND file_sha256 = ? "
             "AND state IN ('completed','partial','sheet_written','details_written',"
-            "'drive_archived','calendar_created','logged') ORDER BY created_at LIMIT 1",
-            (str(chat_id), file_sha256),
+            f"'drive_archived','calendar_created','logged'){portee}"
+            " ORDER BY created_at LIMIT 1",
+            (str(chat_id), file_sha256, *params),
         ).fetchone()
         return dict(row) if row else None
 
 
 def find_open_twin(
-    db_path: str, chat_id: int, file_sha256: str, *, exclude_key: str = ""
+    db_path: str, chat_id: int, file_sha256: str, *, exclude_key: str = "",
+    company_id: str = "",
 ) -> dict[str, Any] | None:
     """Le MEME fichier est-il deja connu, sans avoir rien produit ?
 
@@ -320,6 +357,7 @@ def find_open_twin(
 
     if not file_sha256:
         return None
+    portee, params = _scope(company_id)
     placeholders = ",".join("?" * len(OPEN_STATES))
     with connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
@@ -327,13 +365,16 @@ def find_open_twin(
             "SELECT * FROM documents WHERE chat_id = ? AND file_sha256 = ? "
             f"AND state IN ({placeholders}) "
             "AND (superseded_by IS NULL OR superseded_by = '') "
-            "AND doc_key != ? ORDER BY created_at LIMIT 1",
-            (str(chat_id), file_sha256, *sorted(OPEN_STATES), exclude_key or ""),
+            f"AND doc_key != ?{portee} ORDER BY created_at LIMIT 1",
+            (str(chat_id), file_sha256, *sorted(OPEN_STATES), exclude_key or "",
+             *params),
         ).fetchone()
         return dict(row) if row else None
 
 
-def list_quarantined(db_path: str, chat_id: int) -> list[dict[str, Any]]:
+def list_quarantined(
+    db_path: str, chat_id: int, *, company_id: str = ""
+) -> list[dict[str, Any]]:
     """Fiches qui occupent DEJA une ligne de `21_A_VERIFIER`.
 
     Sert a garantir une ligne par document PHYSIQUE : avant d'en ecrire une
@@ -343,32 +384,39 @@ def list_quarantined(db_path: str, chat_id: int) -> list[dict[str, Any]]:
     """
     import sqlite3
 
+    portee, params = _scope(company_id)
     with connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             "SELECT * FROM documents WHERE chat_id = ? AND review_row > 0 "
-            "AND (superseded_by IS NULL OR superseded_by = '') "
-            "ORDER BY created_at",
-            (str(chat_id),),
+            "AND (superseded_by IS NULL OR superseded_by = '')"
+            f"{portee} ORDER BY created_at",
+            (str(chat_id), *params),
         ).fetchall()
         return [dict(r) for r in rows]
 
 
 def find_by_business_key(
-    db_path: str, chat_id: int, doc_type: str, numero: str
+    db_path: str, chat_id: int, doc_type: str, numero: str, *, company_id: str = ""
 ) -> dict[str, Any] | None:
-    """Doublon metier : meme type et meme numero pour ce client."""
+    """Doublon metier : meme type et meme numero DANS CETTE ENTREPRISE.
+
+    Deux societes peuvent recevoir des factures portant le meme numero de
+    la part de fournisseurs differents : le numero n'est unique que dans
+    la comptabilite qui le recoit.
+    """
     import sqlite3
 
     if not numero:
         return None
+    portee, params = _scope(company_id)
     with connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
             "SELECT * FROM documents WHERE chat_id = ? AND doc_type = ? "
-            "AND UPPER(numero) = UPPER(?) AND stable_id IS NOT NULL AND stable_id != '' "
-            "ORDER BY created_at LIMIT 1",
-            (str(chat_id), doc_type, numero),
+            "AND UPPER(numero) = UPPER(?) AND stable_id IS NOT NULL "
+            f"AND stable_id != ''{portee} ORDER BY created_at LIMIT 1",
+            (str(chat_id), doc_type, numero, *params),
         ).fetchone()
         return dict(row) if row else None
 
@@ -410,7 +458,8 @@ def find_by_key_prefix(db_path: str, chat_id: int, prefix: str) -> dict[str, Any
 
 
 def find_by_message_and_sha(
-    db_path: str, chat_id: int, gmail_message_id: str, file_sha256: str
+    db_path: str, chat_id: int, gmail_message_id: str, file_sha256: str,
+    *, company_id: str = "",
 ) -> dict[str, Any] | None:
     """Le MEME fichier, dans le MEME email : c'est le meme document.
 
@@ -423,12 +472,13 @@ def find_by_message_and_sha(
 
     if not gmail_message_id or not file_sha256:
         return None
+    portee, params = _scope(company_id)
     with connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
             "SELECT * FROM documents WHERE chat_id = ? AND gmail_message_id = ? "
-            "AND file_sha256 = ? ORDER BY created_at LIMIT 1",
-            (str(chat_id), gmail_message_id, file_sha256),
+            f"AND file_sha256 = ?{portee} ORDER BY created_at LIMIT 1",
+            (str(chat_id), gmail_message_id, file_sha256, *params),
         ).fetchone()
         return dict(row) if row else None
 
@@ -492,7 +542,7 @@ def list_by_message(db_path: str, chat_id: int, gmail_message_id: str) -> list[d
 
 def claim_bank_line(
     db_path: str, chat_id: int, fingerprint: str, row_index: int = 0,
-    doc_key: str = "",
+    doc_key: str = "", *, company_id: str = "",
 ) -> bool:
     """Reserve une operation bancaire. False si elle existe deja.
 
@@ -506,10 +556,16 @@ def claim_bank_line(
     if not fingerprint:
         return True
     with connect(db_path) as conn:
+        colonnes = "fingerprint, chat_id, row_index, doc_key, created_at"
+        valeurs = [fingerprint, str(chat_id), row_index, doc_key or "", _now()]
+        if _has_company_column(conn, "bank_line_fingerprints"):
+            colonnes += ", company_id"
+            valeurs.append(str(company_id))
+        trous = ",".join("?" * len(valeurs))
         cur = conn.execute(
             "INSERT OR IGNORE INTO bank_line_fingerprints "
-            "(fingerprint, chat_id, row_index, doc_key, created_at) VALUES (?,?,?,?,?)",
-            (fingerprint, str(chat_id), row_index, doc_key or "", _now()),
+            f"({colonnes}) VALUES ({trous})",
+            tuple(valeurs),
         )
         conn.commit()
         return cur.rowcount == 1
@@ -560,33 +616,49 @@ def record_calendar_event(db_path: str, event_key: str, event_id: str) -> None:
 OVERLAP_SECONDS = 300
 
 
-def get_or_init_cursor(db_path: str, chat_id: int, now_epoch: int) -> dict[str, Any]:
+def get_or_init_cursor(
+    db_path: str, chat_id: int, now_epoch: int, *, company_id: str = ""
+) -> dict[str, Any]:
+    """Curseur Gmail. Chaque entreprise avance le sien.
+
+    Un curseur partage ferait sauter des emails : l'entreprise servie en
+    premier avancerait la borne pour toutes les autres.
+    """
     import sqlite3
 
+    portee, params = _scope(company_id)
     with connect(db_path) as conn:
+        colonnes = "chat_id, history_id, last_internal_date, created_at, updated_at"
+        valeurs = [str(chat_id), None, int(now_epoch), _now(), _now()]
+        if _has_company_column(conn, "gmail_sync_state"):
+            colonnes += ", company_id"
+            valeurs.append(str(company_id))
+        trous = ",".join("?" * len(valeurs))
         conn.execute(
-            "INSERT OR IGNORE INTO gmail_sync_state "
-            "(chat_id, history_id, last_internal_date, created_at, updated_at) "
-            "VALUES (?,?,?,?,?)",
-            (str(chat_id), None, int(now_epoch), _now(), _now()),
+            f"INSERT OR IGNORE INTO gmail_sync_state ({colonnes}) VALUES ({trous})",
+            tuple(valeurs),
         )
         conn.commit()
         conn.row_factory = sqlite3.Row
         row = conn.execute(
-            "SELECT * FROM gmail_sync_state WHERE chat_id = ?", (str(chat_id),)
+            f"SELECT * FROM gmail_sync_state WHERE chat_id = ?{portee}",
+            (str(chat_id), *params),
         ).fetchone()
         return dict(row)
 
 
 def advance_cursor(
-    db_path: str, chat_id: int, last_internal_date: int, history_id: str | None = None
+    db_path: str, chat_id: int, last_internal_date: int, history_id: str | None = None,
+    *, company_id: str = "",
 ) -> None:
-    """Avance le curseur, jamais en arriere."""
+    """Avance le curseur de CETTE entreprise, jamais en arriere."""
+    portee, params = _scope(company_id)
     with connect(db_path) as conn:
         conn.execute(
             "UPDATE gmail_sync_state SET last_internal_date = MAX(last_internal_date, ?), "
-            "history_id = COALESCE(?, history_id), updated_at = ? WHERE chat_id = ?",
-            (int(last_internal_date), history_id, _now(), str(chat_id)),
+            "history_id = COALESCE(?, history_id), updated_at = ? "
+            f"WHERE chat_id = ?{portee}",
+            (int(last_internal_date), history_id, _now(), str(chat_id), *params),
         )
         conn.commit()
 
@@ -663,28 +735,51 @@ def mark_notified(
         conn.commit()
 
 
-def email_notification_signature(db_path: str, chat_id: int, message_id: str) -> str:
-    """Signature du dernier resume envoye pour cet email ('' si aucun)."""
+def email_notification_signature(
+    db_path: str, chat_id: int, message_id: str, *, company_id: str = ""
+) -> str:
+    """Signature du dernier resume envoye a CETTE entreprise ('' si aucun).
+
+    Un meme email peut concerner deux entreprises : chacune doit recevoir
+    son resume, et n'etre reduite au silence que par le sien.
+    """
     ensure_schema(db_path)
+    portee, params = _scope(company_id)
     with connect(db_path) as conn:
         row = conn.execute(
             "SELECT signature FROM email_notifications WHERE chat_id = ? "
-            "AND gmail_message_id = ?",
-            (str(chat_id), str(message_id)),
+            f"AND gmail_message_id = ?{portee}",
+            (str(chat_id), str(message_id), *params),
         ).fetchone()
     return str(row[0]) if row else ""
 
 
 def remember_email_notification(
-    db_path: str, chat_id: int, message_id: str, signature: str
+    db_path: str, chat_id: int, message_id: str, signature: str,
+    *, company_id: str = "",
 ) -> None:
     ensure_schema(db_path)
     now = _now()
     with connect(db_path) as conn:
-        conn.execute(
-            "INSERT INTO email_notifications (chat_id, gmail_message_id, signature, "
-            "sent_at) VALUES (?, ?, ?, ?) ON CONFLICT(chat_id, gmail_message_id) "
-            "DO UPDATE SET signature = excluded.signature, sent_at = excluded.sent_at",
-            (str(chat_id), str(message_id), signature, now),
-        )
+        # La cle de conflit suit la forme reelle de la table : elle gagne
+        # `company_id` a la migration, et l'ecriture doit suivre sous peine
+        # d'ecraser la notification d'une autre entreprise.
+        if _has_company_column(conn, "email_notifications"):
+            conn.execute(
+                "INSERT INTO email_notifications (company_id, chat_id, "
+                "gmail_message_id, signature, sent_at) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(company_id, chat_id, gmail_message_id) "
+                "DO UPDATE SET signature = excluded.signature, "
+                "sent_at = excluded.sent_at",
+                (str(company_id), str(chat_id), str(message_id), signature, now),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO email_notifications (chat_id, gmail_message_id, "
+                "signature, sent_at) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(chat_id, gmail_message_id) "
+                "DO UPDATE SET signature = excluded.signature, "
+                "sent_at = excluded.sent_at",
+                (str(chat_id), str(message_id), signature, now),
+            )
         conn.commit()
