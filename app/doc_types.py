@@ -150,6 +150,30 @@ def _party_role(text: str, company: str) -> str | None:
     return None
 
 
+# Titres qui designent SANS AMBIGUITE la nature du document. Cherches
+# uniquement dans l'EN-TETE (premieres lignes de la premiere page), ils
+# priment sur toute mention ulterieure.
+_EXPLICIT_TITLES: tuple[tuple[str, str, float], ...] = (
+    ("RELEVE BANCAIRE", BANK_STATEMENT, 0.98),
+    ("AVOIR FOURNISSEUR", SUPPLIER_CREDIT_NOTE, 0.96),
+    ("AVOIR CLIENT", CLIENT_CREDIT_NOTE, 0.96),
+    ("FACTURE FOURNISSEUR", PURCHASE_INVOICE, 0.95),
+    ("FACTURE D ACHAT", PURCHASE_INVOICE, 0.95),
+    ("PURCHASE INVOICE", PURCHASE_INVOICE, 0.95),
+    ("FACTURE DE VENTE", SALES_INVOICE, 0.95),
+    ("FACTURE CLIENT", SALES_INVOICE, 0.95),
+    ("SALES INVOICE", SALES_INVOICE, 0.95),
+)
+
+_TITLE_LINES = 5
+
+
+def header_of(text: str) -> str:
+    """En-tete du document : ses premieres lignes non vides, normalisees."""
+    lignes = [l for l in (text or "").splitlines() if l.strip()][:_TITLE_LINES]
+    return normalize("\n".join(lignes))
+
+
 def classify(text: str, *, company: str = "X BLASTE") -> Classification:
     """Determine le type d'un document a partir de son CONTENU.
 
@@ -163,6 +187,16 @@ def classify(text: str, *, company: str = "X BLASTE") -> Classification:
         return Classification(UNKNOWN, 0.0, "", ["document vide ou illisible"])
 
     role = _party_role(t, company)
+
+    # 0. Titre explicite en EN-TETE. Une facture de deux pages dont la
+    #    seconde precise "le bon de livraison porte la meme reference" etait
+    #    classee BON DE LIVRAISON : la simple mention, plus loin dans le
+    #    texte, l'emportait sur le titre de la page 1. Elle sortait donc de
+    #    la comptabilite pour aller dans les documents commerciaux.
+    entete = header_of(text)
+    for phrase, kind, score in _EXPLICIT_TITLES:
+        if has_phrase(entete, phrase):
+            return Classification(kind, score, phrase, [])
 
     # 1. Releve bancaire : structure totalement differente d'une facture.
     if has_any(t, ("RELEVE BANCAIRE", "RELEVE DE COMPTE", "BANK STATEMENT",
