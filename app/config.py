@@ -27,6 +27,14 @@ class Settings(BaseSettings):
     openai_timeout_seconds: float = Field(default=60.0, alias="OPENAI_TIMEOUT_SECONDS")
     openai_max_output_tokens: int = Field(default=2000, alias="OPENAI_MAX_OUTPUT_TOKENS")
     openai_reasoning_effort: str = Field(default="none", alias="OPENAI_REASONING_EFFORT")
+    # Escalade de lecture. Terra relit le TEXTE, Sol relit l'IMAGE ORIGINALE.
+    # Sol est le niveau le plus couteux : son nombre d'appels est plafonne
+    # PAR EMAIL, sans quoi un lot de photos illisibles le declencherait
+    # autant de fois qu'il contient de pieces.
+    openai_model_terra: str = Field(default="gpt-5.6-terra", alias="OPENAI_MODEL_TERRA")
+    openai_model_sol: str = Field(default="gpt-5.6-sol", alias="OPENAI_MODEL_SOL")
+    vision_escalation_enabled: bool = Field(default=True, alias="VISION_ESCALATION_ENABLED")
+    vision_max_calls_per_email: int = Field(default=6, alias="VISION_MAX_CALLS_PER_EMAIL")
 
     # --- Donnees / TVA (configurable, jamais code en dur) ---
     db_path: str = Field(default="/app/data/demo.db", alias="DB_PATH")

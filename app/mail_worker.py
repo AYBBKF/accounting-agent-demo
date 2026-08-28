@@ -28,6 +28,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app import doc_store as store
+from app import doc_vision
 from app import doc_vault as vault
 from app.attachments import (
     DocumentFile,
@@ -254,7 +255,12 @@ class MailWorker:
         zip_limits: ZipLimits | None = None,
         calendar_check: str = "",
         allowed_vat_rates: tuple[Decimal, ...] | None = None,
+        vision: Any | None = None,
+        vision_max_calls: int = 0,
     ) -> None:
+        self._vision = vision
+        # Budget d'appels au niveau vision, remis a zero a CHAQUE email.
+        self._vision_budget = doc_vision.VisionBudget(vision_max_calls)
         self._api_key = api_key
         self._chat_id = chat_id
         self._db_path = db_path
@@ -303,6 +309,7 @@ class MailWorker:
                 spreadsheet_id=self._spreadsheet_id, company=self._company,
                 drive_root=self._drive_folder,
                 allowed_vat_rates=self._vat_rates or None,
+                vision=self._vision, vision_budget=self._vision_budget,
             )
         return self._pipeline
 
@@ -659,6 +666,8 @@ class MailWorker:
 
     def process_message(self, message_id: str) -> tuple[MailSummary, int]:
         """Traite toutes les pieces jointes d'un email, independamment."""
+        # Le budget de relecture visuelle est propre a CHAQUE email.
+        self._vision_budget.reset()
         message = self.fetch_message(message_id)
         message.setdefault("messageId", message_id)
         summary = MailSummary(

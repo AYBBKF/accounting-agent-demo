@@ -53,6 +53,7 @@ from app.mail_worker import (
     build_summary,
 )
 from app.excel_report import build_excel_report
+from app import doc_vision
 from app.openai_client import OpenAIClientWrapper
 from app.reconciliation import reconcile_invoices
 from app.sheets_client import SheetsClient, SheetsSyncError
@@ -132,6 +133,20 @@ SERVICES_SUMMARY = ", ".join(label for _, _, label in SERVICES)
 # emails recus depuis le curseur (PDF et ZIP), identifie le TYPE de chaque
 # document par son contenu, et le classe au bon endroit. Seuls les documents
 # reellement ambigus passent par les boutons de validation.
+# Escalade de lecture : Terra relit le texte, Sol relit l'image originale.
+# Desactivable par configuration ; absente, le comportement deterministe est
+# strictement inchange.
+_vision_extractor = (
+    doc_vision.VisionExtractor(
+        api_key=settings.openai_api_key,
+        model_terra=settings.openai_model_terra,
+        model_sol=settings.openai_model_sol,
+        timeout_seconds=settings.openai_timeout_seconds,
+    )
+    if settings.vision_escalation_enabled and settings.openai_api_key
+    else None
+)
+
 mail_worker = MailWorker(
     api_key=settings.composio_api_key,
     chat_id=settings.gmail_watch_chat_id,
@@ -144,6 +159,8 @@ mail_worker = MailWorker(
     max_per_cycle=settings.gmail_watch_max_per_cycle,
     zip_limits=settings.zip_limits(),
     allowed_vat_rates=tuple(settings.vat_rates()),
+    vision=_vision_extractor,
+    vision_max_calls=settings.vision_max_calls_per_email,
 )
 
 SYNC_SHEET_BUTTON_TEXT = "Synchroniser Google Sheets"

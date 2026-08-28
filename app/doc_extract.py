@@ -115,9 +115,12 @@ class DocumentLine:
 class BankLine:
     """Operation d'un releve bancaire.
 
-    Le sens (debit/credit) n'est jamais devine a partir d'une position de
-    colonne - la couche texte ne la conserve pas. Il est deduit de la
-    VARIATION DU SOLDE, puis recoupe avec le montant lu.
+    Le sens (debit/credit) vient d'abord de la COLONNE reellement occupee
+    par le montant dans le PDF, ensuite seulement de la variation du solde.
+    Un montant dont la colonne reste indeterminee est conserve comme
+    `mouvement` a valider : il n'est JAMAIS transforme en solde. Ecrire un
+    mouvement dans la colonne "Solde" revenait a affirmer un solde que le
+    document n'annonce nulle part.
     """
 
     date_operation: date | None
@@ -129,6 +132,12 @@ class BankLine:
     devise: str
     page: int
     inferred_direction: bool = False
+    # Montant lu dont le sens n'a pas pu etre etabli.
+    mouvement: Decimal | None = None
+
+    @property
+    def sens_indetermine(self) -> bool:
+        return self.debit is None and self.credit is None and self.mouvement is not None
 
 
 @dataclass
@@ -136,7 +145,8 @@ class ExtractedDocument:
     """Tout ce qui a pu etre lu, plus ce qui manque et ce qui cloche."""
 
     classification: Classification
-    text_source: str = "native"          # "native" ou "ocr"
+    text_source: str = "native"          # "native", "ocr" ou "vision:<niveau>"
+    raw_text: str = ""                   # texte lu, pour une relecture eventuelle
     pages: int = 1
 
     numero: str | None = None
@@ -695,10 +705,7 @@ def extract_bank_lines(lines: list[Line], devise: str) -> tuple[list[BankLine], 
                     debit = abs(movement)
         previous_balance = balance
 
-        reference = ""
-        m = re.search(r"\b([A-Z]{2,}[-_][A-Z0-9\-_]+)\b", libelle)
-        if m:
-            reference = m.group(1)
+        reference = bank_reference(libelle)
         entries.append(
             BankLine(
                 date_operation=operation_date, libelle=libelle, reference=reference,
@@ -707,6 +714,176 @@ def extract_bank_lines(lines: list[Line], devise: str) -> tuple[list[BankLine], 
             )
         )
     return entries, anomalies
+
+
+# Reference de piece citee dans un libelle bancaire. Deux formes reelles :
+# "REL-BP-2026-08" (lettres puis separateur) et "F2026-1101" (une a quatre
+# lettres collees a l'annee). Ne reconnaitre que la premiere laissait tous
+# les virements de facture sans reference, donc sans rapprochement possible.
+_BANK_REFERENCE_RES = (
+    re.compile(r"\b([A-Z]{2,}[-_][A-Z0-9\-_]+)\b"),
+    re.compile(r"\b([A-Z]{1,4}\d{2,}[-_][A-Z0-9]{2,})\b"),
+)
+
+
+def bank_reference(libelle: str) -> str:
+    """Reference de document citee par un libelle bancaire, sinon "" ."""
+    texte = (libelle or "").upper()
+    for motif in _BANK_REFERENCE_RES:
+        found = motif.search(texte)
+        if found:
+            return found.group(1)
+    return ""
+
+
+# --- releve bancaire : lecture PAR COLONNES --------------------------------
+
+
+@dataclass
+class Cell:
+    """Un fragment de texte du PDF avec sa position reelle sur la page."""
+
+    page: int
+    x: float
+    y: float
+    text: str
+
+    @property
+    def norm(self) -> str:
+        return normalize(self.text)
+
+
+def read_pdf_cells(data: bytes) -> list[Cell]:
+    """Fragments de texte avec leurs coordonnees.
+
+    La couche texte d'un PDF conserve la position de chaque fragment ; c'est
+    `extract_text()` qui l'aplatit. Sans elle, impossible de savoir si
+    "6 000,00 MAD" est ecrit dans la colonne Debit ou dans la colonne
+    Credit - et le sens de l'operation etait alors perdu.
+    """
+    try:
+        from pypdf import PdfReader
+    except ImportError:  # pragma: no cover - dependance manquante
+        return []
+    import io
+
+    cellules: list[Cell] = []
+    try:
+        reader = PdfReader(io.BytesIO(data))
+        for numero, page in enumerate(reader.pages, start=1):
+            def visiteur(text, cm, tm, font, size, _page=numero):
+                contenu = (text or "").strip()
+                if contenu:
+                    cellules.append(Cell(page=_page, x=float(tm[4]), y=float(tm[5]), text=contenu))
+
+            page.extract_text(visitor_text=visiteur)
+    except Exception:  # noqa: BLE001 - PDF corrompu : on retombe sur le texte plat
+        return []
+    return cellules
+
+
+# Tolerance verticale pour regrouper des fragments sur une meme ligne.
+_ROW_TOLERANCE = 3.0
+
+_BANK_HEADERS = {"DEBIT": "debit", "CREDIT": "credit", "SOLDE": "solde"}
+
+
+def _group_rows(cells: list[Cell]) -> list[list[Cell]]:
+    lignes: list[list[Cell]] = []
+    for cellule in sorted(cells, key=lambda c: (c.page, -c.y, c.x)):
+        if lignes and lignes[-1][0].page == cellule.page and abs(lignes[-1][0].y - cellule.y) <= _ROW_TOLERANCE:
+            lignes[-1].append(cellule)
+        else:
+            lignes.append([cellule])
+    for ligne in lignes:
+        ligne.sort(key=lambda c: c.x)
+    return lignes
+
+
+def _bank_columns(rows: list[list[Cell]]) -> tuple[dict[str, float], int]:
+    """Position en x des colonnes Debit / Credit / Solde, et l'index de l'en-tete."""
+    for index, ligne in enumerate(rows):
+        trouve = {}
+        for cellule in ligne:
+            role = _BANK_HEADERS.get(cellule.norm)
+            if role:
+                trouve[role] = cellule.x
+        if "debit" in trouve and "credit" in trouve:
+            return trouve, index
+    return {}, -1
+
+
+def _closest_column(x: float, colonnes: dict[str, float]) -> str | None:
+    """Colonne dont l'origine precede le montant et lui est la plus proche.
+
+    Un montant est cale a DROITE dans sa colonne : son x de depart est donc
+    toujours superieur ou egal a celui de l'intitule, et inferieur a celui
+    de la colonne suivante.
+    """
+    candidates = [(nom, ox) for nom, ox in colonnes.items() if x >= ox - 2.0]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item[1])[0]
+
+
+def extract_bank_lines_by_column(
+    cells: list[Cell], devise: str
+) -> tuple[list[BankLine], list[str]]:
+    """Operations d'un releve, sens deduit de la COLONNE occupee.
+
+    Chaque montant est rattache a la colonne Debit, Credit ou Solde selon sa
+    position reelle. Un montant dont la colonne reste indeterminee est
+    conserve comme mouvement a valider, avec une anomalie tracable : on ne
+    fabrique jamais un solde, et une seule operation douteuse ne bloque pas
+    le reste du releve.
+    """
+    rows = _group_rows(cells)
+    colonnes, entete = _bank_columns(rows)
+    if not colonnes or entete < 0:
+        return [], []
+
+    anomalies: list[str] = []
+    operations: list[BankLine] = []
+    for ligne in rows[entete + 1:]:
+        dates = [c for c in ligne if _DATE_RE.fullmatch(c.text.strip())]
+        montants = [c for c in ligne if is_amount_line(Line(page=c.page, text=c.text))]
+        if not dates or not montants:
+            continue
+        operation_date = parse_date(dates[0].text)
+        libelles = [c.text.strip() for c in ligne if c not in dates and c not in montants]
+        libelle = libelles[0] if libelles else ""
+
+        debit = credit = solde = mouvement = None
+        courante = devise
+        for cellule in montants:
+            parsed = parse_money(cellule.text)
+            if not parsed:
+                continue
+            valeur, monnaie = parsed
+            courante = monnaie or courante
+            colonne = _closest_column(cellule.x, colonnes)
+            if colonne == "debit":
+                debit = abs(valeur)
+            elif colonne == "credit":
+                credit = abs(valeur)
+            elif colonne == "solde":
+                solde = valeur
+            else:
+                mouvement = abs(valeur)
+                anomalies.append(
+                    f"operation du {operation_date} : montant {valeur} hors des colonnes "
+                    "Debit et Credit, sens a valider"
+                )
+
+        reference = bank_reference(libelle)
+        operations.append(
+            BankLine(
+                date_operation=operation_date, libelle=libelle, reference=reference,
+                debit=debit, credit=credit, solde=solde, devise=courante,
+                page=ligne[0].page, inferred_direction=False, mouvement=mouvement,
+            )
+        )
+    return operations, anomalies
 
 
 def check_bank_totals(doc: "ExtractedDocument", lines: list[Line]) -> list[str]:
@@ -883,7 +1060,8 @@ def _first_value(lines: list[Line], labels: tuple[str, ...]) -> tuple[str, int] 
 
 
 def extract_document(
-    pages: list[str], *, company: str = "X BLASTE", text_source: str = "native"
+    pages: list[str], *, company: str = "X BLASTE", text_source: str = "native",
+    cells: list["Cell"] | None = None,
 ) -> ExtractedDocument:
     """Classe puis extrait un document. Ne devine jamais un montant absent."""
     joined = "\n".join(pages)
@@ -894,7 +1072,8 @@ def extract_document(
     classification = classify(joined, company=company)
     lines = build_lines(pages)
     doc = ExtractedDocument(
-        classification=classification, text_source=text_source, pages=len(pages)
+        classification=classification, text_source=text_source, pages=len(pages),
+        raw_text=joined,
     )
     kind = classification.doc_type
 
@@ -989,7 +1168,16 @@ def extract_document(
 
     # --- contenu --------------------------------------------------------
     if kind == BANK_STATEMENT:
-        doc.bank_lines, bank_anomalies = extract_bank_lines(lines, doc.devise or "MAD")
+        # La position reelle des colonnes prime : elle DIT le sens de
+        # l'operation. La deduction par variation de solde ne sert que si le
+        # releve ne porte pas d'en-tetes Debit/Credit exploitables.
+        par_colonne, bank_anomalies = (
+            extract_bank_lines_by_column(cells, doc.devise or "MAD") if cells else ([], [])
+        )
+        if par_colonne:
+            doc.bank_lines = par_colonne
+        else:
+            doc.bank_lines, bank_anomalies = extract_bank_lines(lines, doc.devise or "MAD")
         doc.anomalies.extend(bank_anomalies)
         doc.anomalies.extend(check_bank_totals(doc, lines))
         period = _first_value(lines, ("Periode",))
@@ -1067,11 +1255,12 @@ def extract_from_pdf_bytes(
     """Lit un PDF : couche texte native, puis OCR si elle est insuffisante."""
     pages = read_pdf_pages(data)
     source = "native"
+    cells = read_pdf_cells(data)
     if ocr and not _has_usable_text(pages):
         ocr_pages = ocr_pdf_pages(data)
         if _has_usable_text(ocr_pages):
-            pages, source = ocr_pages, "ocr"
-    return extract_document(pages, company=company, text_source=source)
+            pages, source, cells = ocr_pages, "ocr", []
+    return extract_document(pages, company=company, text_source=source, cells=cells)
 
 
 def read_image_text(data: bytes) -> str:

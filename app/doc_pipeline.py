@@ -28,6 +28,7 @@ from typing import Any, Callable, Protocol
 from app import doc_store as store
 from app.attachments import DocumentFile, content_mimetype, idempotency_key, is_image
 from app.business_key import business_identity
+from app import doc_vision
 from app.doc_extract import (
     ExtractedDocument,
     extract_from_image_bytes,
@@ -49,6 +50,7 @@ from app.doc_routing import (
     CUSTOMS_SPEC,
     NEW_TAB_SPECS,
     TAB_BANK,
+    TAB_RECONCILIATION,
     TAB_CLIENTS,
     TAB_CREDIT_NOTES,
     TAB_CUSTOMS,
@@ -257,6 +259,8 @@ class DocumentPipeline:
         drive_root: str = "XBLASTE - Factures",
         allowed_vat_rates: tuple[Decimal, ...] | None = None,
         today: Callable[[], date] | None = None,
+        vision: Any | None = None,
+        vision_budget: Any | None = None,
     ) -> None:
         self._gw = gateway
         self._db = db_path
@@ -272,6 +276,10 @@ class DocumentPipeline:
         # ou cette date devient le passe.
         self._vat_rates = tuple(allowed_vat_rates) if allowed_vat_rates else ()
         self._today = today or date.today
+        # Escalade de lecture (Terra puis Sol). Absente => comportement
+        # deterministe strictement inchange.
+        self._vision = vision
+        self._vision_budget = vision_budget
 
     # -- utilitaires Sheets ------------------------------------------------
 
@@ -906,6 +914,7 @@ class DocumentPipeline:
                 doc = extract_from_image_bytes(file.content, company=self._company)
             else:
                 doc = extract_from_pdf_bytes(file.content, company=self._company)
+            self.escalate_reading(doc, file)
         except Exception as exc:  # noqa: BLE001 - PDF/image illisible
             # Un document illisible n'est pas un document perdu. Il laisse
             # UNE ligne rouge, comme toute piece que le bot refuse de
@@ -1221,6 +1230,19 @@ class DocumentPipeline:
             outcome.row_index = start
             outcome.stable_id = doc.numero or f"REL-{year}"
             outcome.reasons.append(f"{written} operation(s) bancaire(s) ecrite(s)")
+            if written:
+                # Le rapprochement ne bloque JAMAIS l'ecriture du releve : une
+                # operation qu'on ne sait pas rattacher reste "Non rapproche".
+                try:
+                    rapproches = self.reconcile_bank_lines(doc, first_row=start)
+                except Exception as exc:  # noqa: BLE001 - jamais bloquant
+                    logger.warning("Rapprochement bancaire non effectue : %s", exc)
+                else:
+                    if rapproches:
+                        outcome.reasons.append(
+                            f"{len(rapproches)} rapprochement(s) : "
+                            + ", ".join(r["numero"] for r in rapproches)
+                        )
             return
 
         if kind == PAYMENT_RECEIPT:
@@ -1758,6 +1780,136 @@ class DocumentPipeline:
         for offset in range(len(rows)):
             self.mark_new_row(TAB_BANK, start + offset, "M")
         return len(rows), start
+
+    # -- escalade de lecture Luna -> Terra -> Sol --------------------------
+
+    def escalate_reading(self, doc: ExtractedDocument, file: Any) -> None:
+        """Relit un document que la lecture deterministe n'a pas su lire.
+
+        On monte d'un niveau seulement si c'est necessaire, et on s'ARRETE
+        des qu'un niveau rend un resultat qui franchit les six controles
+        comptables. Sol recoit les OCTETS DE L'IMAGE ORIGINALE, jamais le
+        texte OCR degrade : c'est lui le probleme.
+        """
+        if self._vision is None or not getattr(self._vision, "available", False):
+            return
+        raisons = doc_vision.escalation_reasons(doc)
+        if not raisons:
+            return
+        logger.info(
+            "Lecture a escalader (%s) : %s",
+            getattr(file, "filename", "?"), ", ".join(raisons),
+        )
+
+        niveaux = []
+        texte = getattr(doc, "raw_text", "") or ""
+        if texte.strip():
+            niveaux.append(("terra", lambda: self._vision.read_text(texte)))
+        if is_image(file.content):
+            niveaux.append((
+                "sol",
+                lambda: self._vision.read_image(file.content, content_mimetype(file.content)),
+            ))
+
+        for nom, appel in niveaux:
+            if nom == "sol":
+                if self._vision_budget is not None and not self._vision_budget.take():
+                    logger.warning("Budget vision epuise : %s reste en quarantaine",
+                                   getattr(file, "filename", "?"))
+                    doc.anomalies.append("relecture visuelle non effectuee : budget epuise")
+                    return
+            resultat = appel()
+            if resultat is None or resultat.is_empty:
+                continue
+            echecs = doc_vision.validate(
+                resultat, today=self._today(), allowed_rates=self._vat_rates,
+                allowed_currencies=("MAD",),
+            )
+            if echecs:
+                logger.info("Niveau %s rejete pour %s : %s", nom,
+                            getattr(file, "filename", "?"), " | ".join(echecs))
+                continue
+            doc_vision.apply_vision(doc, resultat)
+            logger.info(
+                "Niveau %s retenu pour %s : numero=%s HT=%s TVA=%s TTC=%s (confiance %.0f%%)",
+                nom, getattr(file, "filename", "?"), doc.numero,
+                doc.montant_ht and doc.montant_ht.value,
+                doc.montant_tva and doc.montant_tva.value,
+                doc.montant_ttc and doc.montant_ttc.value,
+                resultat.confidence * 100,
+            )
+            return
+
+    # -- rapprochement bancaire --------------------------------------------
+
+    def reconcile_bank_lines(
+        self, doc: ExtractedDocument, *, first_row: int
+    ) -> list[dict[str, Any]]:
+        """Rapproche les operations ecrites avec les factures deja comptabilisees.
+
+        Une correspondance n'est retenue que si TROIS elements concordent :
+        la REFERENCE citee par le libelle, le MONTANT au centime, et le SENS
+        de l'operation - un debit ne peut solder qu'une facture d'achat, un
+        credit qu'une facture de vente. Deux factures candidates, ou un sens
+        indetermine, ne rapprochent rien : le classeur garde "Non rapproche"
+        plutot qu'un lien invente.
+        """
+        rapproches: list[dict[str, Any]] = []
+        factures = {
+            TAB_PURCHASES: self._read(f"{TAB_PURCHASES}!A2:Q400"),
+            TAB_SALES: self._read(f"{TAB_SALES}!A2:Q400"),
+        }
+        for offset, line in enumerate(doc.bank_lines):
+            if not line.reference:
+                continue
+            if line.debit is not None:
+                tab, montant = TAB_PURCHASES, line.debit
+            elif line.credit is not None:
+                tab, montant = TAB_SALES, line.credit
+            else:
+                continue  # sens indetermine : on ne rapproche pas
+
+            voulue = normalize(line.reference)
+            candidates = []
+            for index, row in enumerate(factures[tab]):
+                if len(row) < 10 or not row[0]:
+                    continue
+                if normalize(str(row[2])) != voulue:
+                    continue
+                try:
+                    ttc = Decimal(str(row[9]).replace("\u202f", "").replace(",", ".").split()[0])
+                except Exception:  # noqa: BLE001 - cellule non numerique
+                    continue
+                if abs(abs(ttc) - abs(montant)) <= Decimal("0.01"):
+                    candidates.append((index + 2, row))
+            if len(candidates) != 1:
+                continue
+
+            row_index, row = candidates[0]
+            bank_row = first_row + offset
+            self._write(
+                f"{TAB_BANK}!L{bank_row}:M{bank_row}",
+                [[str(row[2]), "Rapproche"]],
+            )
+            self.settle_invoice(tab, row_index, abs(montant))
+            rapproches.append({
+                "tab": tab, "row": row_index, "numero": str(row[2]),
+                "tiers": str(row[4]) if len(row) > 4 else "",
+                "montant": abs(montant), "date": str(row[1]),
+                "sens": "Debit" if tab == TAB_PURCHASES else "Credit",
+            })
+
+        if rapproches:
+            depart = self.next_row(TAB_RECONCILIATION)
+            lignes = [[
+                "Facture d'achat" if r["tab"] == TAB_PURCHASES else "Facture de vente",
+                r["tab"], r["numero"], r["tiers"], to_number(r["montant"]),
+                r["date"], "Oui", f"Rapproche ({r['sens']})",
+            ] for r in rapproches]
+            self._write(
+                f"{TAB_RECONCILIATION}!A{depart}:H{depart + len(lignes) - 1}", lignes
+            )
+        return rapproches
 
     # -- outillage du nettoyage audite -------------------------------------
 
