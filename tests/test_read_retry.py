@@ -71,7 +71,12 @@ def test_a_failed_write_is_attempted_exactly_once(gateway):
 
 
 def test_a_rate_limit_is_not_retried(monkeypatch):
-    """Insister pendant la fenetre de quota la repousse : on sort tout de suite."""
+    """Insister pendant la fenetre de quota GMAIL la repousse : on sort.
+
+    Le quota Gmail avance sa date de deblocage a chaque appel. Celui des
+    LECTURES Sheets, lui, est un compteur par minute qui se libere seul :
+    son attente bornee est verifiee dans `test_sheets_quota_wait.py`.
+    """
     from app.mail_worker import MailWorker, RateLimited
 
     monkeypatch.setattr("app.mail_worker.time.sleep", lambda _s: None)
@@ -86,8 +91,13 @@ def test_a_rate_limit_is_not_retried(monkeypatch):
 
     gw = Limited()
     with pytest.raises(RateLimited):
-        MailWorker.execute(gw, "GOOGLESHEETS_BATCH_GET", {})
+        MailWorker.execute(gw, "GMAIL_FETCH_EMAILS", {})
     assert len(gw.calls) == 1
+
+    ecriture = Limited()
+    with pytest.raises(RateLimited):
+        MailWorker.execute(ecriture, "GOOGLESHEETS_VALUES_UPDATE", {})
+    assert len(ecriture.calls) == 1
 
 
 def test_rate_limit_messages_are_recognised():

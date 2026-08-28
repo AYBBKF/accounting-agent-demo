@@ -343,3 +343,67 @@ def test_without_a_vision_client_the_behaviour_is_unchanged(jpeg_bytes, db_path,
     doc = degraded_doc()
     pipe.escalate_reading(doc, FakeFile(jpeg_bytes))
     assert doc.text_source == "ocr" and doc.numero is None
+
+
+# --- une piece deja en quarantaine ne se relit pas indefiniment ---------
+
+
+INCOHERENT = "\n".join([
+    "FACTURE FOURNISSEUR",
+    "Fournisseur : OMEGA SERVICES SARL",
+    "ICE fournisseur : 006677889900112",
+    "Numero de facture : F2026-1103",
+    "Date de facture : 20/08/2026",
+    "Client : X BLASTE",
+    "ICE client : 001987654000021",
+    "Total HT : 5 000,00 MAD",
+    "TVA 20% : 1 000,00 MAD",
+    "Total TTC : 6 450,00 MAD",
+])
+
+
+def incoherent_doc():
+    """Facture lisible mais dont HT + TVA ne fait pas le TTC : quarantaine."""
+    return extract_document([INCOHERENT], company="X BLASTE", text_source="pdf")
+
+
+def test_une_piece_deja_en_quarantaine_ne_rappelle_plus_la_vision(
+    db_path, workbook, monkeypatch
+):
+    """Le cycle Gmail repasse toutes les cinq minutes sur le meme email.
+
+    Une piece garee dans "21_A_VERIFIER" y est reexaminee - c'est voulu,
+    un humain peut l'avoir corrigee - mais ses OCTETS n'ont pas change :
+    la cle d'idempotence inclut leur empreinte. Relire l'image avec les
+    memes modeles rendrait exactement le meme resultat, et facturerait un
+    appel de vision toutes les cinq minutes, indefiniment.
+    """
+    from app import doc_pipeline
+    from app.attachments import DocumentFile
+
+    # Facture aux totaux incoherents : elle finira en quarantaine. On
+    # court-circuite la lecture du PDF pour que le test ne depende
+    # d'aucune bibliotheque de rendu.
+    monkeypatch.setattr(
+        doc_pipeline, "extract_from_pdf_bytes",
+        lambda *a, **k: incoherent_doc(),
+    )
+
+    vision = FakeVision(terra=None, sol=SOL_VIDE)
+    pipe = build_pipeline(vision, VisionBudget(9), db_path, workbook)
+    fichier = DocumentFile(
+        filename="FACT_OMEGA_F2026-1103.pdf",
+        content=b"%PDF-1.4 contenu simule",
+        source="attachment",
+    )
+    message = {"messageId": "msg-quarantaine", "subject": "lot", "sender": "a@b.c"}
+
+    premier = pipe.process_document(fichier, message, attachment_id="att-1")
+    appels_premier_cycle = list(vision.calls)
+    assert appels_premier_cycle, "le premier passage doit bien tenter l'escalade"
+
+    pipe.process_document(fichier, message, attachment_id="att-1")
+    assert vision.calls == appels_premier_cycle, (
+        "aucun appel de vision supplementaire ne doit etre facture "
+        "pour une piece deja garee en quarantaine"
+    )

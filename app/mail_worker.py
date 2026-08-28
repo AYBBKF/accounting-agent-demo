@@ -161,6 +161,26 @@ def is_retryable_read(slug: str) -> bool:
     return slug in _RETRYABLE_READ_SLUGS
 
 
+# Lectures Google Sheets. Leur quota est un compteur GLISSANT PAR MINUTE qui
+# se libere tout seul : contrairement au quota Gmail, attendre le fait
+# disparaitre. Un lot de treize pieces enchaine plusieurs centaines de
+# lectures et touche ce plafond en fin de traitement ; sans attente, le
+# rapprochement bancaire s'interrompait au milieu et le journal
+# 08_RAPPROCHEMENT restait vide alors que les rapprochements etaient justes.
+_SHEETS_READ_SLUGS = frozenset({
+    "GOOGLESHEETS_BATCH_GET",
+    "GOOGLESHEETS_GET_SPREADSHEET_INFO",
+    "GOOGLESHEETS_GET_SHEET_NAMES",
+})
+_SHEETS_QUOTA_ATTEMPTS = 4
+_SHEETS_QUOTA_PAUSE_SECONDS = 20.0
+
+
+def is_sheets_read(slug: str) -> bool:
+    """Vrai si l'outil est une LECTURE Sheets, dont le quota se libere seul."""
+    return slug in _SHEETS_READ_SLUGS
+
+
 class RateLimited(MailWorkerError):
     """Quota de l'API atteint : reessayer tout de suite est contre-productif."""
 
@@ -349,12 +369,34 @@ class MailWorker:
         """
         attempts = _READ_RETRY_ATTEMPTS if is_retryable_read(slug) else 1
         last: Exception | None = None
-        for attempt in range(1, attempts + 1):
+        quota_wait = 0
+        attempt = 0
+        while attempt < attempts:
+            attempt += 1
             try:
                 return self._execute_once(slug, arguments)
-            except RateLimited:
-                # Quota atteint : ne PAS consommer les tentatives restantes.
-                raise
+            except RateLimited as exc:
+                # Quota Gmail : chaque appel repousse la fenetre, on sort.
+                # Quota de LECTURE Sheets : le compteur est par minute et se
+                # libere seul, alors on patiente au lieu d'abandonner un
+                # rapprochement a moitie fait. Aucune ecriture n'est jamais
+                # concernee : rejouer une ecriture creerait une double
+                # ecriture comptable.
+                if not is_sheets_read(slug) or quota_wait >= _SHEETS_QUOTA_ATTEMPTS:
+                    raise
+                quota_wait += 1
+                logger.info(
+                    "Quota de lecture Sheets atteint sur '%s' "
+                    "(attente %d/%d, %.0fs)",
+                    slug, quota_wait, _SHEETS_QUOTA_ATTEMPTS,
+                    _SHEETS_QUOTA_PAUSE_SECONDS,
+                )
+                time.sleep(_SHEETS_QUOTA_PAUSE_SECONDS)
+                last = exc
+                # L'attente d'un quota n'est pas un essai rate : elle ne
+                # doit pas consommer les tentatives de relecture.
+                attempt -= 1
+                continue
             except MailWorkerError as exc:
                 last = exc
                 if attempt >= attempts:

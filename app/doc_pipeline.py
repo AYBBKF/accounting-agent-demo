@@ -860,6 +860,15 @@ class DocumentPipeline:
             outcome.reasons = ["document deja traite lors d'un cycle precedent"]
             return outcome
         resuming = bool(existing and existing["state"] in store.STATES_AFTER_SHEET)
+        # Un document deja gare en quarantaine ("a verifier") est reexamine a
+        # chaque cycle, ce qui est voulu : un humain peut avoir corrige la
+        # piece. Mais les OCTETS n'ont pas change - la cle d'idempotence
+        # inclut leur empreinte - donc une relecture Terra/Sol rendrait
+        # exactement le meme resultat. La refaire toutes les cinq minutes
+        # facturerait indefiniment un appel de vision pour rien.
+        deja_en_quarantaine = bool(
+            existing and existing["state"] == store.NEEDS_REVIEW
+        )
         if not existing:
             store.claim_document(
                 self._db, doc_key, self._chat_id,
@@ -914,7 +923,8 @@ class DocumentPipeline:
                 doc = extract_from_image_bytes(file.content, company=self._company)
             else:
                 doc = extract_from_pdf_bytes(file.content, company=self._company)
-            self.escalate_reading(doc, file)
+            if not deja_en_quarantaine:
+                self.escalate_reading(doc, file)
         except Exception as exc:  # noqa: BLE001 - PDF/image illisible
             # Un document illisible n'est pas un document perdu. Il laisse
             # UNE ligne rouge, comme toute piece que le bot refuse de
