@@ -134,6 +134,21 @@ class Settings(BaseSettings):
     )
     gmail_watch_interval_seconds: int = Field(default=60, alias="GMAIL_WATCH_INTERVAL_SECONDS")
     gmail_watch_max_per_cycle: int = Field(default=5, alias="GMAIL_WATCH_MAX_PER_CYCLE")
+    # --- multi-entreprises ------------------------------------------------
+    #
+    # Desactive par defaut : un deploiement qui ne lirait pas sa
+    # configuration retombe sur le comportement mono-entreprise connu,
+    # jamais sur un mode degrade inconnu.
+    multi_tenant_enabled: bool = Field(default=False, alias="MULTI_TENANT_ENABLED")
+    # Declaration d'entreprises par l'exploitant. C'est le SEUL chemin par
+    # lequel une entreprise peut naitre : aucun email ne peut en creer une.
+    companies_json: str = Field(default="", alias="COMPANIES_JSON")
+    # Classeur comptable servant de modele fonctionnel aux nouvelles
+    # entreprises. Il est COPIE, jamais modifie ni vide.
+    template_sheet_id: str = Field(default="", alias="TEMPLATE_SHEET_ID")
+    # Dossier Drive parent sous lequel chaque entreprise recoit le sien.
+    drive_root_folder_id: str = Field(default="", alias="DRIVE_ROOT_FOLDER_ID")
+
     company_name: str = Field(default="X BLASTE", alias="COMPANY_NAME")
     drive_archive_folder: str = Field(
         default="XBLASTE - Factures", alias="DRIVE_ARCHIVE_FOLDER"

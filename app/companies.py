@@ -114,6 +114,7 @@ CREATE TABLE IF NOT EXISTS companies (
     allowed_admin_senders TEXT NOT NULL DEFAULT '[]',
     sheet_id TEXT NOT NULL DEFAULT '',
     drive_folder_id TEXT NOT NULL DEFAULT '',
+    ice TEXT NOT NULL DEFAULT '',
     country TEXT NOT NULL DEFAULT '',
     currency TEXT NOT NULL DEFAULT '',
     allowed_vat_rates TEXT NOT NULL DEFAULT '[]',
@@ -151,6 +152,7 @@ class Company:
     allowed_admin_senders: tuple[str, ...] = ()
     sheet_id: str = ""
     drive_folder_id: str = ""
+    ice: str = ""
     country: str = ""
     currency: str = ""
     allowed_vat_rates: tuple[Decimal, ...] = ()
@@ -234,9 +236,24 @@ def _list_from_json(payload: str) -> tuple[str, ...]:
     return tuple(str(v) for v in brut if str(v).strip())
 
 
+# Colonnes ajoutees APRES la premiere mise en service. `CREATE TABLE IF
+# NOT EXISTS` ne touche pas une table qui existe deja : une base creee
+# avant cet ajout garderait un schema incomplet et toute lecture
+# echouerait sur une colonne absente. On complete donc explicitement.
+_COLONNES_AJOUTEES = (
+    ("ice", "TEXT NOT NULL DEFAULT ''"),
+)
+
+
 def ensure_schema(db_path: str) -> None:
     with sqlite3.connect(db_path) as conn:
         conn.executescript(SCHEMA)
+        presentes = {
+            row[1] for row in conn.execute("PRAGMA table_info(companies)")
+        }
+        for nom, definition in _COLONNES_AJOUTEES:
+            if nom not in presentes:
+                conn.execute(f"ALTER TABLE companies ADD COLUMN {nom} {definition}")
         conn.commit()
 
 
@@ -250,6 +267,7 @@ def _row_to_company(row: sqlite3.Row) -> Company:
         allowed_admin_senders=_list_from_json(row["allowed_admin_senders"]),
         sheet_id=row["sheet_id"] or "",
         drive_folder_id=row["drive_folder_id"] or "",
+        ice=row["ice"] or "",
         country=row["country"] or "",
         currency=row["currency"] or "",
         allowed_vat_rates=_rates_from_json(row["allowed_vat_rates"]),
@@ -279,6 +297,7 @@ def register_company(
     allowed_admin_senders: Iterable[str] = (),
     sheet_id: str = "",
     drive_folder_id: str = "",
+    ice: str = "",
     country: str = "",
     currency: str = "",
     allowed_vat_rates: Iterable[Decimal | str] = (),
@@ -319,10 +338,10 @@ def register_company(
         conn.execute(
             "INSERT INTO companies (company_id, legal_name, display_name, status,"
             " inbound_aliases, allowed_admin_senders, sheet_id, drive_folder_id,"
-            " country, currency, allowed_vat_rates, telegram_chat_id,"
+            " ice, country, currency, allowed_vat_rates, telegram_chat_id,"
             " template_version, config_validation_status, created_at,"
             " activated_at, last_successful_cycle)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 identifiant,
                 legal_name.strip(),
@@ -332,6 +351,7 @@ def register_company(
                 json.dumps([normalize_alias(a) for a in allowed_admin_senders or ()]),
                 sheet_id.strip(),
                 drive_folder_id.strip(),
+                ice.strip(),
                 country.strip(),
                 currency.strip().upper(),
                 _rates_to_json(allowed_vat_rates),
@@ -413,7 +433,7 @@ def set_status(db_path: str, company_id: str, status: str) -> Company:
 
 
 _UPDATABLE = {
-    "legal_name", "display_name", "sheet_id", "drive_folder_id", "country",
+    "legal_name", "display_name", "sheet_id", "drive_folder_id", "ice", "country",
     "currency", "telegram_chat_id", "template_version",
     "config_validation_status", "last_successful_cycle",
 }

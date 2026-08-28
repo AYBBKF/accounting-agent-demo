@@ -816,6 +816,48 @@ async def deliver_summary(bot: Any, summary: Any) -> dict[str, Any]:
     return rapport
 
 
+def _build_multitenant_worker():
+    """Prepare et rend le repartiteur, ou None pour rester mono-entreprise.
+
+    Un echec de preparation ne fait PAS taire l'agent : on journalise et
+    on retombe sur le comportement mono-entreprise, qui reste correct
+    pour XBLASTE. Un agent muet serait la pire des issues.
+    """
+    if not settings.multi_tenant_enabled:
+        return None
+    try:
+        from app import multitenant_runtime as runtime
+
+        sheets = drive = None
+        if settings.template_sheet_id:
+            from app.bootstrap import ComposioDrive, ComposioSheets
+
+            sheets = ComposioSheets(mail_worker)
+            drive = ComposioDrive(mail_worker, settings.drive_root_folder_id)
+        rapport = runtime.prepare(
+            settings.db_path,
+            companies_json=settings.companies_json,
+            sheets=sheets, drive=drive,
+            template_sheet_id=settings.template_sheet_id,
+        )
+        if not rapport.writable:
+            logger.error(
+                "Multi-entreprises demande mais AUCUNE entreprise ecrivable : "
+                "retour au mode mono-entreprise."
+            )
+            return None
+        return runtime.build_worker(
+            settings, vision=_vision_extractor,
+            vision_max_calls=settings.vision_max_calls_per_email,
+        )
+    except Exception:  # noqa: BLE001 - jamais fatal
+        logger.exception(
+            "Preparation multi-entreprises impossible : retour au mode "
+            "mono-entreprise."
+        )
+        return None
+
+
 async def _gmail_watch_loop(bot: Bot) -> None:
     """Boucle de fond : interroge Gmail toutes les N secondes, importe les
     factures certaines et notifie le client. Les boutons de validation ne
@@ -831,6 +873,29 @@ async def _gmail_watch_loop(bot: Bot) -> None:
         "Worker Gmail demarre (user=%s, intervalle=%ss, requete=%r).",
         mail_worker.user_id, mail_worker.poll_seconds, mail_worker.query,
     )
+    moteur = _build_multitenant_worker()
+    if moteur is not None:
+        logger.info(
+            "Mode MULTI-ENTREPRISES actif (intervalle=%ss, requete=%r).",
+            moteur.poll_seconds, moteur.query,
+        )
+        while True:
+            try:
+                rapport = await asyncio.to_thread(moteur.process_once)
+                for entree in rapport.emails:
+                    if entree.summary is not None:
+                        await deliver_summary(bot, entree.summary)
+                for refuse in rapport.quarantined:
+                    logger.warning(
+                        "Email %s en quarantaine (%s) : %s",
+                        refuse.message_id, refuse.outcome, refuse.reason,
+                    )
+            except MailWorkerError as exc:
+                logger.warning("Cycle Gmail multi-entreprises en echec: %s", exc)
+            except Exception:  # noqa: BLE001 - la boucle ne doit jamais mourir
+                logger.exception("Erreur inattendue dans le worker multi-entreprises")
+            await asyncio.sleep(moteur.poll_seconds)
+
     while True:
         try:
             summaries = await asyncio.to_thread(mail_worker.process_once)
