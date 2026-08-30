@@ -215,6 +215,15 @@ def prepare(
     """Prepare l'etat multi-tenant AVANT d'ouvrir le repartiteur."""
     rapport = StartupReport()
 
+    # Sur un volume NEUF, les tables d'etat n'existent pas encore : le
+    # magasin les cree paresseusement au premier cycle, ce qui est trop
+    # tard pour une migration qui pose des index dessus. Decouvert en
+    # conditions reelles : le premier demarrage E2E s'est arrete
+    # fail-closed sur "no such table: documents".
+    from app import doc_store as store
+
+    store.ensure_schema(db_path)
+
     migration = tenancy.migrate_to_multi_tenant(db_path)
     rapport.migrated = not migration.already_migrated
     if rapport.migrated:

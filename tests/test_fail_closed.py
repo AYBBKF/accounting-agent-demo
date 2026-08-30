@@ -108,6 +108,25 @@ def test_l_erreur_terminale_est_structuree(db_path):
         pytest.fail("l'erreur terminale n'a pas ete levee")
 
 
+def test_un_volume_neuf_demarre_sans_intervention(db_path):
+    """Regression, trouvee en E2E reel : sur un volume vierge la
+    migration tournait avant la creation du schema et le premier
+    demarrage partait en fail-closed sur "no such table: documents"."""
+    import tempfile
+    from app.db import init_db as _init
+
+    vierge = tempfile.mktemp(suffix=".db")
+    try:
+        _init(vierge)          # volume neuf : PAS de ensure_schema
+        rapport = runtime.prepare_or_fail(
+            vierge,
+            companies_json=_declaration_complete(),
+        )
+        assert rapport.writable == ("xblaste",)
+    finally:
+        Path(vierge).unlink(missing_ok=True)
+
+
 # --- niveau processus : la boucle Gmail ------------------------------------
 
 
