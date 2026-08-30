@@ -112,6 +112,39 @@ _INDEX = (
     " ON documents(company_id, doc_type, numero)",
 )
 
+# Cle d'evenement CANONIQUE, imposee par la BASE elle-meme (principe
+# observe chez Accounted et paperless-ngx : la deduplication vit dans une
+# contrainte, pas dans le code - aucun code n'a ete copie, licences
+# AGPL/GPL respectees). L'index vit dans le FICHIER SQLite du volume :
+# il est donc applique par N'IMPORTE QUEL digest qui ouvre ce volume, y
+# compris le digest de rollback, apres redemarrage, retry ou fenetre de
+# recouvrement Gmail. Une meme piece (entreprise, email, empreinte,
+# membre) ne peut exister qu'une fois, meme si une formule de cle
+# applicative changeait entre deux versions.
+INDEX_EVENEMENT_UNIQUE = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS uniq_documents_evenement"
+    " ON documents(company_id, chat_id, gmail_message_id, file_sha256,"
+    " ifnull(member_path,''), ifnull(filename,''))"
+)
+
+
+def ensure_event_uniqueness(db_path: str) -> bool:
+    """Pose la contrainte d'evenement unique sur le volume. Rend False si
+    des doublons HISTORIQUES (anterieurs au correctif de cle stable)
+    empechent sa creation - jamais bloquant : la deduplication applicative
+    couvre ces lignes-la, la contrainte protege tout le reste."""
+    with sqlite3.connect(db_path) as conn:
+        if not _table_existe(conn, "documents"):
+            return False
+        if "company_id" not in _colonnes(conn, "documents"):
+            return False
+        try:
+            conn.execute(INDEX_EVENEMENT_UNIQUE)
+            conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
 
 @dataclass
 class MigrationReport:
@@ -234,6 +267,10 @@ def migrate_to_multi_tenant(
         except Exception:
             conn.execute("ROLLBACK")
             raise
+
+    # Contrainte d'evenement unique, hors transaction : des doublons
+    # historiques ne doivent pas faire echouer la migration elle-meme.
+    ensure_event_uniqueness(db_path)
 
     rapport.columns_added = tuple(ajoutees)
     rapport.tables_rebuilt = tuple(reconstruites)
