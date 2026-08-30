@@ -29,6 +29,7 @@ from app import doc_store as store
 from app.attachments import DocumentFile, content_mimetype, idempotency_key, is_image
 from app.business_key import business_identity
 from app import doc_vision
+from app import llm_usage
 from app.doc_extract import (
     ExtractedDocument,
     extract_from_image_bytes,
@@ -261,10 +262,18 @@ class DocumentPipeline:
         today: Callable[[], date] | None = None,
         vision: Any | None = None,
         vision_budget: Any | None = None,
+        company_id: str = "",
     ) -> None:
         self._gw = gateway
         self._db = db_path
         self._chat_id = chat_id
+        # Entreprise proprietaire de CE traitement. Toute recherche d'etat
+        # (doublon, jumeau ouvert, empreinte bancaire, quarantaine) est
+        # enfermee dedans : une piece envoyee a deux societes doit produire
+        # une ecriture dans CHACUNE, et jamais une seule "deja vue".
+        # Une chaine vide preserve exactement le comportement mono-entreprise
+        # d'avant la V2, le temps que la migration ait tourne.
+        self._company_id = company_id
         self._sheet = spreadsheet_id
         self._company = company
         self._drive_root = drive_root
@@ -280,6 +289,14 @@ class DocumentPipeline:
         # deterministe strictement inchange.
         self._vision = vision
         self._vision_budget = vision_budget
+
+    @property
+    def company_id(self) -> str:
+        return self._company_id
+
+    def _scope(self) -> dict[str, str]:
+        """Portee entreprise a joindre a CHAQUE recherche d'etat."""
+        return {"company_id": self._company_id}
 
     # -- utilitaires Sheets ------------------------------------------------
 
@@ -844,7 +861,9 @@ class DocumentPipeline:
         # empreinte du fichier) identifie la piece une fois pour toutes.
         # Sans cela, chaque cycle recreait un document neuf, les boutons
         # pointaient vers des cles mortes et les reprises n'aboutissaient pas.
-        known = store.find_by_message_and_sha(self._db, self._chat_id, message_id, file.sha256)
+        known = store.find_by_message_and_sha(
+            self._db, self._chat_id, message_id, file.sha256, **self._scope()
+        )
         if known is not None:
             doc_key = known["doc_key"]
         outcome = DocumentOutcome(doc_key=doc_key, filename=file.display_name)
@@ -878,6 +897,7 @@ class DocumentPipeline:
                 parent_attachment_id=parent_attachment_id or attachment_id,
                 parent_filename=parent_filename or file.container or file.filename,
                 member_path=file.member_path, local_path=local_path,
+                **self._scope(),
             )
         else:
             # Reprise : on rafraichit ce qui a pu changer cote Gmail
@@ -906,7 +926,8 @@ class DocumentPipeline:
         # touche a aucun onglet.
         if not resuming:
             twin = store.find_open_twin(
-                self._db, self._chat_id, file.sha256, exclude_key=doc_key
+                self._db, self._chat_id, file.sha256, exclude_key=doc_key,
+                **self._scope()
             )
             if twin is not None:
                 return self._attach_to_twin(outcome, twin)
@@ -957,14 +978,17 @@ class DocumentPipeline:
         # --- doublons ------------------------------------------------------
         duplicates = DuplicateState()
         if not resuming:
-            same_file = store.find_by_sha256(self._db, self._chat_id, file.sha256)
+            same_file = store.find_by_sha256(
+                self._db, self._chat_id, file.sha256, **self._scope()
+            )
             if same_file and same_file["doc_key"] != doc_key:
                 duplicates.certain = True
                 duplicates.existing_ref = same_file["stable_id"] or same_file["doc_key"][:12]
                 duplicates.existing_key = str(same_file["doc_key"])
             else:
                 same_business = store.find_by_business_key(
-                    self._db, self._chat_id, doc.doc_type, doc.numero or ""
+                    self._db, self._chat_id, doc.doc_type, doc.numero or "",
+                    **self._scope()
                 )
                 if same_business and same_business["doc_key"] != doc_key:
                     duplicates.certain = True
@@ -1338,7 +1362,7 @@ class DocumentPipeline:
         """
         if not empreinte:
             return None
-        for fiche in store.list_quarantined(self._db, self._chat_id):
+        for fiche in store.list_quarantined(self._db, self._chat_id, **self._scope()):
             if str(fiche.get("doc_key")) == doc_key:
                 continue
             if str(fiche.get("business_key") or "") == empreinte:
@@ -1748,7 +1772,7 @@ class DocumentPipeline:
             repetition = rang > 1        # deja vue DANS CE RELEVE
 
             if store.claim_bank_line(
-                self._db, self._chat_id, empreinte, doc_key=doc_key
+                self._db, self._chat_id, empreinte, doc_key=doc_key, **self._scope()
             ):
                 fresh.append(line)
                 if repetition:
@@ -1793,6 +1817,34 @@ class DocumentPipeline:
 
     # -- escalade de lecture Luna -> Terra -> Sol --------------------------
 
+    def _journaliser_appel(
+        self, level: str, model: str, reason: str, outcome: str,
+        input_tokens: int, output_tokens: int, doc_key: str,
+    ) -> None:
+        """Impute UN appel de modele a l'entreprise en cours.
+
+        Sans entreprise (mode mono-entreprise d'avant la V2) il n'y a rien
+        a ventiler : on n'ecrit pas une ligne qu'on ne saurait pas lire.
+        Une panne du journal ne doit jamais faire perdre une lecture qui,
+        elle, a reussi.
+        """
+        if not self._company_id:
+            return
+        if not model and self._vision is not None:
+            model = getattr(self._vision, "model_for", lambda _l: "")(level)
+        try:
+            llm_usage.record_call(
+                self._db, company_id=self._company_id, level=level,
+                model=model or level, doc_key=doc_key, reason=reason,
+                outcome=outcome, input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                estimated_cost_usd=llm_usage.estimate_cost(
+                    model, input_tokens, output_tokens
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 - jamais bloquant
+            logger.warning("Journal des couts indisponible : %s", type(exc).__name__)
+
     def escalate_reading(self, doc: ExtractedDocument, file: Any) -> None:
         """Relit un document que la lecture deterministe n'a pas su lire.
 
@@ -1821,6 +1873,9 @@ class DocumentPipeline:
                 lambda: self._vision.read_image(file.content, content_mimetype(file.content)),
             ))
 
+        motif = _motif_escalade(raisons)
+        doc_key = getattr(file, "doc_key", "") or ""
+
         for nom, appel in niveaux:
             if nom == "sol":
                 if self._vision_budget is not None and not self._vision_budget.take():
@@ -1829,7 +1884,19 @@ class DocumentPipeline:
                     doc.anomalies.append("relecture visuelle non effectuee : budget epuise")
                     return
             resultat = appel()
-            if resultat is None or resultat.is_empty:
+            # CHAQUE tentative est imputee, y compris celles qui echouent :
+            # un appel refuse ou rejete a ete facture tout de meme, et une
+            # escalade qui coute sans rien rendre est exactement ce qu'on
+            # veut voir dans le journal.
+            if resultat is None:
+                self._journaliser_appel(nom, "", motif, llm_usage.OUTCOME_UNAVAILABLE,
+                                        0, 0, doc_key)
+                continue
+            if resultat.is_empty:
+                self._journaliser_appel(nom, resultat.model, motif,
+                                        llm_usage.OUTCOME_EMPTY,
+                                        resultat.input_tokens, resultat.output_tokens,
+                                        doc_key)
                 continue
             echecs = doc_vision.validate(
                 resultat, today=self._today(), allowed_rates=self._vat_rates,
@@ -1838,7 +1905,15 @@ class DocumentPipeline:
             if echecs:
                 logger.info("Niveau %s rejete pour %s : %s", nom,
                             getattr(file, "filename", "?"), " | ".join(echecs))
+                self._journaliser_appel(nom, resultat.model, motif,
+                                        llm_usage.OUTCOME_REJECTED,
+                                        resultat.input_tokens, resultat.output_tokens,
+                                        doc_key)
                 continue
+            self._journaliser_appel(nom, resultat.model, motif,
+                                    llm_usage.OUTCOME_ACCEPTED,
+                                    resultat.input_tokens, resultat.output_tokens,
+                                    doc_key)
             doc_vision.apply_vision(doc, resultat)
             logger.info(
                 "Niveau %s retenu pour %s : numero=%s HT=%s TVA=%s TTC=%s (confiance %.0f%%)",
@@ -2239,3 +2314,21 @@ def drive_link(uploaded: dict[str, Any]) -> str:
         if file_id:
             return f"https://drive.google.com/file/d/{file_id}/view"
     return ""
+
+
+def _motif_escalade(raisons: list[str]) -> str:
+    """Traduit les raisons libres en UN motif normalise.
+
+    Une chaine libre rendrait toute statistique impossible : on ne saurait
+    pas regrouper deux formulations du meme probleme.
+    """
+    texte = " ".join(raisons).lower()
+    if "incoherent" in texte:
+        return llm_usage.REASON_INCOHERENT_TOTALS
+    if "confiance" in texte:
+        return llm_usage.REASON_LOW_CONFIDENCE
+    if "illisible" in texte or "aucune lecture" in texte:
+        return llm_usage.REASON_UNREADABLE_IMAGE
+    if "absent" in texte:
+        return llm_usage.REASON_MISSING_FIELDS
+    return llm_usage.REASON_DIRECT
