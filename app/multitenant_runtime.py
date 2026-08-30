@@ -45,7 +45,20 @@ from app.tenant_worker import TenantWorker
 logger = logging.getLogger(__name__)
 
 
-class RuntimeConfigError(RuntimeError):
+class MultiTenantStartupError(RuntimeError):
+    """Le multi-tenant est DEMANDE mais ne peut pas demarrer sainement.
+
+    Cette erreur est terminale par construction : quand l'exploitant a
+    explicitement active le multi-entreprises, retomber en silence sur le
+    worker mono-entreprise servirait la comptabilite de XBLASTE avec la
+    configuration d'un monde qui n'existe plus - et surtout laisserait
+    croire que tous les clients sont servis. On prefere un conteneur
+    unhealthy, visible et diagnosticable, a un agent qui travaille a
+    moitie sans le dire.
+    """
+
+
+class RuntimeConfigError(MultiTenantStartupError):
     """Configuration multi-tenant inexploitable : on refuse de demarrer.
 
     Demarrer a moitie configure serait pire que ne pas demarrer : les
@@ -239,6 +252,45 @@ def prepare(
     )
     for identifiant, raison in rapport.pending.items():
         logger.warning("En attente de configuration : %s (%s)", identifiant, raison)
+    return rapport
+
+
+def prepare_or_fail(
+    db_path: str, *, companies_json: str, sheets: Any = None, drive: Any = None,
+    template_sheet_id: str = "",
+) -> StartupReport:
+    """Prepare l'etat multi-tenant, ou echoue TERMINALEMENT.
+
+    C'est le chemin que doit emprunter un processus dont l'exploitant a
+    active le multi-entreprises : toute impossibilite - configuration
+    illisible, migration en echec, registre inexploitable, aucune
+    entreprise ecrivable - devient une `MultiTenantStartupError`, jamais
+    un repli silencieux.
+    """
+    try:
+        rapport = prepare(
+            db_path, companies_json=companies_json, sheets=sheets, drive=drive,
+            template_sheet_id=template_sheet_id,
+        )
+    except MultiTenantStartupError:
+        raise
+    except Exception as exc:
+        raise MultiTenantStartupError(
+            f"preparation multi-entreprises impossible : {type(exc).__name__}: {exc}"
+        ) from exc
+    if not rapport.declared:
+        raise MultiTenantStartupError(
+            "multi-entreprises actif mais COMPANIES_JSON ne declare aucune "
+            "entreprise : rien a servir, refus de demarrer"
+        )
+    if not rapport.writable:
+        details = "; ".join(
+            f"{ident}: {raison}" for ident, raison in rapport.pending.items()
+        ) or "aucun detail"
+        raise MultiTenantStartupError(
+            "multi-entreprises actif mais AUCUNE entreprise n'est ecrivable "
+            f"({details}) : refus de demarrer"
+        )
     return rapport
 
 

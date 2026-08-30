@@ -816,46 +816,60 @@ async def deliver_summary(bot: Any, summary: Any) -> dict[str, Any]:
     return rapport
 
 
+# Posee quand le multi-entreprises, explicitement demande, ne peut pas
+# demarrer sainement. Le heartbeat cesse alors d'etre ecrit : le
+# healthcheck Docker voit le fichier vieillir et declare le conteneur
+# unhealthy. C'est le canal d'alerte le plus fiable dont on dispose - il
+# ne depend ni de Telegram ni du reseau.
+_fatal_startup_error: str | None = None
+
+
+def _declare_fatal(raison: str) -> None:
+    global _fatal_startup_error
+    _fatal_startup_error = raison
+    logger.critical("ARRET FAIL-CLOSED : %s", raison)
+
+
 def _build_multitenant_worker():
-    """Prepare et rend le repartiteur, ou None pour rester mono-entreprise.
+    """Construit le repartiteur multi-entreprises, ou echoue TERMINALEMENT.
 
-    Un echec de preparation ne fait PAS taire l'agent : on journalise et
-    on retombe sur le comportement mono-entreprise, qui reste correct
-    pour XBLASTE. Un agent muet serait la pire des issues.
+    Quand `MULTI_TENANT_ENABLED` est vrai, il n'existe AUCUN repli vers le
+    worker mono-entreprise : un echec de preparation leve, l'appelant
+    declare l'arret fail-closed, et le conteneur devient unhealthy. Servir
+    XBLASTE en silence avec la configuration d'un monde a une seule
+    entreprise laisserait croire que tous les clients sont servis.
     """
-    if not settings.multi_tenant_enabled:
-        return None
+    from app import multitenant_runtime as runtime
+
+    sheets = drive = None
+    if settings.template_sheet_id:
+        from app.bootstrap import ComposioDrive, ComposioSheets
+
+        sheets = ComposioSheets(mail_worker)
+        drive = ComposioDrive(mail_worker, settings.drive_root_folder_id)
+    rapport = runtime.prepare_or_fail(
+        settings.db_path,
+        companies_json=settings.companies_json,
+        sheets=sheets, drive=drive,
+        template_sheet_id=settings.template_sheet_id,
+    )
+    logger.info(
+        "Multi-entreprises pret : %d entreprise(s) ecrivable(s) : %s",
+        len(rapport.writable), ", ".join(rapport.writable),
+    )
+    return runtime.build_worker(
+        settings, vision=_vision_extractor,
+        vision_max_calls=settings.vision_max_calls_per_email,
+    )
+
+
+async def _alert_admin(bot: Bot, texte: str) -> None:
+    """Prevenir l'exploitant si le canal existe. Jamais bloquant."""
     try:
-        from app import multitenant_runtime as runtime
-
-        sheets = drive = None
-        if settings.template_sheet_id:
-            from app.bootstrap import ComposioDrive, ComposioSheets
-
-            sheets = ComposioSheets(mail_worker)
-            drive = ComposioDrive(mail_worker, settings.drive_root_folder_id)
-        rapport = runtime.prepare(
-            settings.db_path,
-            companies_json=settings.companies_json,
-            sheets=sheets, drive=drive,
-            template_sheet_id=settings.template_sheet_id,
-        )
-        if not rapport.writable:
-            logger.error(
-                "Multi-entreprises demande mais AUCUNE entreprise ecrivable : "
-                "retour au mode mono-entreprise."
-            )
-            return None
-        return runtime.build_worker(
-            settings, vision=_vision_extractor,
-            vision_max_calls=settings.vision_max_calls_per_email,
-        )
-    except Exception:  # noqa: BLE001 - jamais fatal
-        logger.exception(
-            "Preparation multi-entreprises impossible : retour au mode "
-            "mono-entreprise."
-        )
-        return None
+        if settings.gmail_watch_chat_id:
+            await bot.send_message(settings.gmail_watch_chat_id, texte[:4000])
+    except Exception:  # noqa: BLE001 - l'alerte ne doit pas masquer la panne
+        logger.warning("Alerte administrateur non remise (canal indisponible).")
 
 
 async def _gmail_watch_loop(bot: Bot) -> None:
@@ -873,8 +887,27 @@ async def _gmail_watch_loop(bot: Bot) -> None:
         "Worker Gmail demarre (user=%s, intervalle=%ss, requete=%r).",
         mail_worker.user_id, mail_worker.poll_seconds, mail_worker.query,
     )
-    moteur = _build_multitenant_worker()
-    if moteur is not None:
+    if settings.multi_tenant_enabled:
+        # FAIL-CLOSED : le multi-entreprises est explicitement demande.
+        # S'il ne peut pas demarrer, RIEN ne demarre a sa place - pas de
+        # worker mono-entreprise, pas d'email lu, pas de curseur avance.
+        try:
+            moteur = await asyncio.to_thread(_build_multitenant_worker)
+        except Exception as exc:  # noqa: BLE001 - erreur TERMINALE, pas un repli
+            raison = f"{type(exc).__name__}: {exc}"
+            _declare_fatal(
+                "multi-entreprises demande mais impossible a demarrer - "
+                f"{raison}. Aucun email ne sera traite tant que la "
+                "configuration n'est pas corrigee."
+            )
+            await _alert_admin(
+                bot,
+                "ALERTE agent comptable : demarrage multi-entreprises "
+                f"impossible ({raison}). L'agent est ARRETE (fail-closed), "
+                "aucun email n'est traite. Corrigez la configuration puis "
+                "redeployez.",
+            )
+            return
         logger.info(
             "Mode MULTI-ENTREPRISES actif (intervalle=%ss, requete=%r).",
             moteur.poll_seconds, moteur.query,
@@ -911,6 +944,15 @@ async def _gmail_watch_loop(bot: Bot) -> None:
 async def _heartbeat_loop() -> None:
     HEARTBEAT_PATH.parent.mkdir(parents=True, exist_ok=True)
     while True:
+        if _fatal_startup_error is not None:
+            # Le heartbeat cesse : le healthcheck voit le fichier vieillir
+            # et declare le conteneur unhealthy. C'est VOULU - un agent en
+            # arret fail-closed ne doit pas avoir l'air en bonne sante.
+            logger.critical(
+                "Heartbeat suspendu (fail-closed) : %s", _fatal_startup_error
+            )
+            await asyncio.sleep(30)
+            continue
         HEARTBEAT_PATH.write_text(str(time.time()))
         await asyncio.sleep(30)
 
