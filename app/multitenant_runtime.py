@@ -73,6 +73,7 @@ class RuntimeConfigError(MultiTenantStartupError):
 _CHAMPS = {
     "company_id", "display_name", "legal_name", "ice", "country", "currency",
     "allowed_vat_rates", "telegram_chat_id", "inbound_aliases", "sheet_id",
+    "account_mapping",
     "drive_folder_id", "status", "allowed_admin_senders",
 }
 _OBLIGATOIRES = ("company_id", "inbound_aliases")

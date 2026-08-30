@@ -115,6 +115,7 @@ CREATE TABLE IF NOT EXISTS companies (
     sheet_id TEXT NOT NULL DEFAULT '',
     drive_folder_id TEXT NOT NULL DEFAULT '',
     ice TEXT NOT NULL DEFAULT '',
+    account_mapping TEXT NOT NULL DEFAULT '{}',
     country TEXT NOT NULL DEFAULT '',
     currency TEXT NOT NULL DEFAULT '',
     allowed_vat_rates TEXT NOT NULL DEFAULT '[]',
@@ -153,6 +154,7 @@ class Company:
     sheet_id: str = ""
     drive_folder_id: str = ""
     ice: str = ""
+    account_mapping: dict = None  # type: ignore[assignment]
     country: str = ""
     currency: str = ""
     allowed_vat_rates: tuple[Decimal, ...] = ()
@@ -242,6 +244,7 @@ def _list_from_json(payload: str) -> tuple[str, ...]:
 # echouerait sur une colonne absente. On complete donc explicitement.
 _COLONNES_AJOUTEES = (
     ("ice", "TEXT NOT NULL DEFAULT ''"),
+    ("account_mapping", "TEXT NOT NULL DEFAULT '{}'"),
 )
 
 
@@ -257,6 +260,14 @@ def ensure_schema(db_path: str) -> None:
         conn.commit()
 
 
+def _mapping_from_json(brut: object) -> dict:
+    try:
+        charge = json.loads(str(brut or "{}"))
+        return charge if isinstance(charge, dict) else {}
+    except Exception:  # noqa: BLE001 - un mapping illisible vaut vide
+        return {}
+
+
 def _row_to_company(row: sqlite3.Row) -> Company:
     return Company(
         company_id=row["company_id"],
@@ -268,6 +279,7 @@ def _row_to_company(row: sqlite3.Row) -> Company:
         sheet_id=row["sheet_id"] or "",
         drive_folder_id=row["drive_folder_id"] or "",
         ice=row["ice"] or "",
+        account_mapping=_mapping_from_json(row["account_mapping"]),
         country=row["country"] or "",
         currency=row["currency"] or "",
         allowed_vat_rates=_rates_from_json(row["allowed_vat_rates"]),
@@ -298,6 +310,7 @@ def register_company(
     sheet_id: str = "",
     drive_folder_id: str = "",
     ice: str = "",
+    account_mapping: dict | None = None,
     country: str = "",
     currency: str = "",
     allowed_vat_rates: Iterable[Decimal | str] = (),
@@ -338,10 +351,10 @@ def register_company(
         conn.execute(
             "INSERT INTO companies (company_id, legal_name, display_name, status,"
             " inbound_aliases, allowed_admin_senders, sheet_id, drive_folder_id,"
-            " ice, country, currency, allowed_vat_rates, telegram_chat_id,"
+            " ice, account_mapping, country, currency, allowed_vat_rates, telegram_chat_id,"
             " template_version, config_validation_status, created_at,"
             " activated_at, last_successful_cycle)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 identifiant,
                 legal_name.strip(),
@@ -352,6 +365,7 @@ def register_company(
                 sheet_id.strip(),
                 drive_folder_id.strip(),
                 ice.strip(),
+                json.dumps(account_mapping or {}),
                 country.strip(),
                 currency.strip().upper(),
                 _rates_to_json(allowed_vat_rates),
@@ -433,7 +447,8 @@ def set_status(db_path: str, company_id: str, status: str) -> Company:
 
 
 _UPDATABLE = {
-    "legal_name", "display_name", "sheet_id", "drive_folder_id", "ice", "country",
+    "legal_name", "display_name", "sheet_id", "drive_folder_id", "ice",
+    "account_mapping", "country",
     "currency", "telegram_chat_id", "template_version",
     "config_validation_status", "last_successful_cycle",
 }
@@ -447,6 +462,9 @@ def update_company(db_path: str, company_id: str, **champs: Any) -> Company:
     table d'unicite.
     """
     identifiant = normalize_company_id(company_id)
+    mapping = champs.pop("account_mapping", None)
+    if mapping is not None:
+        champs["account_mapping"] = json.dumps(dict(mapping))
     taux = champs.pop("allowed_vat_rates", None)
     inconnus = set(champs) - _UPDATABLE
     if inconnus:

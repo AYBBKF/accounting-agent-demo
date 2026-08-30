@@ -29,6 +29,8 @@ from app import doc_store as store
 from app.attachments import DocumentFile, content_mimetype, idempotency_key, is_image
 from app.business_key import business_identity
 from app import doc_vision
+from app import archive_log
+from app import ledger
 from app import llm_usage
 from app.doc_extract import (
     ExtractedDocument,
@@ -47,6 +49,9 @@ from app.doc_policy import (
     DuplicateState,
     decide,
 )
+TAB_JOURNAL = "12_JOURNAL_COMPTABLE"
+TAB_TVA_RECAP = "BOT_TVA_RECAP"
+
 from app.doc_routing import (
     CUSTOMS_SPEC,
     NEW_TAB_SPECS,
@@ -263,6 +268,7 @@ class DocumentPipeline:
         vision: Any | None = None,
         vision_budget: Any | None = None,
         company_id: str = "",
+        account_mapping: dict | None = None,
     ) -> None:
         self._gw = gateway
         self._db = db_path
@@ -274,6 +280,9 @@ class DocumentPipeline:
         # Une chaine vide preserve exactement le comportement mono-entreprise
         # d'avant la V2, le temps que la migration ait tourne.
         self._company_id = company_id
+        # Plan de comptes complementaire de la societe (banque, frais...).
+        # Vide par defaut : les operations qui l'exigent partent A_VALIDER.
+        self._account_mapping = dict(account_mapping or {})
         self._sheet = spreadsheet_id
         self._company = company
         self._drive_root = drive_root
@@ -711,18 +720,28 @@ class DocumentPipeline:
         self._folder_cache[cache_key] = folder_id
         return folder_id
 
-    def archive(self, file: DocumentFile, folder: str, year: int, source_url: str) -> str:
-        """Archive le PDF dans <racine>/<categorie>/<annee> et retourne son lien.
+    def archive(self, file: DocumentFile, folder: str, year: int, source_url: str,
+                *, month: int = 0, gmail_message_id: str = "",
+                reference: str = "", statut: str = "") -> str:
+        """Archive la piece dans Entreprise/AAAA/MM/<categorie>, une seule fois.
 
-        Le contenu archive est celui du document lui-meme. Pour un PDF
-        contenu dans un ZIP, l'URL Gmail designe l'archive entiere : s'en
-        servir stockerait le ZIP sous le nom du PDF. L'URL n'est donc un
-        repli que pour une piece jointe autonome.
+        Le contenu archive est celui du document lui-meme, octets
+        inchanges. Le registre `drive_archives` rend l'operation
+        idempotente PAR CONTENU : les memes octets deja archives dans
+        cette entreprise rendent le lien existant sans second depot -
+        et les memes octets dans une AUTRE entreprise s'archivent chez
+        elle, la cle du registre etant (entreprise, empreinte).
         """
-        target = self.archive_folder(folder, year)
+        if self._company_id and file.sha256:
+            connue = archive_log.known(self._db, self._company_id, file.sha256)
+            if connue and connue.get("drive_link"):
+                return str(connue["drive_link"])
+        target = self.archive_folder(folder, year, month)
         if file.content:
             uploaded = self._upload_content(file, target)
             if uploaded:
+                self._remember_archive(file, uploaded, folder,
+                                       gmail_message_id, reference, statut)
                 return uploaded
         if file.source != "attachment" or not source_url:
             raise PipelineError(
@@ -737,12 +756,96 @@ class DocumentPipeline:
         if target:
             args["parent_folder_id"] = target
         uploaded = self._gw.execute("GOOGLEDRIVE_UPLOAD_FROM_URL", args)
-        return drive_link(uploaded)
+        lien = drive_link(uploaded)
+        if lien:
+            self._remember_archive(file, lien, folder,
+                                   gmail_message_id, reference, statut)
+        return lien
 
-    def archive_folder(self, folder: str, year: int) -> str:
-        root = self.ensure_folder(self._drive_root)
-        category = self.ensure_folder(folder, root)
-        return self.ensure_folder(str(year), category) or category or root
+    def archive_original_bundle(self, name: str, content: bytes,
+                                gmail_message_id: str) -> str:
+        """Archive le ZIP recu, tel quel, dans Emails_ZIP.
+
+        Chaque document extrait a deja son archivage individuel ; le
+        ZIP est la piece probante de la reception. Une seule fois par
+        contenu et par entreprise, via le registre.
+        """
+        if not content:
+            return ""
+        empreinte = hashlib.sha256(content).hexdigest()
+        if self._company_id:
+            connue = archive_log.known(self._db, self._company_id, empreinte)
+            if connue and connue.get("drive_link"):
+                return str(connue["drive_link"])
+        aujourdhui = date.today()
+        cible = self.archive_folder("Emails_ZIP", aujourdhui.year, aujourdhui.month)
+        upload = getattr(self._gw, "upload", None)
+        if upload is None:
+            return ""
+        cle = upload(name=name, mimetype="application/zip", content=content)
+        if not cle:
+            return ""
+        args: dict[str, Any] = {
+            "file_to_upload": {"name": name, "mimetype": "application/zip",
+                               "s3key": cle}
+        }
+        if cible:
+            args["folder_to_upload_to"] = cible
+        lien = drive_link(self._gw.execute("GOOGLEDRIVE_UPLOAD_FILE", args))
+        if lien and self._company_id:
+            archive_log.remember(
+                self._db, company_id=self._company_id, sha256=empreinte,
+                original_name=name, mimetype="application/zip",
+                size_bytes=len(content), gmail_message_id=gmail_message_id,
+                statut="zip-original", category="Emails_ZIP",
+                drive_file_id=drive_file_id(lien) or "", drive_link=lien,
+            )
+        return lien
+
+    def _remember_archive(self, file: DocumentFile, lien: str, category: str,
+                          gmail_message_id: str, reference: str, statut: str) -> None:
+        """Inscrit l'archive au registre. Jamais bloquant : une panne du
+        registre ne doit pas faire perdre un depot qui, lui, a reussi."""
+        if not self._company_id or not file.sha256:
+            return
+        try:
+            archive_log.remember(
+                self._db, company_id=self._company_id, sha256=file.sha256,
+                original_name=file.filename,
+                mimetype=content_mimetype(file.content) if file.content else "",
+                size_bytes=len(file.content or b""),
+                gmail_message_id=gmail_message_id, reference=reference,
+                statut=statut, category=category,
+                drive_file_id=drive_file_id(lien) or "", drive_link=lien,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Registre d'archives indisponible : %s", type(exc).__name__)
+
+    def _root_folder(self) -> str:
+        """Racine d'archivage de l'entreprise.
+
+        En multi-tenant elle arrive comme un IDENTIFIANT Drive, pas un
+        nom : le chercher par nom creerait un dossier homonyme errant a
+        la racine du Drive - c'est arrive lors de la premiere validation
+        E2E. Un identifiant se reconnait et s'utilise tel quel.
+        """
+        racine = str(self._drive_root or "").strip()
+        if len(racine) >= 20 and " " not in racine and "/" not in racine:
+            return racine
+        return self.ensure_folder(racine)
+
+    def archive_folder(self, folder: str, year: int, month: int = 0) -> str:
+        """Dossier cible : Entreprise/AAAA/MM/Categorie.
+
+        L'annee puis le mois puis la categorie : un exercice comptable se
+        consulte par periode d'abord, par nature ensuite.
+        """
+        root = self._root_folder()
+        annee = self.ensure_folder(str(year), root) or root
+        niveau = annee
+        if month:
+            niveau = self.ensure_folder(f"{month:02d}", annee) or annee
+        return self.ensure_folder(folder, niveau) or niveau or root
 
     def _upload_content(self, file: DocumentFile, target: str) -> str:
         """Depot des octets reels. Retourne "" si la passerelle ne sait pas
@@ -771,11 +874,11 @@ class DocumentPipeline:
             args["folder_to_upload_to"] = target
         return drive_link(self._gw.execute("GOOGLEDRIVE_UPLOAD_FILE", args))
 
-    def relocate(self, link: str, folder: str, year: int) -> bool:
+    def relocate(self, link: str, folder: str, year: int, month: int = 0) -> bool:
         """Deplace une piece archivee dans 'A verifier' vers son dossier
         definitif, une fois la decision humaine prise."""
         file_id = drive_file_id(link)
-        target = self.archive_folder(folder, year)
+        target = self.archive_folder(folder, year, month)
         if not file_id or not target:
             return False
         try:
@@ -1135,15 +1238,20 @@ class DocumentPipeline:
             # elle rejoint son dossier definitif et la ligne comptable
             # recoit enfin son lien.
             if self.relocate(outcome.drive_link, route.drive_folder,
-                             (doc.date_document or date.today()).year):
+                             (doc.date_document or date.today()).year,
+                             (doc.date_document or date.today()).month):
                 store.update_document(self._db, doc_key, review_archive=0)
             self._backfill(outcome.tab, outcome.row_index,
                            DRIVE_LINK_COLUMN, outcome.drive_link)
         if not outcome.drive_link:
             try:
+                quand = doc.date_document or date.today()
                 outcome.drive_link = self.archive(
-                    file, route.drive_folder,
-                    (doc.date_document or date.today()).year, source_url,
+                    file, route.drive_folder, quand.year, source_url,
+                    month=quand.month,
+                    gmail_message_id=str(message.get("messageId") or ""),
+                    reference=doc.numero or outcome.stable_id,
+                    statut="comptabilise",
                 )
                 store.update_document(
                     self._db, doc_key, drive_link=outcome.drive_link,
@@ -1156,6 +1264,14 @@ class DocumentPipeline:
                 store.set_state(self._db, doc_key, store.PARTIAL)
                 outcome.error = "archivage Drive a terminer au prochain cycle"
                 return outcome
+
+        # --- etape 3ter : ecritures comptables ------------------------------
+        # L'idempotence est portee par le journal lui-meme (cle par piece) :
+        # un rejeu du meme document rend record()==False et ne touche ni la
+        # base ni le classeur. La facture et son paiement restent deux
+        # evenements distincts - le paiement s'ecrit au rapprochement.
+        self._post_ledger_entry(doc, outcome, file,
+                                str(message.get("messageId") or ""))
 
         # --- etape 4 : rappel Calendar -------------------------------------
         outcome.calendar_event = str(state.get("calendar_event") or "")
@@ -1482,15 +1598,129 @@ class DocumentPipeline:
         validation : on journalise et on rend un lien vide.
         """
         try:
+            quand = doc.date_document or date.today()
             return self.archive(
-                file, REVIEW_DRIVE_FOLDER,
-                (doc.date_document or date.today()).year, source_url,
+                file, REVIEW_DRIVE_FOLDER, quand.year, source_url,
+                month=quand.month, reference=doc.numero or doc_key[:12],
+                statut="quarantaine",
             )
         except Exception as exc:  # noqa: BLE001 - archivage non bloquant
             logger.warning(
                 "Archivage 'A verifier' impossible (%s): %s", doc_key[:12], exc
             )
             return ""
+
+    _LEDGER_KINDS = {
+        PURCHASE_INVOICE: "facture_achat",
+        IMPORT_INVOICE: "facture_achat",
+        SALES_INVOICE: "facture_vente",
+        EXPORT_INVOICE: "facture_vente",
+        SUPPLIER_CREDIT_NOTE: "avoir_fournisseur",
+        CLIENT_CREDIT_NOTE: "avoir_client",
+    }
+
+    def _ledger_mapping(self) -> "ledger.AccountMapping":
+        return ledger.AccountMapping(getattr(self, "_account_mapping", None))
+
+    def _post_ledger_entry(self, doc, outcome, file, gmail_message_id: str) -> None:
+        """Pose l'ecriture en partie double d'un document comptabilise.
+
+        Seuls les documents aux montants complets et coherents arrivent
+        ici - les autres sont partis en quarantaine bien avant. Si un
+        desequilibre survenait quand meme, l'ecriture serait enregistree
+        A_VALIDER avec l'ecart exact, jamais posee comme definitive, et
+        la piece resterait tracable. Une panne du journal ne casse pas le
+        traitement : le document est deja ecrit et archive.
+        """
+        kind = self._LEDGER_KINDS.get(doc.doc_type)
+        if kind is None or not self._company_id or not doc.numero:
+            return
+        try:
+            ht = doc.montant_ht.value if doc.montant_ht else None
+            tva = doc.montant_tva.value if doc.montant_tva else Decimal("0")
+            ttc = doc.montant_ttc.value if doc.montant_ttc else None
+            if ht is None or ttc is None:
+                return
+            try:
+                entry = ledger.build_entry(
+                    self._ledger_mapping(), company_id=self._company_id,
+                    kind=kind, piece=doc.numero,
+                    entry_date=(doc.date_document or date.today()).isoformat(),
+                    devise=doc.devise or "MAD", ht=ht, tva=tva, ttc=ttc,
+                    tiers=(doc.emetteur or doc.destinataire or ""),
+                    taux_tva=str(doc.taux_tva or ""),
+                    reference=outcome.stable_id or "",
+                    doc_sha256=file.sha256, gmail_message_id=gmail_message_id,
+                    drive_file_id=drive_file_id(outcome.drive_link) or "",
+                )
+            except ledger.LedgerImbalance as exc:
+                entry = ledger.Entry(
+                    company_id=self._company_id, journal=ledger.JOURNAL_OD,
+                    piece=doc.numero,
+                    entry_date=(doc.date_document or date.today()).isoformat(),
+                    lines=[], tiers=(doc.emetteur or doc.destinataire or ""),
+                    devise=doc.devise or "MAD",
+                    doc_sha256=file.sha256, gmail_message_id=gmail_message_id,
+                    statut=ledger.STATUT_A_VALIDER, motif=str(exc),
+                )
+                logger.warning("Ecriture %s NON validee : %s", doc.numero, exc)
+            if ledger.record(self._db, entry):
+                self._append_journal(entry)
+                self._write_tva_recap()
+        except Exception as exc:  # noqa: BLE001 - jamais bloquant
+            logger.warning("Journal comptable indisponible pour %s : %s",
+                           doc.numero, type(exc).__name__)
+
+    def _post_bank_ledger(self, *, kind: str, piece: str, montant, jour: str,
+                          tiers: str, reference: str, doc_sha256: str = "") -> None:
+        """Ecriture bancaire (paiement, reglement, frais).
+
+        Le template ne declare pas de compte banque : tant que la societe
+        n'en fournit pas via `account_mapping`, ces ecritures partent
+        A_VALIDER - enregistrees, motivees, jamais inventees.
+        """
+        if not self._company_id:
+            return
+        try:
+            entry = ledger.build_entry(
+                self._ledger_mapping(), company_id=self._company_id, kind=kind,
+                piece=piece, entry_date=jour, montant=montant, tiers=tiers,
+                reference=reference, doc_sha256=doc_sha256,
+            )
+            if ledger.record(self._db, entry):
+                self._append_journal(entry)
+        except Exception as exc:  # noqa: BLE001 - jamais bloquant
+            logger.warning("Ecriture bancaire %s impossible : %s",
+                           piece, type(exc).__name__)
+
+    def _append_journal(self, entry) -> None:
+        """Projette une ecriture VALIDEE dans 12_JOURNAL_COMPTABLE (A..G).
+
+        Les colonnes de controle du classeur (totaux, ecart) vivent plus a
+        droite et se recalculent seules : on n'ecrit jamais au-dela de G.
+        """
+        lignes = ledger.sheet_rows(entry)
+        if not lignes:
+            return
+        depart = self.next_row(TAB_JOURNAL)
+        self._write(
+            f"{TAB_JOURNAL}!A{depart}:G{depart + len(lignes) - 1}", lignes
+        )
+
+    def _write_tva_recap(self) -> None:
+        """Recapitulatif TVA par periode, recalcule depuis les ecritures
+        VALIDEES. L'onglet est une PROJECTION : le reecrire en entier est
+        idempotent par construction."""
+        recap = ledger.tva_recap(self._db, self._company_id)
+        if not recap:
+            return
+        self.ensure_tab_with_headers(
+            TAB_TVA_RECAP,
+            ["Période", "TVA collectée", "TVA déductible", "TVA due"],
+        )
+        lignes = [[r["periode"], r["tva_collectee"], r["tva_deductible"],
+                   r["tva_due"]] for r in recap]
+        self._write(f"{TAB_TVA_RECAP}!A2:D{1 + len(lignes)}", lignes)
 
     def _backfill(self, tab: str, row_index: int, columns: dict[str, str], value: str) -> None:
         """Reporte une valeur (lien Drive, evenement Calendar) dans la ligne
@@ -1946,6 +2176,21 @@ class DocumentPipeline:
         }
         for offset, line in enumerate(doc.bank_lines):
             if not line.reference:
+                # Un debit sans reference dont le libelle annonce des
+                # frais est un FRAIS BANCAIRE : il recoit son ecriture
+                # (A_VALIDER tant que la societe n'a pas declare ses
+                # comptes banque/frais) mais ne rapproche rien.
+                libelle = (line.libelle or "").lower()
+                if line.debit is not None and any(
+                    mot in libelle for mot in ("frais", "commission", "agios")
+                ):
+                    jour_frais = (line.date_operation or date.today()).isoformat()
+                    self._post_bank_ledger(
+                        kind="frais_bancaires",
+                        piece=f"FRAIS-{jour_frais}-{abs(line.debit)}",
+                        montant=abs(line.debit), jour=jour_frais,
+                        tiers="Banque", reference=line.libelle or "",
+                    )
                 continue
             if line.debit is not None:
                 tab, montant = TAB_PURCHASES, line.debit
@@ -1977,6 +2222,24 @@ class DocumentPipeline:
                 [[str(row[2]), "Rapproche"]],
             )
             self.settle_invoice(tab, row_index, abs(montant))
+            # Le paiement est un evenement comptable DISTINCT de la
+            # facture : il solde la dette via la banque, sans jamais
+            # recreer la facture. Piece deterministe -> rejeu sans double.
+            jour = (line.date_operation or date.today()).isoformat()
+            if tab == TAB_PURCHASES:
+                self._post_bank_ledger(
+                    kind="paiement_fournisseur", piece=f"PAY-{row[2]}",
+                    montant=abs(montant), jour=jour,
+                    tiers=str(row[4]) if len(row) > 4 else "",
+                    reference=str(row[2]),
+                )
+            else:
+                self._post_bank_ledger(
+                    kind="reglement_client", piece=f"ENC-{row[2]}",
+                    montant=abs(montant), jour=jour,
+                    tiers=str(row[4]) if len(row) > 4 else "",
+                    reference=str(row[2]),
+                )
             rapproches.append({
                 "tab": tab, "row": row_index, "numero": str(row[2]),
                 "tiers": str(row[4]) if len(row) > 4 else "",

@@ -52,6 +52,7 @@ class TenantContext:
     drive_folder_id: str
     telegram_chat_id: str
     allowed_vat_rates: tuple[Decimal, ...]
+    account_mapping: dict
     currency: str
     db_path: str
     chat_id: int
@@ -89,6 +90,7 @@ class TenantContext:
             drive_folder_id=entreprise.drive_folder_id,
             telegram_chat_id=str(entreprise.telegram_chat_id),
             allowed_vat_rates=entreprise.allowed_vat_rates,
+            account_mapping=dict(entreprise.account_mapping or {}),
             currency=entreprise.currency,
             db_path=db_path,
             chat_id=int(cible),

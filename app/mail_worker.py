@@ -278,12 +278,14 @@ class MailWorker:
         vision: Any | None = None,
         vision_max_calls: int = 0,
         company_id: str = "",
+        account_mapping: dict | None = None,
     ) -> None:
         # Entreprise servie par CE worker. Elle scope le curseur Gmail, la
         # memoire des notifications et toutes les recherches d'etat. Une
         # chaine vide = comportement mono-entreprise d'avant la V2, conserve
         # intact tant que la migration n'a pas tourne.
         self._company_id = company_id
+        self._account_mapping = dict(account_mapping or {})
         self._vision = vision
         # Budget d'appels au niveau vision, remis a zero a CHAQUE email.
         self._vision_budget = doc_vision.VisionBudget(vision_max_calls)
@@ -345,6 +347,7 @@ class MailWorker:
                 allowed_vat_rates=self._vat_rates or None,
                 vision=self._vision, vision_budget=self._vision_budget,
                 company_id=self._company_id,
+                account_mapping=self._account_mapping,
             )
         return self._pipeline
 
@@ -748,6 +751,20 @@ class MailWorker:
                 summary.rejected.append((name, str(exc)))
                 continue
             report = collect_documents(name, content, limits=self._zip_limits)
+            if len(report.files) > 1 or any(f.container for f in report.files):
+                # L'email portait une ARCHIVE : le ZIP original s'archive
+                # aussi, octets inchanges, dans Emails_ZIP - c'est la
+                # piece probante de ce qui a ete recu. Idempotent par
+                # empreinte via le registre ; jamais bloquant, les
+                # documents extraits ont leur propre gating.
+                try:
+                    self.pipeline.archive_original_bundle(
+                        name, content, message_id
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Archive du ZIP original %s impossible : %s", name, exc
+                    )
             summary.rejected.extend(report.rejected)
             if report.truncated:
                 # Une archive tronquee est une PERTE de documents, pas un
