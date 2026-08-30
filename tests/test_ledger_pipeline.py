@@ -174,6 +174,41 @@ def test_sans_entreprise_le_pipeline_reste_muet_au_journal(db_path, monkeypatch)
     assert _journal_rows(wb) == []
 
 
+def test_un_avoir_aux_montants_negatifs_reduit_bien_la_tva(db_path, monkeypatch):
+    """L'extraction rend souvent un avoir en montants NEGATIFS. Les comptes
+    sont deja inverses par le generateur : garder le signe doublerait
+    l'inversion et GONFLERAIT la TVA au lieu de la reduire (constate en
+    E2E sur AV2026-1171)."""
+    from types import SimpleNamespace
+
+    from app.doc_types import SUPPLIER_CREDIT_NOTE
+
+    wb = FakeWorkbook()
+    pipe = _pipeline(db_path, monkeypatch, wb)
+    _run(pipe, ACHAT)  # pose la TVA deductible de la periode
+    avant = D(ledger.tva_recap(db_path, "xblaste")[0]["tva_deductible"])
+
+    montant = lambda v: SimpleNamespace(value=D(v))  # noqa: E731
+    doc = SimpleNamespace(
+        doc_type=SUPPLIER_CREDIT_NOTE, numero="AV-NEG-1",
+        montant_ht=montant("-1000"), montant_tva=montant("-200"),
+        montant_ttc=montant("-1200"), date_document=None, devise="MAD",
+        emetteur="ATLAS PRO SARL", destinataire="", taux_tva=D("20"),
+    )
+    outcome = SimpleNamespace(stable_id="AV-NEG-1", drive_link="")
+    fichier = DocumentFile(filename="avoir.pdf", content=b"%PDF-avoir",
+                           source="attachment")
+    pipe._post_ledger_entry(doc, outcome, fichier, "m-avoir")
+
+    lignes = ledger.entries_for(db_path, "xblaste", "AV-NEG-1")
+    assert lignes and all(l["statut"] == "VALIDEE" for l in lignes)
+    assert all(D(l["debit"]) >= 0 and D(l["credit"]) >= 0 for l in lignes), (
+        "aucun montant negatif au journal"
+    )
+    apres = D(ledger.tva_recap(db_path, "xblaste")[0]["tva_deductible"])
+    assert apres == avant - D("200"), "l'avoir doit REDUIRE la TVA deductible"
+
+
 def test_chaque_ecriture_pointe_vers_son_archive(db_path, monkeypatch):
     """Le lien ecriture -> piece est la colonne vertebrale de l'audit."""
     wb = FakeWorkbook()

@@ -1641,6 +1641,10 @@ class DocumentPipeline:
             ttc = doc.montant_ttc.value if doc.montant_ttc else None
             if ht is None or ttc is None:
                 return
+            # Un avoir arrive souvent avec des montants NEGATIFS : le
+            # generateur inverse deja les comptes, garder le signe
+            # inverserait l'effet une seconde fois (recap TVA fausse).
+            ht, tva, ttc = abs(ht), abs(tva), abs(ttc)
             try:
                 entry = ledger.build_entry(
                     self._ledger_mapping(), company_id=self._company_id,
