@@ -196,3 +196,28 @@ def test_terra_sans_ice_continue_vers_sol_et_la_photo_est_comptabilisee(pipeline
     assert outcome.action == ACTION_AUTO, outcome.reasons
     assert outcome.document.emetteur_ice == "009999000004401"
     assert outcome.document.text_source == "vision:sol"
+
+
+def test_une_copie_renvoyee_ne_declenche_plus_aucun_appel_modele(pipeline):
+    """Cache par empreinte : les MEMES octets renvoyes dans un autre email
+    (copie renommee) ne coutent plus aucun appel Terra/Sol - le contenu a
+    deja ete lu, la deduplication tranche. Avant le correctif, la copie
+    etait relue par les modeles avant d'etre reconnue comme doublon."""
+    content = _png()
+    pipeline.registry[content] = OCR_SANS_ICE
+    premier = DocumentFile(filename="IMG_20260824.png", content=content, source="attachment")
+    pipeline.process_document(
+        premier, {"messageId": "m-img", "subject": "Photo", "sender": "x@example.ma"},
+        attachment_id="att-img", source_url="https://example.invalid/i.png",
+    )
+    appels_apres_premier = list(pipeline.fake_vision.appels)
+
+    copie = DocumentFile(filename="IMG_rappel_v2.png", content=content, source="attachment")
+    outcome = pipeline.process_document(
+        copie, {"messageId": "m-rappel", "subject": "Rappel", "sender": "x@example.ma"},
+        attachment_id="att-rappel", source_url="https://example.invalid/i2.png",
+    )
+    assert pipeline.fake_vision.appels == appels_apres_premier, (
+        "la copie ne doit declencher AUCUN nouvel appel modele"
+    )
+    assert outcome.action != ACTION_AUTO or outcome.reasons  # doublon reconnu, rien d'ecrit

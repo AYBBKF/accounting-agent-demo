@@ -1053,7 +1053,7 @@ class DocumentPipeline:
             else:
                 doc = extract_from_pdf_bytes(file.content, company=self._company)
             if not deja_en_quarantaine:
-                self.escalate_reading(doc, file)
+                self.escalate_reading(doc, file, doc_key=doc_key)
         except Exception as exc:  # noqa: BLE001 - PDF/image illisible
             # Un document illisible n'est pas un document perdu. Il laisse
             # UNE ligne rouge, comme toute piece que le bot refuse de
@@ -2165,7 +2165,8 @@ class DocumentPipeline:
         except Exception as exc:  # noqa: BLE001 - jamais bloquant
             logger.warning("Journal des couts indisponible : %s", type(exc).__name__)
 
-    def escalate_reading(self, doc: ExtractedDocument, file: Any) -> None:
+    def escalate_reading(self, doc: ExtractedDocument, file: Any,
+                         doc_key: str = "") -> None:
         """Relit un document que la lecture deterministe n'a pas su lire.
 
         On monte d'un niveau seulement si c'est necessaire, et on s'ARRETE
@@ -2178,6 +2179,27 @@ class DocumentPipeline:
         raisons = doc_vision.escalation_reasons(doc)
         if not raisons:
             return
+
+        # Cache par EMPREINTE : si ces octets exacts ont deja ete lus dans
+        # cette entreprise (piece comptabilisee, en quarantaine ou
+        # rattachee), une relecture Terra/Sol rendrait le meme resultat et
+        # la deduplication tranchera de toute facon. Une copie renvoyee
+        # dans un autre email ne coute donc plus aucun appel modele.
+        cle = doc_key or getattr(file, "doc_key", "") or ""
+        empreinte = getattr(file, "sha256", "") or ""
+        if empreinte:
+            deja_lu = store.find_read_twin(
+                self._db, self._chat_id, empreinte, exclude_key=cle,
+                **self._scope(),
+            )
+            if deja_lu is not None:
+                logger.info(
+                    "Relecture non escaladee (%s) : contenu deja lu "
+                    "(cache par empreinte, fiche %s)",
+                    getattr(file, "filename", "?"),
+                    str(deja_lu.get("doc_key", ""))[:12],
+                )
+                return
         logger.info(
             "Lecture a escalader (%s) : %s",
             getattr(file, "filename", "?"), ", ".join(raisons),
@@ -2194,7 +2216,7 @@ class DocumentPipeline:
             ))
 
         motif = _motif_escalade(raisons)
-        doc_key = getattr(file, "doc_key", "") or ""
+        doc_key = cle
 
         for nom, appel in niveaux:
             if nom == "sol":
