@@ -2243,6 +2243,16 @@ class DocumentPipeline:
                 doc.montant_ttc and doc.montant_ttc.value,
                 resultat.confidence * 100,
             )
+            # Terra relit le TEXTE : il ne peut pas voir un ICE que l'OCR
+            # n'a pas rendu. Si l'escalade a ete demandee (entre autres)
+            # pour un ICE fournisseur absent et que ce niveau ne l'a pas
+            # fourni, on continue vers le niveau image - sans cela, la
+            # piece resterait bloquee "sans ICE exploitable" alors que
+            # l'image originale le montre.
+            if ("ICE du fournisseur absent du texte lu" in raisons
+                    and nom != "sol"
+                    and not getattr(doc, "emetteur_ice", None)):
+                continue
             return
 
     # -- rapprochement bancaire --------------------------------------------

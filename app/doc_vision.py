@@ -69,8 +69,40 @@ SYSTEM_PROMPT = (
 
 USER_PROMPT_IMAGE = (
     "Extrais les champs comptables de ce document. Si une valeur est illisible, "
-    "laisse null plutot que de deviner."
+    "laisse null plutot que de deviner. Pour 'type_document', choisis parmi : "
+    "facture_achat, facture_vente, avoir_fournisseur, avoir_client, devis, "
+    "recu_paiement, releve_bancaire - ou null si le type n'est pas certain. "
+    "Pour 'tiers', donne la raison sociale du TIERS (le fournisseur d'une "
+    "facture d'achat, le client d'une facture de vente), jamais le titre du "
+    "document. Pour 'ICE', recopie l'identifiant ICE de ce tiers exactement "
+    "tel qu'imprime, chiffre par chiffre, ou null s'il est illisible."
 )
+
+# Types que la relecture escaladee est autorisee a proposer. Toute autre
+# valeur est ignoree : le type reste celui de la lecture deterministe.
+_VISION_TYPES = {
+    "facture_achat": "facture_achat",
+    "facture fournisseur": "facture_achat",
+    "facture_fournisseur": "facture_achat",
+    "facture_vente": "facture_vente",
+    "facture client": "facture_vente",
+    "facture_client": "facture_vente",
+    "avoir_fournisseur": "avoir_fournisseur",
+    "avoir fournisseur": "avoir_fournisseur",
+    "avoir_client": "avoir_client",
+    "avoir client": "avoir_client",
+    "devis": "devis",
+    "recu_paiement": "recu_paiement",
+    "recu de paiement": "recu_paiement",
+    "releve_bancaire": "releve_bancaire",
+    "releve bancaire": "releve_bancaire",
+}
+
+
+def type_from_vision(data: dict[str, Any]) -> str | None:
+    """Type de document annonce par la relecture, s'il est reconnu."""
+    brut = (data.get("type_document") or "").strip().lower().replace("-", "_")
+    return _VISION_TYPES.get(brut) or _VISION_TYPES.get(brut.replace("_", " "))
 
 
 @dataclass
@@ -194,6 +226,16 @@ def escalation_reasons(doc: Any) -> list[str]:
         raisons.append("HT + TVA incoherent avec le TTC")
     if not getattr(doc, "devise", None):
         raisons.append("devise absente")
+
+    # Cote FOURNISSEUR, l'ICE conditionne la comptabilisation : sur une
+    # lecture DEGRADEE (OCR d'une photo ou d'un scan), un ICE manquant est
+    # une insuffisance de lecture, pas forcement une absence sur la piece -
+    # la relecture de l'image originale peut le voir. Un PDF natif sans ICE
+    # n'escalade pas : le texte est fidele, l'ICE est reellement absent.
+    if (kind in ("facture_achat", "avoir_fournisseur")
+            and getattr(doc, "text_source", "native") != "native"
+            and not getattr(doc, "emetteur_ice", None)):
+        raisons.append("ICE du fournisseur absent du texte lu")
 
     confiance = getattr(doc, "confidence", 1.0)
     try:
@@ -403,8 +445,29 @@ def apply_vision(doc: Any, result: VisionResult) -> None:
     comptables ; les anomalies issues du texte degrade tombent avec lui.
     """
     from app.doc_extract import Amount
+    from app.doc_types import Classification
 
     d = result.data
+
+    # Type de document : la lecture deterministe d'une photo peut n'avoir
+    # reconnu AUCUN marqueur ("aucun marqueur de type reconnu") alors que le
+    # modele, qui voit l'image, identifie la piece avec certitude. On ne
+    # retient que les types de la liste fermee, uniquement quand la
+    # classification deterministe est inconnue ou sous le seuil, et jamais
+    # avec une confiance superieure a celle annoncee par la relecture.
+    # Aucun seuil de decision n'est modifie : le document relu repasse par
+    # exactement les memes controles comptables que les autres.
+    type_vu = type_from_vision(d)
+    classification = getattr(doc, "classification", None)
+    if type_vu and classification is not None:
+        if classification.doc_type in ("inconnu", "") or classification.confidence < 0.90:
+            doc.classification = Classification(
+                doc_type=type_vu,
+                confidence=min(float(result.confidence or 0.0), 0.95),
+                matched=f"vision:{result.level}",
+                reasons=[],
+            )
+
     doc.numero = (d.get("numero") or "").strip() or None
     doc.date_document = _parse_iso(d.get("date"))
     doc.date_echeance = _parse_iso(d.get("echeance"))
