@@ -372,6 +372,37 @@ def find_open_twin(
         return dict(row) if row else None
 
 
+def find_read_twin(
+    db_path: str, chat_id: int, file_sha256: str, *, exclude_key: str = "",
+    company_id: str = "",
+) -> dict[str, Any] | None:
+    """Une AUTRE fiche portant les memes octets a-t-elle deja ete LUE ?
+
+    Cache par empreinte pour la relecture escaladee : si le meme contenu a
+    deja ete extrait dans cette entreprise - qu'il ait fini comptabilise,
+    en quarantaine ou rattache - une nouvelle lecture Terra/Sol rendrait le
+    meme resultat pour un contenu identique, et la deduplication tranchera
+    de toute facon. On evite donc de payer une relecture pour un fichier
+    deja connu. Les fiches encore en cours de premiere lecture (etats
+    anterieurs a l'extraction) ne comptent pas : elles n'ont rien lu.
+    """
+    import sqlite3
+
+    if not file_sha256:
+        return None
+    portee, params = _scope(company_id)
+    with connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM documents WHERE chat_id = ? AND file_sha256 = ? "
+            "AND state NOT IN (?, ?) "
+            f"AND doc_key != ?{portee} ORDER BY created_at LIMIT 1",
+            (str(chat_id), file_sha256, DETECTED, DOWNLOADED, exclude_key or "",
+             *params),
+        ).fetchone()
+        return dict(row) if row else None
+
+
 def list_quarantined(
     db_path: str, chat_id: int, *, company_id: str = ""
 ) -> list[dict[str, Any]]:
