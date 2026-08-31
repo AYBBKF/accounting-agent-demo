@@ -56,6 +56,9 @@ class TenantContext:
     currency: str
     db_path: str
     chat_id: int
+    # ICE legal de l'entreprise : identite contre laquelle l'orientation
+    # achat/vente d'un document est verifiee. Vide = non renseigne.
+    ice: str = ""
 
     # -- construction ------------------------------------------------------
 
@@ -94,6 +97,7 @@ class TenantContext:
             currency=entreprise.currency,
             db_path=db_path,
             chat_id=int(cible),
+            ice=(entreprise.ice or "").strip(),
         )
 
     # -- recherches, toujours enfermees dans l'entreprise ------------------

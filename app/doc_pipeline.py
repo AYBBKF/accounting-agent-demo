@@ -269,6 +269,7 @@ class DocumentPipeline:
         vision_budget: Any | None = None,
         company_id: str = "",
         account_mapping: dict | None = None,
+        company_ice: str = "",
     ) -> None:
         self._gw = gateway
         self._db = db_path
@@ -283,6 +284,10 @@ class DocumentPipeline:
         # Plan de comptes complementaire de la societe (banque, frais...).
         # Vide par defaut : les operations qui l'exigent partent A_VALIDER.
         self._account_mapping = dict(account_mapping or {})
+        # ICE legal de la societe tenant : sert au controle d'ORIENTATION
+        # (achat/vente) contre les deux parties du document. Vide = controle
+        # inapplicable (mono-entreprise historique), comportement inchange.
+        self._company_ice = (company_ice or "").strip()
         self._sheet = spreadsheet_id
         self._company = company
         self._drive_root = drive_root
@@ -1065,6 +1070,26 @@ class DocumentPipeline:
 
         outcome.document = doc
         outcome.doc_type = doc.doc_type
+
+        # --- recu sans numero externe --------------------------------------
+        # Un recu n'est pas rejete au SEUL motif qu'il ne porte pas de
+        # numero : le numero externe reste vide et un identifiant INTERNE
+        # deterministe est derive de (entreprise, email, membre, empreinte).
+        # Meme piece => meme identifiant, a chaque cycle et apres redemarrage.
+        # Il n'est JAMAIS presente comme un numero legal du fournisseur ;
+        # toutes les autres exigences (date, montant, rapprochement unique)
+        # restent entieres.
+        if doc.doc_type == PAYMENT_RECEIPT and not doc.numero:
+            graine = "|".join((
+                self._company_id, str(message_id or ""),
+                file.member_path or "", file.sha256 or "",
+            ))
+            doc.numero_interne = (
+                "REC-INT-"
+                + hashlib.sha256(graine.encode("utf-8")).hexdigest()[:10].upper()
+            )
+            doc.missing = [m for m in doc.missing if m != "numero"]
+
         outcome.numero = doc.numero
         outcome.devise = doc.devise
         outcome.echeance = doc.date_echeance
@@ -1120,13 +1145,25 @@ class DocumentPipeline:
         if doc.doc_type == PAYMENT_RECEIPT:
             receipt_matches = self.find_invoice(doc)
 
+        # --- avoir : la facture d'origine doit EXISTER chez CE tenant ------
+        # La reference est lue sur la piece ; on verifie qu'elle designe une
+        # facture reellement comptabilisee dans CETTE societe. `None` =
+        # recherche non applicable (pas d'avoir, ou reference deja jugee
+        # absente par la politique).
+        credit_targets: int | None = None
+        if (doc.doc_type in (SUPPLIER_CREDIT_NOTE, CLIENT_CREDIT_NOTE)
+                and (doc.facture_liee or "").strip()):
+            credit_targets = len(self.find_origin_invoice(doc))
+
         context = DecisionContext(
             duplicates=duplicates,
             party_ambiguous=party.ambiguous,
             party_reason=party.reason,
             receipt_matches=len(receipt_matches),
+            credit_note_targets=credit_targets,
             today=self._today(),
             allowed_vat_rates=self._vat_rates or None,
+            company_ice=self._company_ice,
         )
         decision = decide(doc, context)
         outcome.action = decision.action
@@ -1405,7 +1442,9 @@ class DocumentPipeline:
             self.settle_invoice(tab, row_index, amount)
             outcome.tab = tab
             outcome.row_index = row_index
-            outcome.stable_id = doc.numero or ""
+            # L'identifiant interne deterministe supplee un numero externe
+            # absent - il n'est jamais presente comme un numero legal.
+            outcome.stable_id = doc.numero or doc.numero_interne or ""
             outcome.reasons.append(f"facture soldee dans {tab} ligne {row_index}")
             return
 
@@ -1757,7 +1796,13 @@ class DocumentPipeline:
         """
         wanted_number = normalize(doc.facture_liee or "")
         amount = doc.montant_paye.value if doc.montant_paye else None
-        payer = normalize(doc.emetteur or "")
+        # Le tiers du recu peut etre lu cote emetteur (recu fournisseur) ou
+        # cote destinataire ("Recu de : ..." sur un recu de vente) : les deux
+        # noms sont des candidats legitimes pour le rapprochement, toujours
+        # exiges EN PLUS du montant, jamais a sa place.
+        payeurs = {
+            normalize(nom) for nom in (doc.emetteur, doc.destinataire) if nom
+        }
         matches: list[tuple[str, int, list[Any]]] = []
         for tab in (TAB_SALES, TAB_PURCHASES):
             for offset, row in enumerate(self._read(f"{tab}!A2:Q400")):
@@ -1774,9 +1819,50 @@ class DocumentPipeline:
                     ttc = Decimal(str(row[9]))
                 except Exception:  # noqa: BLE001 - cellule non numerique
                     continue
-                if amount is not None and ttc == amount and payer and party_name == payer:
+                if amount is not None and ttc == amount and party_name and party_name in payeurs:
                     matches.append((tab, offset + 2, row))
         return matches
+
+    def find_origin_invoice(self, doc: ExtractedDocument) -> list[tuple[str, int, list[Any]]]:
+        """Factures d'origine candidates pour un avoir, chez CE tenant.
+
+        Correspondance EXACTE sur le numero d'abord, dans l'onglet du bon
+        sens (achats pour un avoir fournisseur, ventes pour un avoir
+        client). A defaut, un repli n'est admis que sur PLUSIEURS criteres
+        concordants a la fois : meme tiers ET memes chiffres de reference.
+        Jamais de rattachement par simple ressemblance de montant ou de
+        libelle - un avoir dont l'origine reste introuvable part en
+        quarantaine, motive.
+        """
+        wanted = normalize(doc.facture_liee or "")
+        if not wanted:
+            return []
+        tab = TAB_PURCHASES if doc.doc_type == SUPPLIER_CREDIT_NOTE else TAB_SALES
+        tiers_avoir = normalize(
+            (doc.emetteur if doc.doc_type == SUPPLIER_CREDIT_NOTE
+             else doc.destinataire) or ""
+        )
+        rows = self._read(f"{tab}!A2:Q400")
+        exacts: list[tuple[str, int, list[Any]]] = []
+        for offset, row in enumerate(rows):
+            if len(row) < 5:
+                continue
+            if normalize(str(row[2])) == wanted:
+                exacts.append((tab, offset + 2, row))
+        if exacts:
+            return exacts
+        chiffres_voulus = "".join(c for c in wanted if c.isdigit())
+        if not chiffres_voulus or not tiers_avoir:
+            return []
+        replis: list[tuple[str, int, list[Any]]] = []
+        for offset, row in enumerate(rows):
+            if len(row) < 5:
+                continue
+            chiffres = "".join(c for c in str(row[2]) if c.isdigit())
+            meme_tiers = normalize(str(row[4])) == tiers_avoir
+            if meme_tiers and chiffres and chiffres == chiffres_voulus:
+                replis.append((tab, offset + 2, row))
+        return replis
 
     def settle_invoice(self, tab: str, row_index: int, amount: Decimal) -> None:
         """Solde une facture : montant paye et statut, rien d'autre."""

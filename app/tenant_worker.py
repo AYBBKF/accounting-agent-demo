@@ -183,6 +183,7 @@ class TenantWorker:
             vision_max_calls=self._vision_max_calls,
             company_id=tenant.company_id,
             account_mapping=tenant.account_mapping,
+            company_ice=tenant.ice,
         )
 
     def worker_for(self, company_id: str) -> MailWorker:

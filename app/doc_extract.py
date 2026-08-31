@@ -150,6 +150,10 @@ class ExtractedDocument:
     pages: int = 1
 
     numero: str | None = None
+    # Identifiant INTERNE deterministe, genere par le pipeline pour un recu
+    # sans numero externe : (entreprise, email, membre, empreinte). Jamais
+    # presente comme un numero legal du fournisseur.
+    numero_interne: str | None = None
     date_document: date | None = None
     date_echeance: date | None = None
 
@@ -503,7 +507,9 @@ def party(lines: list[Line], labels: tuple[str, ...]) -> tuple[str | None, str |
                 if any(voisin == normalize(l) or voisin.startswith(normalize(l) + " :")
                        or voisin.startswith(normalize(l) + ":")
                        for l in ("CLIENT", "FOURNISSEUR", "EMETTEUR", "ACHETEUR",
-                                 "IMPORTER", "BENEFICIAIRE", "EXPORTER")):
+                                 "IMPORTER", "BENEFICIAIRE", "EXPORTER",
+                                 "DESTINATAIRE", "VENDEUR", "TITULAIRE",
+                                 "PAYEUR")):
                     break
             return (name or None), ice, line.page
     return None, None, 1
@@ -938,7 +944,8 @@ _NUMBER_LABELS = (
     "Reference",
 )
 _DATE_LABELS = (
-    "Date de facture", "Date de paiement", "Date de l'avis", "Invoice date",
+    "Date de facture", "Date de paiement", "Date d'encaissement",
+    "Date de reglement", "Date de l'avis", "Invoice date",
     "Date",
 )
 _DUE_LABELS = (
@@ -1103,7 +1110,8 @@ def extract_document(
         lines, ("Fournisseur", "Emetteur", "Exporter", "Organisme", "Payeur", "Banque")
     )
     doc.destinataire, doc.destinataire_ice, _ = party(
-        lines, ("Client", "Acheteur", "Importer", "Beneficiaire", "Titulaire")
+        lines, ("Client", "Acheteur", "Importer", "Beneficiaire", "Titulaire",
+                "Destinataire", "Bill to", "Sold to")
     )
     doc.emetteur = clean_party_name(doc.emetteur)
     doc.destinataire = clean_party_name(doc.destinataire)
@@ -1124,8 +1132,56 @@ def extract_document(
         )
         doc.montant_ttc = _first_amount(lines, _TTC_LABELS.get(kind, _DEFAULT_TTC_LABELS))
     if kind == PAYMENT_RECEIPT:
-        doc.montant_paye = _first_amount(lines, ("Montant paye",))
+        doc.montant_paye = _first_amount(
+            lines, ("Montant paye", "Montant regle", "Montant recu",
+                    "Montant encaisse", "Total paye")
+        )
+        if doc.montant_paye is None:
+            # Recu reel sans libelle de montant : si le document ne porte
+            # qu'UNE seule valeur monetaire distincte (lignes qui ne sont
+            # QUE des montants, dates exclues), elle est le montant paye
+            # sans ambiguite possible. Deux valeurs differentes = aucun
+            # choix automatique, le champ reste manquant.
+            candidats: list[Amount] = []
+            for ligne in lines:
+                brut = ligne.text.strip()
+                if not brut or not _PURE_AMOUNT_RE.match(brut):
+                    continue
+                if parse_date(brut) is not None:
+                    continue
+                lu = parse_money(brut)
+                if lu is None:
+                    continue
+                candidats.append(Amount(
+                    value=lu[0], currency=lu[1], label="montant unique du recu",
+                    page=ligne.page,
+                ))
+            if len({c.value for c in candidats}) == 1:
+                doc.montant_paye = candidats[0]
         doc.montant_ttc = doc.montant_paye
+        if doc.destinataire is None:
+            # "Recu de : X" designe le payeur. Le libelle n'est retenu
+            # qu'avec son deux-points : sans lui, le TITRE "RECU DE
+            # PAIEMENT" fournirait un payeur nomme "PAIEMENT".
+            for line in lines:
+                if line.norm.startswith("RECU DE :") or line.norm.startswith("RECU DE:"):
+                    doc.destinataire = clean_party_name(
+                        strip_label(line.text, "Recu de")
+                    )
+                    break
+        if doc.numero is None:
+            # Le numero d'un recu est souvent imprime en tete, seul sur sa
+            # ligne, sans libelle ("REC-2026-001" sous le titre). On ne le
+            # devine pas : on n'accepte qu'une ligne d'en-tete qui EST une
+            # reference plausible a elle seule, jamais une date ni un
+            # montant.
+            for header in lines[:8]:
+                token = header.text.strip()
+                if (" " not in token and plausible_reference(token)
+                        and parse_date(token) is None
+                        and not _PURE_AMOUNT_RE.match(token)):
+                    doc.numero = token
+                    break
     if kind in (IMPORT_INVOICE, EXPORT_INVOICE):
         doc.frais_annexes = _first_amount(
             lines, ("Freight and insurance", "Fret et assurance", "Frais annexes")
@@ -1149,11 +1205,18 @@ def extract_document(
     # --- divers ---------------------------------------------------------
     statut = _first_value(lines, ("Statut",))
     doc.statut = statut[0] if statut else None
-    mode = _first_value(lines, ("Mode de paiement", "Mode"))
+    mode = _first_value(lines, ("Mode de paiement", "Mode de reglement", "Mode"))
     doc.mode_paiement = mode[0] if mode else None
     motif = _first_value(lines, ("Motif", "Objet", "Nature"))
     doc.motif = motif[0] if motif else ""
-    linked = _first_value(lines, ("Facture reglee", "Facture d'origine", "Facture liee"))
+    # "Document d'origine" (avoirs) et "Facture concernee" (recus) sont les
+    # libelles REELS des pieces : leur absence de cette liste envoyait tout
+    # avoir legitime en quarantaine "sans facture d'origine identifiable".
+    linked = _first_value(lines, (
+        "Facture reglee", "Facture d'origine", "Facture liee",
+        "Document d'origine", "Reference d'origine", "Document lie",
+        "Facture concernee",
+    ))
     if linked:
         candidate = (linked[0].split() or [""])[0]
         doc.facture_liee_brute = linked[0]
@@ -1297,6 +1360,13 @@ def read_image_text(data: bytes) -> str:
                     f"plafond {MAX_IMAGE_PIXELS} pixels)"
                 )
             img.load()
+            # Une photo mobile porte son orientation dans les metadonnees
+            # EXIF : sans cette transposition, le texte est lu de cote.
+            try:
+                from PIL import ImageOps
+                img = ImageOps.exif_transpose(img)
+            except Exception:  # noqa: BLE001 - EXIF corrompu : image telle quelle
+                pass
             frame = img.convert("RGB")
     except DocumentExtractError:
         raise
@@ -1313,17 +1383,72 @@ def read_image_text(data: bytes) -> str:
     except ImportError as exc:  # pragma: no cover - dependance manquante
         raise DocumentExtractError(f"Dependance pytesseract manquante: {exc}") from exc
 
-    # On vise le francais, mais un serveur ou le pack `fra` manque ne doit pas
-    # renvoyer TOUTES les images en quarantaine : on retombe alors sur `eng`,
-    # qui lit tout aussi bien les caracteres latins d'une facture. Seul un
-    # echec des DEUX est un vrai echec OCR.
-    last_error: Exception | None = None
-    for lang in ("fra+eng", "eng"):
+    # Redressement d'orientation : l'OSD de tesseract detecte une image
+    # tournee de 90/180/270 degres. Detection bornee et non bloquante - un
+    # OSD en echec (image trop pauvre) laisse l'image telle quelle.
+    try:
+        osd = pytesseract.image_to_osd(frame)
+        m = re.search(r"Rotate:\s*(\d+)", osd or "")
+        angle = int(m.group(1)) if m else 0
+        if angle in (90, 180, 270):
+            frame = frame.rotate(-angle, expand=True)
+    except Exception:  # noqa: BLE001 - OSD indisponible : pas de rotation
+        pass
+
+    # Passes d'OCR BORNEES (au plus trois variantes deterministes), chacune
+    # tracable : image telle quelle, image nettoyee (gris, contraste,
+    # debruitage, nettete, remise a l'echelle ~300 DPI), image binarisee
+    # pour les photos sombres. On garde la MEILLEURE lecture - jamais une
+    # fusion - selon un score de texte exploitable. Aucun seuil de decision
+    # comptable n'est touche : seule la QUALITE de la lecture s'ameliore.
+    def _score(texte: str) -> int:
+        return sum(
+            len(mot) for mot in re.findall(r"[0-9A-Za-zÀ-ÿ]{2,}", texte or "")
+        )
+
+    def _ocr(image) -> str:
+        last_error: Exception | None = None
+        # On vise le francais ; un serveur sans le pack `fra` retombe sur
+        # `eng`, qui lit tout aussi bien les caracteres latins. Seul un
+        # echec des DEUX est un vrai echec OCR.
+        for lang in ("fra+eng", "eng"):
+            try:
+                return pytesseract.image_to_string(image, lang=lang)
+            except Exception as exc:  # noqa: BLE001 - langue absente / moteur KO
+                last_error = exc
+        raise DocumentExtractError("OCR de l'image en echec.") from last_error
+
+    variantes = [frame]
+    try:
+        from PIL import ImageFilter, ImageOps
+        gris = ImageOps.grayscale(frame)
+        gris = ImageOps.autocontrast(gris, cutoff=1)
+        gris = gris.filter(ImageFilter.MedianFilter(3))
+        gris = gris.filter(ImageFilter.SHARPEN)
+        if min(gris.size) < 1500:
+            facteur = min(2, int(1500 / max(1, min(gris.size))) + 1)
+            cible = (gris.size[0] * facteur, gris.size[1] * facteur)
+            if cible[0] * cible[1] <= MAX_IMAGE_PIXELS:
+                gris = gris.resize(cible, Image.LANCZOS)
+        variantes.append(gris)
+        variantes.append(gris.point(lambda p: 255 if p > 140 else 0))
+    except Exception:  # noqa: BLE001 - pretraitement KO : l'original suffit
+        pass
+
+    meilleur_texte, meilleur_score = "", -1
+    derniere_erreur: DocumentExtractError | None = None
+    for variante in variantes[:3]:
         try:
-            return pytesseract.image_to_string(frame, lang=lang)
-        except Exception as exc:  # noqa: BLE001 - langue absente ou moteur en echec
-            last_error = exc
-    raise DocumentExtractError("OCR de l'image en echec.") from last_error
+            texte = _ocr(variante)
+        except DocumentExtractError as exc:
+            derniere_erreur = exc
+            continue
+        note = _score(texte)
+        if note > meilleur_score:
+            meilleur_texte, meilleur_score = texte, note
+    if meilleur_score < 0 and derniere_erreur is not None:
+        raise derniere_erreur
+    return meilleur_texte
 
 
 def extract_from_image_bytes(

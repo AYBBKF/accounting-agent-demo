@@ -363,13 +363,22 @@ def test_a_credit_note_that_names_its_invoice_is_written_automatically(pipeline,
     doc = extract_document([text_of(AVOIR)])
     assert doc.facture_liee == "FAC-TEST-2026-002"
 
+    # La facture d'origine existe reellement dans la comptabilite : c'est
+    # elle qui rend l'imputation certaine. Un avoir dont l'origine est
+    # INTROUVABLE dans la societe reste, lui, une decision humaine (teste
+    # plus bas et dans test_extraction_metier).
+    origine = run(pipeline, ACHAT, message_id="m-origine", attachment_id="att-origine")
+    assert origine.action == ACTION_AUTO
+
+    achats_avant = len(workbook.writes_to("05_FACTURES_ACHATS"))
     outcome = run(pipeline, AVOIR)
     assert outcome.action == ACTION_AUTO
     row = workbook.row("17_AVOIRS", outcome.row_index)
     assert row[2] == "AV-2026-003"
     assert row[6] == "FAC-TEST-2026-002"
     assert row[7] == -600.0 and row[9] == -120.0 and row[10] == -720.0
-    assert workbook.writes_to("05_FACTURES_ACHATS") == []
+    # L'avoir lui-meme n'ecrit JAMAIS de ligne de facture.
+    assert len(workbook.writes_to("05_FACTURES_ACHATS")) == achats_avant
 
 
 def test_a_credit_note_without_a_known_invoice_still_asks(pipeline, workbook):
@@ -393,14 +402,18 @@ def test_a_credit_note_matching_several_invoices_asks(pipeline, workbook):
 
 
 def test_a_validated_credit_note_is_written_with_negative_amounts(pipeline, workbook):
+    origine = run(pipeline, ACHAT, message_id="m-origine", attachment_id="att-origine")
+    assert origine.action == ACTION_AUTO
+    achats_avant = len(workbook.writes_to("05_FACTURES_ACHATS"))
     outcome = run(pipeline, AVOIR)
     row = workbook.row("17_AVOIRS", outcome.row_index)
     assert row[2] == "AV-2026-003"
     assert row[3] == "Fournisseur"
     assert row[6] == "FAC-TEST-2026-002"           # facture d'origine
     assert row[7] == -600.0 and row[9] == -120.0 and row[10] == -720.0
-    # Un avoir n'est jamais confondu avec une facture.
-    assert workbook.writes_to("05_FACTURES_ACHATS") == []
+    # Un avoir n'est jamais confondu avec une facture : aucune NOUVELLE
+    # ligne de facture n'apparait apres son traitement.
+    assert len(workbook.writes_to("05_FACTURES_ACHATS")) == achats_avant
 
 
 # === 11. facture incoherente ============================================

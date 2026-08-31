@@ -279,6 +279,7 @@ class MailWorker:
         vision_max_calls: int = 0,
         company_id: str = "",
         account_mapping: dict | None = None,
+        company_ice: str = "",
     ) -> None:
         # Entreprise servie par CE worker. Elle scope le curseur Gmail, la
         # memoire des notifications et toutes les recherches d'etat. Une
@@ -286,6 +287,9 @@ class MailWorker:
         # intact tant que la migration n'a pas tourne.
         self._company_id = company_id
         self._account_mapping = dict(account_mapping or {})
+        # ICE de la societe tenant, pour le controle d'orientation
+        # achat/vente du pipeline. Vide = controle inapplicable.
+        self._company_ice = (company_ice or "").strip()
         self._vision = vision
         # Budget d'appels au niveau vision, remis a zero a CHAQUE email.
         self._vision_budget = doc_vision.VisionBudget(vision_max_calls)
@@ -348,6 +352,7 @@ class MailWorker:
                 vision=self._vision, vision_budget=self._vision_budget,
                 company_id=self._company_id,
                 account_mapping=self._account_mapping,
+                company_ice=self._company_ice,
             )
         return self._pipeline
 

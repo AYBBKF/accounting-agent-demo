@@ -135,7 +135,15 @@ class DecisionContext:
     # Nombre de factures candidates pour un recu de paiement.
     receipt_matches: int = 0
     # Nombre de factures candidates pour l'imputation d'un avoir.
-    credit_note_targets: int = 1
+    # `None` signifie "non recherche" (appelant historique) : la regle
+    # d'introuvabilite ne s'applique alors pas. 0 = origine citee mais
+    # INTROUVABLE dans la comptabilite de CETTE societe.
+    credit_note_targets: int | None = 1
+    # ICE de l'entreprise TENANT au nom de laquelle on comptabilise. Sert a
+    # verifier l'ORIENTATION du document (achat ou vente) contre l'identite
+    # legale des deux parties, jamais contre le nom du fichier. Vide =
+    # controle inapplicable.
+    company_ice: str = ""
     # Taux de change disponible pour une facture en devise etrangere.
     exchange_rate: Decimal | None = None
     tolerance: Decimal = DEFAULT_TOLERANCE
@@ -360,6 +368,40 @@ def decide(doc: ExtractedDocument, context: DecisionContext | None = None) -> De
                     f"ICE absent du document : fiche tiers '{party_name}' a completer"
                 )
 
+    # 7bis. ORIENTATION par l'identite legale. Le sens achat/vente ne se
+    #       decide jamais d'apres le nom du fichier ou l'objet de l'email :
+    #       il se VERIFIE contre l'ICE de l'entreprise tenant, compare aux
+    #       DEUX parties du document. Tenant emetteur = vente ; tenant
+    #       destinataire = achat ; contradiction ou identite insuffisante =
+    #       quarantaine motivee, jamais un choix silencieux.
+    if ctx.company_ice and doc.doc_type in NEEDS_PARTY_ID:
+        tenant = ctx.company_ice.strip()
+        em = (doc.emetteur_ice or "").strip()
+        de = (doc.destinataire_ice or "").strip()
+        est_vente = doc.doc_type in (SALES_INVOICE, CLIENT_CREDIT_NOTE)
+        if est_vente:
+            if em and em != tenant and de == tenant:
+                reasons.append(
+                    "document au sens VENTE mais l'entreprise est le "
+                    "DESTINATAIRE d'apres les ICE : orientation contradictoire"
+                )
+            elif em and de and tenant not in (em, de):
+                reasons.append(
+                    "aucune des deux parties ne porte l'ICE de l'entreprise : "
+                    "document a verifier"
+                )
+        else:
+            if de and de != tenant and em == tenant:
+                reasons.append(
+                    "document au sens ACHAT mais l'entreprise est "
+                    "l'EMETTEUR d'apres les ICE : orientation contradictoire"
+                )
+            elif em and de and tenant not in (em, de):
+                reasons.append(
+                    "aucune des deux parties ne porte l'ICE de l'entreprise : "
+                    "document a verifier"
+                )
+
     # 8. Avoirs : ce qui engage la comptabilite dans les deux sens, c'est
     #    l'imputation sur une facture d'origine. Quand cette facture est
     #    citee et que les montants sont coherents, l'ecriture est certaine
@@ -375,9 +417,17 @@ def decide(doc: ExtractedDocument, context: DecisionContext | None = None) -> De
                 )
             else:
                 reasons.append("avoir sans facture d'origine identifiable")
-        elif ctx.credit_note_targets > 1:
+        elif ctx.credit_note_targets is not None and ctx.credit_note_targets > 1:
             reasons.append(
                 f"{ctx.credit_note_targets} factures peuvent correspondre a cet avoir"
+            )
+        elif ctx.credit_note_targets == 0:
+            # La reference d'origine est LUE mais aucune facture de CETTE
+            # societe ne la porte : imputer l'avoir reviendrait a inventer
+            # la facture. Jamais de rattachement par ressemblance.
+            reasons.append(
+                f"facture d'origine {doc.facture_liee!r} introuvable dans "
+                f"cette societe"
             )
 
     # 9. Recu de paiement : ne jamais solder une facture sur une simple
