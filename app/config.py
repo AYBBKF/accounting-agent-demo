@@ -149,6 +149,31 @@ class Settings(BaseSettings):
     # Dossier Drive parent sous lequel chaque entreprise recoit le sien.
     drive_root_folder_id: str = Field(default="", alias="DRIVE_ROOT_FOLDER_ID")
 
+    # --- creation automatique d'entreprise --------------------------------
+    #
+    # Desactivee par defaut : sans ce drapeau, une adresse inconnue reste
+    # en quarantaine et aucune entreprise ne peut naitre d'un email.
+    # Activee, un message livre a `<base>+<identifiant>@<domaine>` cree la
+    # comptabilite correspondante (classeur, dossier Drive, registre) puis
+    # est traite normalement.
+    auto_provision_enabled: bool = Field(default=False, alias="AUTO_PROVISION_ENABLED")
+    # Boite de l'exploitant. La partie locale AVANT le `+` doit
+    # correspondre exactement, sinon rien n'est cree.
+    auto_provision_base_address: str = Field(
+        default="", alias="AUTO_PROVISION_BASE_ADDRESS"
+    )
+    # Plafond de securite : au-dela, plus aucune entreprise ne nait seule.
+    auto_provision_max_companies: int = Field(
+        default=50, alias="AUTO_PROVISION_MAX_COMPANIES"
+    )
+    # Reglages d'exploitation d'une entreprise creee seule. Aucune donnee
+    # legale ici : l'ICE reste vide tant que personne ne l'a declare.
+    auto_provision_country: str = Field(default="MA", alias="AUTO_PROVISION_COUNTRY")
+    auto_provision_currency: str = Field(default="MAD", alias="AUTO_PROVISION_CURRENCY")
+    auto_provision_vat_rates: str = Field(
+        default="20", alias="AUTO_PROVISION_VAT_RATES"
+    )
+
     company_name: str = Field(default="X BLASTE", alias="COMPANY_NAME")
     drive_archive_folder: str = Field(
         default="XBLASTE - Factures", alias="DRIVE_ARCHIVE_FOLDER"

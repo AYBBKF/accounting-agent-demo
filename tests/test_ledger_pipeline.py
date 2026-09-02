@@ -186,7 +186,16 @@ def test_un_avoir_aux_montants_negatifs_reduit_bien_la_tva(db_path, monkeypatch)
     wb = FakeWorkbook()
     pipe = _pipeline(db_path, monkeypatch, wb)
     _run(pipe, ACHAT)  # pose la TVA deductible de la periode
-    avant = D(ledger.tva_recap(db_path, "xblaste")[0]["tva_deductible"])
+
+    # Somme TOUTES periodes : un avoir sans date est date du jour, donc
+    # peut tomber dans un mois different de sa facture d'origine. Regarder
+    # une seule periode faisait passer ce test pour vert selon le jour du
+    # mois ou il tournait - il doit mesurer la TVA, pas le calendrier.
+    total_deductible = lambda: sum(  # noqa: E731
+        (D(p["tva_deductible"]) for p in ledger.tva_recap(db_path, "xblaste")),
+        D("0"),
+    )
+    avant = total_deductible()
 
     montant = lambda v: SimpleNamespace(value=D(v))  # noqa: E731
     doc = SimpleNamespace(
@@ -205,7 +214,7 @@ def test_un_avoir_aux_montants_negatifs_reduit_bien_la_tva(db_path, monkeypatch)
     assert all(D(l["debit"]) >= 0 and D(l["credit"]) >= 0 for l in lignes), (
         "aucun montant negatif au journal"
     )
-    apres = D(ledger.tva_recap(db_path, "xblaste")[0]["tva_deductible"])
+    apres = total_deductible()
     assert apres == avant - D("200"), "l'avoir doit REDUIRE la TVA deductible"
 
 
