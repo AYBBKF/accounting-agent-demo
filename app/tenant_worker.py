@@ -111,6 +111,7 @@ class TenantWorker:
         vision_max_calls: int = 0,
         locks: Any | None = None,
         worker_factory: Callable[..., MailWorker] | None = None,
+        provisioner: Any | None = None,
     ) -> None:
         if not str(query or "").strip():
             # Un fallback silencieux vers une requete plus large ferait
@@ -134,6 +135,10 @@ class TenantWorker:
         self._locks = locks if locks is not None else TenantLocks()
         self._workers: dict[str, MailWorker] = {}
         self._factory = worker_factory or self._build_worker
+        # Creation automatique d'entreprise : optionnelle, jamais sur le
+        # chemin nominal. Sans elle, un alias inconnu reste en quarantaine
+        # exactement comme avant.
+        self._provisioner = provisioner
         # Sondeur unique : il ne sert qu'a interroger Gmail et n'a AUCUNE
         # entreprise, donc aucun classeur et aucun droit d'ecriture.
         self._probe = MailWorker(
@@ -308,6 +313,25 @@ class TenantWorker:
             )
 
         decision = routing.route_message(self._db_path, message)
+
+        # Alias inconnu : l'exploitant peut avoir demande qu'une adresse
+        # sous-adressee fasse naitre sa comptabilite. La creation est
+        # tentee UNE fois, puis le routage normal retranche - c'est lui,
+        # et lui seul, qui autorise l'ecriture.
+        if decision.outcome == routing.UNKNOWN_COMPANY and self._provisioner is not None:
+            cree = self._provisioner.provision_for_message(message)
+            if getattr(cree, "usable", False):
+                logger.info(
+                    "Email %s : entreprise '%s' creee automatiquement, "
+                    "routage rejoue", message_id, cree.company_id,
+                )
+                decision = routing.route_message(self._db_path, message)
+            elif getattr(cree, "refused", ""):
+                logger.warning(
+                    "Email %s : creation automatique refusee (%s)",
+                    message_id, cree.refused,
+                )
+
         if not decision.accepted:
             # Rien n'est telecharge, rien n'est extrait, rien n'est facture.
             logger.warning(

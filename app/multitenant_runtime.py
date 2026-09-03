@@ -304,6 +304,53 @@ def prepare_or_fail(
     return rapport
 
 
+def build_provisioner(
+    settings: Any, *, sheets: Any, drive: Any,
+) -> Any | None:
+    """Provisionneur automatique, ou None si l'exploitant ne l'a pas demande.
+
+    Trois conditions cumulatives : le drapeau, la boite de reference et un
+    classeur modele. Il manque l'une d'elles - le mode reste celui d'hier,
+    ou seule une declaration d'administrateur cree une entreprise.
+    """
+    if not bool(getattr(settings, "auto_provision_enabled", False)):
+        return None
+    base = str(getattr(settings, "auto_provision_base_address", "") or "").strip()
+    modele = str(getattr(settings, "template_sheet_id", "") or "").strip()
+    if not base or not modele or sheets is None or drive is None:
+        logger.warning(
+            "Creation automatique demandee mais incomplete "
+            "(adresse de base=%r, modele=%r) : elle reste inactive.",
+            base, bool(modele),
+        )
+        return None
+
+    from app.auto_provision import AutoProvisioner, ProvisionDefaults
+
+    taux = tuple(
+        t.strip()
+        for t in str(getattr(settings, "auto_provision_vat_rates", "20")).split(",")
+        if t.strip()
+    ) or ("20",)
+    provisionneur = AutoProvisioner(
+        settings.db_path,
+        base_address=base,
+        sheets=sheets, drive=drive, template_sheet_id=modele,
+        defaults=ProvisionDefaults(
+            country=str(getattr(settings, "auto_provision_country", "MA")),
+            currency=str(getattr(settings, "auto_provision_currency", "MAD")),
+            allowed_vat_rates=taux,
+            telegram_chat_id=str(getattr(settings, "gmail_watch_chat_id", "") or ""),
+        ),
+        max_companies=int(getattr(settings, "auto_provision_max_companies", 50)),
+    )
+    logger.info(
+        "Creation automatique d'entreprise ACTIVE sur %s (plafond %d).",
+        base, provisionneur._max,  # noqa: SLF001 - trace de demarrage
+    )
+    return provisionneur
+
+
 def build_worker(settings: Any, **extra: Any) -> TenantWorker:
     """Construit le repartiteur a partir de la configuration de l'exploitant.
 

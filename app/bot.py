@@ -860,6 +860,7 @@ def _build_multitenant_worker():
     return runtime.build_worker(
         settings, vision=_vision_extractor,
         vision_max_calls=settings.vision_max_calls_per_email,
+        provisioner=runtime.build_provisioner(settings, sheets=sheets, drive=drive),
     )
 
 
