@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -164,6 +165,9 @@ class Company:
     created_at: str = ""
     activated_at: str | None = None
     last_successful_cycle: str | None = None
+    approval_required: bool = False
+    bootstrap_sheet_id: str = ""
+    bootstrap_initialized: bool = False
 
     @property
     def can_write(self) -> bool:
@@ -174,6 +178,7 @@ class Company:
         """
         return (
             self.status in WRITABLE_STATUSES
+            and not self.approval_required
             and bool(self.sheet_id)
             and bool(self.drive_folder_id)
         )
@@ -245,11 +250,14 @@ def _list_from_json(payload: str) -> tuple[str, ...]:
 _COLONNES_AJOUTEES = (
     ("ice", "TEXT NOT NULL DEFAULT ''"),
     ("account_mapping", "TEXT NOT NULL DEFAULT '{}'"),
+    ("approval_required", "INTEGER NOT NULL DEFAULT 0"),
+    ("bootstrap_sheet_id", "TEXT NOT NULL DEFAULT ''"),
+    ("bootstrap_initialized", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 
 def ensure_schema(db_path: str) -> None:
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.executescript(SCHEMA)
         presentes = {
             row[1] for row in conn.execute("PRAGMA table_info(companies)")
@@ -289,13 +297,17 @@ def _row_to_company(row: sqlite3.Row) -> Company:
         created_at=row["created_at"] or "",
         activated_at=row["activated_at"],
         last_successful_cycle=row["last_successful_cycle"],
+        approval_required=bool(row["approval_required"]),
+        bootstrap_sheet_id=row["bootstrap_sheet_id"] or "",
+        bootstrap_initialized=bool(row["bootstrap_initialized"]),
     )
 
 
-def _connect(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    return conn
+@contextmanager
+def _connect(db_path: str):
+    with closing(sqlite3.connect(db_path)) as conn, conn:
+        conn.row_factory = sqlite3.Row
+        yield conn
 
 
 def register_company(
@@ -426,11 +438,13 @@ def set_status(db_path: str, company_id: str, status: str) -> Company:
     identifiant = normalize_company_id(company_id)
     with _connect(db_path) as conn:
         courant = conn.execute(
-            "SELECT status, activated_at FROM companies WHERE company_id = ?",
+            "SELECT status, activated_at, approval_required FROM companies WHERE company_id = ?",
             (identifiant,),
         ).fetchone()
         if courant is None:
             raise CompanyError(f"entreprise inconnue : '{identifiant}'")
+        if status == ACTIVE and courant["approval_required"]:
+            raise CompanyError("validation administrateur requise avant activation")
         # `activated_at` marque la PREMIERE activation et ne bouge plus :
         # c'est une date d'audit, pas un horodatage de derniere reprise.
         activated = courant["activated_at"]

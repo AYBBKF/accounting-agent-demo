@@ -514,15 +514,16 @@ def find_by_message_and_sha(
         return dict(row) if row else None
 
 
-def list_pending_review(db_path: str, chat_id: int) -> list[dict[str, Any]]:
+def list_pending_review(db_path: str, chat_id: int, *, company_id: str = "") -> list[dict[str, Any]]:
     """Documents qui attendent reellement une decision humaine."""
     import sqlite3
 
+    portee, params = _scope(company_id)
     with connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            "SELECT * FROM documents WHERE chat_id = ? AND state = ? ORDER BY created_at",
-            (str(chat_id), NEEDS_REVIEW),
+            f"SELECT * FROM documents WHERE chat_id = ? AND state = ?{portee} ORDER BY created_at",
+            (str(chat_id), NEEDS_REVIEW, *params),
         ).fetchall()
         return [dict(r) for r in rows]
 
@@ -541,17 +542,18 @@ def list_documents(db_path: str, chat_id: int) -> list[dict[str, Any]]:
         return [dict(r) for r in rows]
 
 
-def list_unfinished(db_path: str, chat_id: int) -> list[dict[str, Any]]:
+def list_unfinished(db_path: str, chat_id: int, *, company_id: str = "") -> list[dict[str, Any]]:
     """Documents dont l'ecriture comptable a abouti mais pas la suite."""
     import sqlite3
 
+    portee, params = _scope(company_id)
     with connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             "SELECT * FROM documents WHERE chat_id = ? AND state IN "
             "('partial','sheet_written','details_written','drive_archived',"
-            "'calendar_created') ORDER BY created_at",
-            (str(chat_id),),
+            f"'calendar_created'){portee} ORDER BY created_at",
+            (str(chat_id), *params),
         ).fetchall()
         return [dict(r) for r in rows]
 

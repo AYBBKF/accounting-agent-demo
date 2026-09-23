@@ -343,6 +343,7 @@ def build_provisioner(
             telegram_chat_id=str(getattr(settings, "gmail_watch_chat_id", "") or ""),
         ),
         max_companies=int(getattr(settings, "auto_provision_max_companies", 50)),
+        require_approval=bool(getattr(settings, "auto_provision_require_approval", True)),
     )
     logger.info(
         "Creation automatique d'entreprise ACTIVE sur %s (plafond %d).",

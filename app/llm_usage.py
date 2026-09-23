@@ -19,6 +19,7 @@ Deux interdits absolus, verifies par les tests :
 from __future__ import annotations
 
 import sqlite3
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -74,7 +75,7 @@ def _now() -> str:
 
 
 def ensure_schema(db_path: str) -> None:
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.executescript(SCHEMA)
         conn.commit()
 
@@ -159,7 +160,7 @@ def record_call(
     if not str(company_id).strip():
         raise UsageError("un appel LLM doit toujours etre impute a une entreprise")
     ensure_schema(db_path)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.execute(
             "INSERT INTO llm_usage (company_id, doc_key, gmail_message_id, level,"
             " model, reason, outcome, input_tokens, output_tokens,"
@@ -175,7 +176,7 @@ def record_call(
 
 def totals_for(db_path: str, company_id: str) -> UsageTotals:
     ensure_schema(db_path)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         row = conn.execute(
             "SELECT COUNT(*), COALESCE(SUM(input_tokens),0),"
             " COALESCE(SUM(output_tokens),0), COALESCE(SUM(estimated_cost_usd),0.0)"
@@ -189,7 +190,7 @@ def totals_by_company(db_path: str) -> dict[str, UsageTotals]:
     """Ventilation complete. C'est la vue qui part dans un rapport client."""
     ensure_schema(db_path)
     sortie: dict[str, UsageTotals] = {}
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         for ligne in conn.execute(
             "SELECT company_id, COUNT(*), COALESCE(SUM(input_tokens),0),"
             " COALESCE(SUM(output_tokens),0), COALESCE(SUM(estimated_cost_usd),0.0)"
@@ -209,7 +210,7 @@ def calls_for_document(db_path: str, company_id: str, doc_key: str) -> int:
     d'augmenter des le second cycle.
     """
     ensure_schema(db_path)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         row = conn.execute(
             "SELECT COUNT(*) FROM llm_usage WHERE company_id = ? AND doc_key = ?",
             (str(company_id), doc_key),
@@ -227,7 +228,7 @@ def rows_for_document(
     et ce que sa reponse est devenue.
     """
     ensure_schema(db_path)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.row_factory = sqlite3.Row
         lignes = conn.execute(
             "SELECT level, model, reason, outcome, input_tokens, output_tokens,"
@@ -245,7 +246,7 @@ def levels_for_document(db_path: str, company_id: str, doc_key: str) -> tuple[st
     suffisante, ('terra', 'sol') quand il a fallu monter jusqu'a l'image.
     """
     ensure_schema(db_path)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         lignes = conn.execute(
             "SELECT level FROM llm_usage WHERE company_id = ? AND doc_key = ?"
             " ORDER BY id",

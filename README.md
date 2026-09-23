@@ -1,5 +1,10 @@
 # accounting-agent-demo
 
+> Exploitation multi-entreprises : voir [le guide opérateur](docs/OPERATIONS.md)
+> pour l'activation contrôlée, la console de revue et le suivi des cycles.
+> Le texte ci-dessous décrit la démonstration initiale ; il ne constitue pas
+> l'inventaire des intégrations du worker Gmail actuel.
+
 Demo jetable, mono-conteneur, isolee de tout autre projet. **Aucune donnee
 reelle** : factures et releves bancaires sont entierement fictifs
 (marques "DEMO").

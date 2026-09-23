@@ -67,12 +67,14 @@ TRANSACTIONAL_TABS = REQUIRED_TABS + (
     "13_ANOMALIES",
     "18_DOCUMENTS_COMMERCIAUX",
     "19_ECHEANCES_A_PAYER",
+    "BOT_FACTURES", "BOT_RELEVE", "BOT_RAPPROCHEMENT", "BOT_TVA",
+    "BOT_TVA_RECAP",
 )
 
 # Premiere ligne de donnees. La ligne 1 porte les en-tetes et ne se vide
 # jamais.
 _FIRST_DATA_ROW = 2
-_CLEAR_RANGE = "A{row}:Z2000"
+_CLEAR_RANGE = "A{row}:Z"
 
 
 class BootstrapError(RuntimeError):
@@ -143,9 +145,9 @@ def bootstrap_company(
     entreprise = registry.get_company(db_path, company_id)
     if entreprise is None:
         raise BootstrapError(f"entreprise inconnue : '{company_id}'")
-    if entreprise.status == registry.DISABLED:
+    if entreprise.status in (registry.DISABLED, registry.SUSPENDED):
         raise BootstrapError(
-            f"l'entreprise '{entreprise.company_id}' est DISABLED : "
+            f"l'entreprise '{entreprise.company_id}' est {entreprise.status} : "
             "son bootstrap doit etre demande explicitement par un administrateur"
         )
 
@@ -166,9 +168,20 @@ def bootstrap_company(
         )
         if not nouveau:
             raise BootstrapError("la copie du modele comptable n'a rien rendu")
+        if nouveau == template_sheet_id or any(
+            autre.sheet_id == nouveau for autre in registry.list_companies(db_path)
+        ):
+            raise BootstrapError("copie non distincte : refus de toucher un classeur existant")
         # Enregistre AVANT toute suite : si l'etape suivante echoue, la
         # reprise retrouvera ce classeur au lieu d'en creer un second.
-        registry.update_company(db_path, entreprise.company_id, sheet_id=nouveau)
+        # Persist ownership of this NEW copy in the same transaction as its ID.
+        # Only such a copy may be cleared, and only until initialization finishes.
+        with registry._connect(db_path) as conn:
+            conn.execute(
+                "UPDATE companies SET sheet_id=?, bootstrap_sheet_id=?, "
+                "bootstrap_initialized=0 WHERE company_id=?",
+                (nouveau, nouveau, entreprise.company_id),
+            )
         resultat.sheet_id = nouveau
         resultat.sheet_created = True
         logger.info(
@@ -220,15 +233,32 @@ def bootstrap_company(
     # Seulement les lignes. En-tetes, formules, validations et formats
     # restent ceux du modele.
     vides: list[str] = []
-    for onglet in TRANSACTIONAL_TABS:
+    current = registry.get_company(db_path, entreprise.company_id)
+    may_clear = (
+        current.bootstrap_sheet_id == resultat.sheet_id
+        and not current.bootstrap_initialized
+        and not current.activated_at
+        and current.status == registry.PENDING_CONFIGURATION
+    )
+    to_clear = tuple(dict.fromkeys(TRANSACTIONAL_TABS + tuple(
+        t for t in sorted(onglets) if t.startswith('21_A_VERIFIER_BACKUP_')
+    )))
+    for onglet in to_clear if may_clear else ():
         if onglet not in onglets:
             continue
+        a1_tab = onglet if onglet.replace('_', '').isalnum() else "'" + onglet.replace("'", "''") + "'"
         sheets.clear_range(
             resultat.sheet_id,
-            f"{onglet}!{_CLEAR_RANGE.format(row=_FIRST_DATA_ROW)}",
+            f"{a1_tab}!{_CLEAR_RANGE.format(row=_FIRST_DATA_ROW)}",
         )
         vides.append(onglet)
     resultat.tabs_cleared = tuple(vides)
+    if may_clear:
+        with registry._connect(db_path) as conn:
+            conn.execute(
+                "UPDATE companies SET bootstrap_initialized=1 WHERE company_id=?",
+                (entreprise.company_id,),
+            )
 
     registry.update_company(
         db_path, entreprise.company_id,
@@ -254,7 +284,9 @@ def bootstrap_company(
         )
         return resultat
 
-    if activate:
+    if a_jour.approval_required:
+        resultat.blocked_by = ("validation administrateur requise",)
+    elif activate:
         registry.set_status(db_path, entreprise.company_id, registry.ACTIVE)
         resultat.activated = True
         logger.info("[%s] entreprise activee", entreprise.company_id)

@@ -735,7 +735,8 @@ def build_dispatcher() -> Dispatcher:
     return dp
 
 
-async def deliver_summary(bot: Any, summary: Any) -> dict[str, Any]:
+async def deliver_summary(bot: Any, summary: Any, *, owner: Any = None,
+                          chat_id: int | None = None) -> dict[str, Any]:
     """Annonce UN email, et ne marque que ce qui a REELLEMENT ete delivre.
 
     Le defaut corrige ici etait un mensonge d'etat. Quand l'envoi du
@@ -761,7 +762,8 @@ async def deliver_summary(bot: Any, summary: Any) -> dict[str, Any]:
         rapport["skipped"] = True
         return rapport
 
-    chat_id = settings.gmail_watch_chat_id
+    chat_id = settings.gmail_watch_chat_id if chat_id is None else chat_id
+    owner = mail_worker if owner is None else owner
     try:
         morceaux = await send_text(
             bot.send_message, chat_id, build_summary(summary), label="resume",
@@ -791,7 +793,7 @@ async def deliver_summary(bot: Any, summary: Any) -> dict[str, Any]:
             rapport["failed"].append((outcome.doc_key, str(exc)))
             continue
         await asyncio.to_thread(
-            mail_worker.mark_notified, outcome,
+            owner.mark_notified, outcome,
             telegram_message_id=envoyes[0] if envoyes else 0,
         )
         rapport["marked"].append(outcome.doc_key)
@@ -803,7 +805,7 @@ async def deliver_summary(bot: Any, summary: Any) -> dict[str, Any]:
         for outcome in summary.notified_outcomes:
             if outcome in summary.to_review:
                 continue
-            await asyncio.to_thread(mail_worker.mark_notified, outcome)
+            await asyncio.to_thread(owner.mark_notified, outcome)
             rapport["marked"].append(outcome.doc_key)
 
     logger.info(
@@ -888,6 +890,8 @@ async def _gmail_watch_loop(bot: Bot) -> None:
         "Worker Gmail demarre (user=%s, intervalle=%ss, requete=%r).",
         mail_worker.user_id, mail_worker.poll_seconds, mail_worker.query,
     )
+    from app.cycle_health import CycleHealth
+    health = CycleHealth(settings.db_path, mail_worker.poll_seconds)
     if settings.multi_tenant_enabled:
         # FAIL-CLOSED : le multi-entreprises est explicitement demande.
         # S'il ne peut pas demarrer, RIEN ne demarre a sa place - pas de
@@ -914,32 +918,61 @@ async def _gmail_watch_loop(bot: Bot) -> None:
             moteur.poll_seconds, moteur.query,
         )
         while True:
+            cycle_ok = False
             try:
                 rapport = await asyncio.to_thread(moteur.process_once)
+                cycle_ok = not getattr(rapport, 'technical_failures', 0)
                 for entree in rapport.emails:
                     if entree.summary is not None:
-                        await deliver_summary(bot, entree.summary)
+                        from app.tenant_context import TenantContext
+                        tenant = TenantContext.for_company(settings.db_path, entree.company_id)
+                        delivery = await deliver_summary(bot, entree.summary,
+                                              owner=moteur.worker_for(entree.company_id),
+                                              chat_id=tenant.chat_id)
+                        if delivery['failed'] or any(o.error for o in entree.summary.outcomes):
+                            cycle_ok = False
                 for refuse in rapport.quarantined:
                     logger.warning(
                         "Email %s en quarantaine (%s) : %s",
                         refuse.message_id, refuse.outcome, refuse.reason,
                     )
             except MailWorkerError as exc:
+                cycle_ok = False
                 logger.warning("Cycle Gmail multi-entreprises en echec: %s", exc)
             except Exception:  # noqa: BLE001 - la boucle ne doit jamais mourir
+                cycle_ok = False
                 logger.exception("Erreur inattendue dans le worker multi-entreprises")
+            await _record_cycle_health(bot, health, cycle_ok)
             await asyncio.sleep(moteur.poll_seconds)
 
     while True:
+        cycle_ok = False
         try:
             summaries = await asyncio.to_thread(mail_worker.process_once)
+            cycle_ok = True
             for summary in summaries:
-                await deliver_summary(bot, summary)
+                delivery = await deliver_summary(bot, summary)
+                if delivery['failed'] or any(o.error for o in summary.outcomes):
+                    cycle_ok = False
         except MailWorkerError as exc:
+            cycle_ok = False
             logger.warning("Cycle Gmail en echec: %s", exc)
         except Exception:  # noqa: BLE001 - la boucle ne doit jamais mourir
+            cycle_ok = False
             logger.exception("Erreur inattendue dans le worker Gmail")
+        await _record_cycle_health(bot, health, cycle_ok)
         await asyncio.sleep(mail_worker.poll_seconds)
+
+
+async def _record_cycle_health(bot: Bot, health: Any, ok: bool) -> None:
+    try:
+        transition = await asyncio.to_thread(health.finish, ok)
+        if transition == 'failure':
+            await _alert_admin(bot, "Agent comptable : trois cycles consecutifs en echec. Consultez la console operations et les journaux.")
+        elif transition == 'recovered':
+            await _alert_admin(bot, "Agent comptable : reprise confirmee, le dernier cycle a reussi.")
+    except Exception:
+        logger.exception("Impossible d'enregistrer la sante des cycles")
 
 
 async def _heartbeat_loop() -> None:
@@ -959,6 +992,8 @@ async def _heartbeat_loop() -> None:
 
 
 async def main() -> None:
+    # Transport INFO logs include presigned attachment URLs and bot tokens.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     if not settings.telegram_bot_token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN manquant : impossible de demarrer le bot.")
     settings.ensure_db_dir()

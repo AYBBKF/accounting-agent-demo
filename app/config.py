@@ -157,6 +157,9 @@ class Settings(BaseSettings):
     # comptabilite correspondante (classeur, dossier Drive, registre) puis
     # est traite normalement.
     auto_provision_enabled: bool = Field(default=False, alias="AUTO_PROVISION_ENABLED")
+    auto_provision_require_approval: bool = Field(
+        default=True, alias="AUTO_PROVISION_REQUIRE_APPROVAL"
+    )
     # Boite de l'exploitant. La partie locale AVANT le `+` doit
     # correspondre exactement, sinon rien n'est cree.
     auto_provision_base_address: str = Field(

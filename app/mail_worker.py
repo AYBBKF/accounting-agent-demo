@@ -883,6 +883,11 @@ class MailWorker:
         demande de validation sans en renvoyer aucune en trop.
         """
         fiche = store.get_document(self._db_path, outcome.doc_key) or {}
+        if self._company_id and (
+            fiche.get('company_id') != self._company_id
+            or str(fiche.get('chat_id')) != str(self._chat_id)
+        ):
+            raise MailWorkerError("notification d'une autre entreprise refusee")
         store.mark_notified(
             self._db_path, outcome.doc_key,
             notify_state_of(outcome, str(fiche.get("state") or "")),
@@ -898,7 +903,7 @@ class MailWorker:
         """
         store.ensure_schema(self._db_path)
         outcomes: list[DocumentOutcome] = []
-        for row in store.list_pending_review(self._db_path, self._chat_id):
+        for row in store.list_pending_review(self._db_path, self._chat_id, **self._scope()):
             try:
                 outcome = self.resume(row)
             except Exception as exc:  # noqa: BLE001 - un document n'en bloque pas un autre
@@ -1064,7 +1069,7 @@ class MailWorker:
         """Termine les documents dont l'ecriture comptable a abouti mais dont
         l'archivage, le rappel ou le journal manquent encore."""
         outcomes: list[DocumentOutcome] = []
-        for row in store.list_unfinished(self._db_path, self._chat_id):
+        for row in store.list_unfinished(self._db_path, self._chat_id, **self._scope()):
             try:
                 outcomes.append(self.resume(row))
             except Exception as exc:  # noqa: BLE001 - la reprise ne bloque jamais le cycle
@@ -1073,6 +1078,10 @@ class MailWorker:
 
     def resume(self, row: dict[str, Any]) -> DocumentOutcome:
         """Reprend UN document exactement la ou il s'est arrete."""
+        if self._company_id and row.get("company_id") != self._company_id:
+            raise MailWorkerError("document d'une autre entreprise : reprise refusee")
+        if str(row.get("chat_id")) != str(self._chat_id):
+            raise MailWorkerError("document d'un autre chat : reprise refusee")
         file, source_url = self.materialize(row)
         message = {
             "messageId": row["gmail_message_id"],
@@ -1101,8 +1110,8 @@ class MailWorker:
         outcomes: list[DocumentOutcome] = []
         seen: set[str] = set()
         rows = (
-            store.list_unfinished(self._db_path, self._chat_id)
-            + store.list_pending_review(self._db_path, self._chat_id)
+            store.list_unfinished(self._db_path, self._chat_id, **self._scope())
+            + store.list_pending_review(self._db_path, self._chat_id, **self._scope())
         )
         for row in rows:
             if row["doc_key"] in seen:

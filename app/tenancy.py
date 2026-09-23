@@ -23,6 +23,7 @@ Trois exigences gouvernent l'ecriture de cette migration :
 from __future__ import annotations
 
 import sqlite3
+from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -133,7 +134,7 @@ def ensure_event_uniqueness(db_path: str) -> bool:
     des doublons HISTORIQUES (anterieurs au correctif de cle stable)
     empechent sa creation - jamais bloquant : la deduplication applicative
     couvre ces lignes-la, la contrainte protege tout le reste."""
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         if not _table_existe(conn, "documents"):
             return False
         if "company_id" not in _colonnes(conn, "documents"):
@@ -179,7 +180,7 @@ def _table_existe(conn: sqlite3.Connection, table: str) -> bool:
 
 def is_migrated(db_path: str) -> bool:
     """La base porte-t-elle deja la structure multi-tenant ?"""
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         for table in _TABLES_A_COLONNE + _TABLES_A_RECONSTRUIRE:
             if not _table_existe(conn, table):
                 continue
@@ -201,7 +202,7 @@ def migrate_to_multi_tenant(
     reconstruites: list[str] = []
     conservees: list[str] = []
 
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.execute("PRAGMA foreign_keys=OFF")
         # Une seule transaction : soit la base est entierement migree,
         # soit elle reste exactement dans son etat d'origine. Une
@@ -286,7 +287,7 @@ def company_counts(db_path: str) -> dict[str, dict[str, int]]:
     entreprise ne doit avoir bouge que sur ses propres lignes.
     """
     sortie: dict[str, dict[str, int]] = {}
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         for table in _TABLES_A_COLONNE + _TABLES_A_RECONSTRUIRE:
             if not _table_existe(conn, table):
                 continue
@@ -308,7 +309,7 @@ def orphan_rows(db_path: str) -> dict[str, int]:
     ecriture qu'aucune comptabilite ne revendique.
     """
     orphelines: dict[str, int] = {}
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         for table in _TABLES_A_COLONNE + _TABLES_A_RECONSTRUIRE:
             if not _table_existe(conn, table):
                 continue
