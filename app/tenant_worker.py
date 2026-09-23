@@ -70,6 +70,7 @@ class RoutedEmail:
     source: str = ""
     reason: str = ""
     summary: MailSummary | None = None
+    technical_failure: bool = False
 
     @property
     def processed(self) -> bool:
@@ -85,6 +86,7 @@ class CycleReport:
     quarantined: list[RoutedEmail] = field(default_factory=list)
     emails: list[RoutedEmail] = field(default_factory=list)
     skipped_busy: tuple[str, ...] = ()
+    technical_failures: int = 0
 
     @property
     def summaries(self) -> list[MailSummary]:
@@ -134,6 +136,7 @@ class TenantWorker:
 
         self._locks = locks if locks is not None else TenantLocks()
         self._workers: dict[str, MailWorker] = {}
+        self._contexts: dict[str, TenantContext] = {}
         self._factory = worker_factory or self._build_worker
         # Creation automatique d'entreprise : optionnelle, jamais sur le
         # chemin nominal. Sans elle, un alias inconnu reste en quarantaine
@@ -199,10 +202,10 @@ class TenantWorker:
         une quarantaine explicite qu'une ecriture au mauvais endroit.
         """
         identifiant = registry.normalize_company_id(company_id)
-        connu = self._workers.get(identifiant)
-        if connu is not None:
-            return connu
         tenant = TenantContext.for_company(self._db_path, identifiant)
+        connu = self._workers.get(identifiant)
+        if connu is not None and self._contexts.get(identifiant) == tenant:
+            return connu
         worker = self._factory(tenant)
         if worker.company_id != tenant.company_id:
             raise TenantError(
@@ -210,6 +213,7 @@ class TenantWorker:
                 f"{worker.company_id!r} au lieu de {tenant.company_id!r}"
             )
         self._workers[identifiant] = worker
+        self._contexts[identifiant] = tenant
         return worker
 
     # -- curseur commun ----------------------------------------------------
@@ -276,6 +280,7 @@ class TenantWorker:
                 continue
             entree = self._handle_message(message_id, plus_recent, occupees)
             rapport.emails.append(entree)
+            rapport.technical_failures += int(entree.technical_failure)
             if entree.company_id:
                 rapport.routed[entree.company_id] = (
                     rapport.routed.get(entree.company_id, 0) + 1
@@ -310,6 +315,7 @@ class TenantWorker:
             return RoutedEmail(
                 message_id=message_id, outcome=routing.UNKNOWN_COMPANY,
                 reason=f"email illisible : {exc}",
+                technical_failure=True,
             )
 
         decision = routing.route_message(self._db_path, message)

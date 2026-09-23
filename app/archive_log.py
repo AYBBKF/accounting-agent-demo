@@ -14,6 +14,7 @@ entreprise, et peut s'archiver une fois dans CHAQUE entreprise.
 from __future__ import annotations
 
 import sqlite3
+from contextlib import closing
 from datetime import datetime, timezone
 
 SCHEMA = """
@@ -37,7 +38,7 @@ CREATE TABLE IF NOT EXISTS drive_archives (
 
 
 def ensure_schema(db_path: str) -> None:
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.executescript(SCHEMA)
         conn.commit()
 
@@ -45,7 +46,7 @@ def ensure_schema(db_path: str) -> None:
 def known(db_path: str, company_id: str, sha256: str) -> dict | None:
     """L'archive existante pour ce contenu dans CETTE entreprise, ou None."""
     ensure_schema(db_path)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
             "SELECT * FROM drive_archives WHERE company_id=? AND sha256=?",
@@ -68,7 +69,7 @@ def remember(
     if not company_id.strip() or not sha256.strip():
         raise ValueError("une archive exige une entreprise et une empreinte")
     ensure_schema(db_path)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         try:
             conn.execute(
                 "INSERT INTO drive_archives (company_id, sha256, original_name,"
@@ -102,7 +103,7 @@ def update_status(
             params.append(valeur)
     if not champs:
         return
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.execute(
             f"UPDATE drive_archives SET {', '.join(champs)}"
             " WHERE company_id=? AND sha256=?",
@@ -113,7 +114,7 @@ def update_status(
 
 def archives_for(db_path: str, company_id: str) -> list[dict]:
     ensure_schema(db_path)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.row_factory = sqlite3.Row
         return [dict(r) for r in conn.execute(
             "SELECT * FROM drive_archives WHERE company_id=? ORDER BY archived_at",

@@ -464,7 +464,9 @@ def clean_party_name(raw: str | None) -> str | None:
         courant = normalize(candidate)
         retire = False
         for label in _ROLE_LABELS:
-            if not courant.startswith(label):
+            # A role word may be part of the legal name (CLIENT NOVA SARL,
+            # CLIENTEL SARL). Strip only an explicitly separated label.
+            if not re.match(r"^" + re.escape(label) + r"\s*[:/\-]\s*", courant):
                 continue
             reste = candidate[len(label):].lstrip()
             reste = re.sub(r"^[:/\-]\s*", "", reste).strip()

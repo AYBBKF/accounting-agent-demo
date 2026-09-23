@@ -34,6 +34,7 @@ qui laisse l'originale intacte.
 from __future__ import annotations
 
 import sqlite3
+from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -154,7 +155,7 @@ class AccountMapping:
 
 
 def ensure_schema(db_path: str) -> None:
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.executescript(SCHEMA)
         conn.commit()
 
@@ -361,7 +362,7 @@ def record(db_path: str, entry: Entry) -> bool:
         _verify_balance(entry.piece, entry.lines)
     ensure_schema(db_path)
     maintenant = _now()
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         existe = conn.execute(
             "SELECT 1 FROM ledger_entries WHERE company_id=? AND piece=? LIMIT 1",
             (entry.company_id, entry.piece),
@@ -391,7 +392,7 @@ def record(db_path: str, entry: Entry) -> bool:
 
 def entries_for(db_path: str, company_id: str, piece: str = "") -> list[dict]:
     ensure_schema(db_path)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.row_factory = sqlite3.Row
         requete = "SELECT * FROM ledger_entries WHERE company_id=?"
         params: list[object] = [company_id]

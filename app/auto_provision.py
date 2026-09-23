@@ -173,8 +173,12 @@ class AutoProvisioner:
         defaults: ProvisionDefaults | None = None,
         max_companies: int = 50,
         reserved: Iterable[str] = (),
+        require_approval: bool = False,
     ) -> None:
         self._db = db_path
+        # Legacy direct callers retain their contract. The production factory
+        # explicitly enables controlled onboarding by default.
+        self._require_approval = require_approval
         self._base = registry.normalize_alias(base_address)
         self._sheets = sheets
         self._drive = drive
@@ -228,7 +232,7 @@ class AutoProvisioner:
         # l'exploitant ait reellement ecrite. L'ICE reste VIDE.
         registry.register_company(
             self._db, identifiant,
-            legal_name=slug.upper(),
+            legal_name="" if self._require_approval else slug.upper(),
             display_name=slug.upper(),
             inbound_aliases=[alias],
             country=self._defaults.country,
@@ -237,6 +241,12 @@ class AutoProvisioner:
             telegram_chat_id=str(self._defaults.telegram_chat_id or ""),
             account_mapping=dict(self._defaults.account_mapping or {}),
         )
+        if self._require_approval:
+            with registry._connect(self._db) as conn:
+                conn.execute(
+                    "UPDATE companies SET approval_required=1 WHERE company_id=?",
+                    (identifiant,),
+                )
         logger.info(
             "Entreprise creee automatiquement depuis l'adresse %s : %s",
             alias, identifiant,

@@ -9,6 +9,7 @@ rejouer indefiniment.
 from __future__ import annotations
 
 import sqlite3
+from contextlib import closing
 import tempfile
 from pathlib import Path
 
@@ -36,7 +37,7 @@ def legacy_db():
         gmail_message_id="msg-2", attachment_id="att-2",
         file_sha256="b" * 64, filename="releve.pdf",
     )
-    with sqlite3.connect(chemin) as conn:
+    with closing(sqlite3.connect(chemin)) as conn, conn:
         conn.execute(
             "INSERT INTO email_notifications (chat_id, gmail_message_id,"
             " signature, sent_at) VALUES (?,?,?,?)",
@@ -60,7 +61,7 @@ def legacy_db():
 
 
 def _compter(db_path: str, table: str) -> int:
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         return conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
 
 
@@ -94,12 +95,12 @@ def test_aucune_ligne_n_est_perdue(legacy_db):
 
 def test_le_curseur_gmail_ne_recule_pas(legacy_db):
     """Un curseur qui recule ferait retraiter d'anciens emails."""
-    with sqlite3.connect(legacy_db) as conn:
+    with closing(sqlite3.connect(legacy_db)) as conn, conn:
         avant = conn.execute(
             "SELECT history_id, last_internal_date FROM gmail_sync_state"
         ).fetchone()
     tenancy.migrate_to_multi_tenant(legacy_db)
-    with sqlite3.connect(legacy_db) as conn:
+    with closing(sqlite3.connect(legacy_db)) as conn, conn:
         apres = conn.execute(
             "SELECT history_id, last_internal_date FROM gmail_sync_state"
         ).fetchone()
@@ -112,12 +113,12 @@ def test_les_etats_des_documents_sont_intacts(legacy_db):
     Un etat remis a zero declencherait une reecriture comptable et une
     relecture LLM sur des pieces deja traitees.
     """
-    with sqlite3.connect(legacy_db) as conn:
+    with closing(sqlite3.connect(legacy_db)) as conn, conn:
         avant = sorted(conn.execute(
             "SELECT doc_key, state, stable_id, row_index FROM documents"
         ).fetchall())
     tenancy.migrate_to_multi_tenant(legacy_db)
-    with sqlite3.connect(legacy_db) as conn:
+    with closing(sqlite3.connect(legacy_db)) as conn, conn:
         apres = sorted(conn.execute(
             "SELECT doc_key, state, stable_id, row_index FROM documents"
         ).fetchall())
@@ -127,7 +128,7 @@ def test_les_etats_des_documents_sont_intacts(legacy_db):
 def test_les_notifications_deja_envoyees_restent_marquees(legacy_db):
     """Sans cela, chaque document deja notifie repartirait en Telegram."""
     tenancy.migrate_to_multi_tenant(legacy_db)
-    with sqlite3.connect(legacy_db) as conn:
+    with closing(sqlite3.connect(legacy_db)) as conn, conn:
         row = conn.execute(
             "SELECT company_id, signature FROM email_notifications"
             " WHERE gmail_message_id = 'msg-1'"
@@ -151,7 +152,7 @@ def test_les_tables_d_origine_sont_conservees_pour_le_retour_arriere(legacy_db):
     rapport = tenancy.migrate_to_multi_tenant(legacy_db)
     assert "email_notifications_legacy_v1" in rapport.legacy_tables_kept
     assert "gmail_sync_state_legacy_v1" in rapport.legacy_tables_kept
-    with sqlite3.connect(legacy_db) as conn:
+    with closing(sqlite3.connect(legacy_db)) as conn, conn:
         tables = {
             row[0] for row in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'"
@@ -163,13 +164,13 @@ def test_les_tables_d_origine_sont_conservees_pour_le_retour_arriere(legacy_db):
 
 
 def test_la_sauvegarde_contient_l_etat_exact_d_avant_migration(legacy_db):
-    with sqlite3.connect(legacy_db) as conn:
+    with closing(sqlite3.connect(legacy_db)) as conn, conn:
         avant = conn.execute(
             "SELECT chat_id, gmail_message_id, signature, sent_at"
             " FROM email_notifications"
         ).fetchall()
     tenancy.migrate_to_multi_tenant(legacy_db)
-    with sqlite3.connect(legacy_db) as conn:
+    with closing(sqlite3.connect(legacy_db)) as conn, conn:
         sauvegarde = conn.execute(
             "SELECT chat_id, gmail_message_id, signature, sent_at"
             " FROM email_notifications_legacy_v1"
@@ -183,7 +184,7 @@ def test_une_migration_interrompue_ne_se_rejoue_pas_en_aveugle(legacy_db):
     La rejouer ecraserait la seule copie de l'etat d'origine : on refuse
     et on demande une intervention.
     """
-    with sqlite3.connect(legacy_db) as conn:
+    with closing(sqlite3.connect(legacy_db)) as conn, conn:
         conn.execute("CREATE TABLE email_notifications_legacy_v1 (x TEXT)")
         conn.commit()
     with pytest.raises(RuntimeError, match="intervention requise"):
@@ -192,7 +193,7 @@ def test_une_migration_interrompue_ne_se_rejoue_pas_en_aveugle(legacy_db):
 
 def test_une_migration_qui_echoue_ne_laisse_aucune_trace(legacy_db):
     """Tout ou rien : une base a moitie migree serait ingerable."""
-    with sqlite3.connect(legacy_db) as conn:
+    with closing(sqlite3.connect(legacy_db)) as conn, conn:
         conn.execute("CREATE TABLE gmail_sync_state_legacy_v1 (x TEXT)")
         conn.commit()
     with pytest.raises(RuntimeError):
@@ -230,7 +231,7 @@ def test_les_empreintes_bancaires_deviennent_uniques_par_entreprise(legacy_db):
     seconde etait rejetee en silence et sa ligne bancaire disparaissait.
     """
     tenancy.migrate_to_multi_tenant(legacy_db)
-    with sqlite3.connect(legacy_db) as conn:
+    with closing(sqlite3.connect(legacy_db)) as conn, conn:
         maintenant = "2026-08-28T00:00:00+00:00"
         conn.execute(
             "INSERT INTO bank_line_fingerprints (company_id, fingerprint,"
@@ -244,7 +245,7 @@ def test_les_empreintes_bancaires_deviennent_uniques_par_entreprise(legacy_db):
     assert total == 2, "la meme empreinte doit coexister dans deux entreprises"
 
     # Mais le rejeu dans la MEME entreprise reste refuse.
-    with sqlite3.connect(legacy_db) as conn:
+    with closing(sqlite3.connect(legacy_db)) as conn, conn:
         with pytest.raises(sqlite3.IntegrityError):
             conn.execute(
                 "INSERT INTO bank_line_fingerprints (company_id, fingerprint,"
