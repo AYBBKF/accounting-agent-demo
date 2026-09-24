@@ -59,11 +59,16 @@ def test_start_does_not_reset_failures_or_hide_recovery(tmp_path):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('multi', [False, True])
-async def test_gmail_loop_records_active_work_before_completion(tmp_path, monkeypatch, multi):
+@pytest.mark.parametrize('telemetry_fails', [False, True])
+async def test_gmail_loop_records_active_work_before_completion(tmp_path, monkeypatch, multi, telemetry_fails):
     import asyncio
     from types import SimpleNamespace
     from app import bot
     db = str(tmp_path / 'live.db')
+    if telemetry_fails:
+        def fail_start(self):
+            raise PermissionError('telemetry unavailable')
+        monkeypatch.setattr(CycleHealth, 'start', fail_start)
     seen = []
     def process():
         seen.append(read_status(db)['status'])
@@ -80,5 +85,5 @@ async def test_gmail_loop_records_active_work_before_completion(tmp_path, monkey
     monkeypatch.setattr(bot.asyncio, 'sleep', stop)
     with pytest.raises(asyncio.CancelledError):
         await bot._gmail_watch_loop(SimpleNamespace())
-    assert seen == ['processing']
+    assert seen == ['unknown' if telemetry_fails else 'processing']
     assert read_status(db)['status'] == 'ok'

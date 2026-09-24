@@ -920,7 +920,7 @@ async def _gmail_watch_loop(bot: Bot) -> None:
         while True:
             cycle_ok = False
             try:
-                await asyncio.to_thread(health.start)
+                await _start_cycle_health(health)
                 rapport = await asyncio.to_thread(moteur.process_once)
                 cycle_ok = not getattr(rapport, 'technical_failures', 0)
                 for entree in rapport.emails:
@@ -949,7 +949,7 @@ async def _gmail_watch_loop(bot: Bot) -> None:
     while True:
         cycle_ok = False
         try:
-            await asyncio.to_thread(health.start)
+            await _start_cycle_health(health)
             summaries = await asyncio.to_thread(mail_worker.process_once)
             cycle_ok = True
             for summary in summaries:
@@ -964,6 +964,13 @@ async def _gmail_watch_loop(bot: Bot) -> None:
             logger.exception("Erreur inattendue dans le worker Gmail")
         await _record_cycle_health(bot, health, cycle_ok)
         await asyncio.sleep(mail_worker.poll_seconds)
+
+
+async def _start_cycle_health(health: Any) -> None:
+    try:
+        await asyncio.to_thread(health.start)
+    except Exception:
+        logger.exception("Impossible d'enregistrer le debut du cycle")
 
 
 async def _record_cycle_health(bot: Bot, health: Any, ok: bool) -> None:
