@@ -653,6 +653,13 @@ class DocumentPipeline:
         wanted_name = normalize(name or "")
         by_ice = [r for r in rows if len(r) > 2 and wanted_ice and str(r[2]).strip() == wanted_ice]
         if len(by_ice) == 1:
+            registered_name = str(by_ice[0][1]).strip()
+            if wanted_name and normalize(registered_name) != wanted_name:
+                return PartyMatch(
+                    ambiguous=True,
+                    reason=f"nom du tiers different pour le meme ICE : document '{name}', "
+                           f"referentiel '{registered_name}' ; verifier la fiche {by_ice[0][0]}",
+                )
             return PartyMatch(str(by_ice[0][0]).strip(), str(by_ice[0][1]).strip(), existing=True)
         if len(by_ice) > 1:
             return PartyMatch(ambiguous=True, reason="plusieurs tiers avec le meme ICE")

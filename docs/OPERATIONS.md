@@ -88,6 +88,21 @@ extraction pour remplir l'écran.
 
 ## Santé et reprise
 
+Le début de chaque cycle est enregistré comme `processing` (« Traitement en
+cours »), sans avancer la dernière réussite ni effacer les échecs précédents.
+Une opération dépassant trois minutes ne devient donc plus `stale` simplement
+parce que son ZIP est encore traité. Après trente minutes sans fin de cycle,
+elle devient `stalled` et appelle une vérification opérateur. Cette borne ne
+prouve ni une progression réelle ni un blocage ; elle ne tue pas le worker.
+Un processus arrêté pendant un traitement reste visible comme traitement
+inachevé, puis anormalement long. Le heartbeat Docker reste complémentaire.
+
+Si le même ICE désigne un nom différent dans une nouvelle pièce et dans le
+référentiel, la pièce passe en revue avant comptabilisation. Vérifier l'original
+et la fiche tiers, corriger la fiche si nécessaire, puis reprendre la revue.
+Le bot ne renomme pas automatiquement les tiers ou les écritures historiques.
+Les noms équivalents après normalisation gardent le traitement automatique.
+
 Le fichier voisin `demo.cycles.json` décrit le dernier cycle, les échecs
 consécutifs et la dernière réussite. Trois échecs consécutifs déclenchent une
 alerte opérateur ; le premier succès suivant signale la reprise. Le fichier
