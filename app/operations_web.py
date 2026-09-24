@@ -41,6 +41,7 @@ def link(url: str, label: str) -> str:
 def render(data: dict) -> str:
     health = data['health']
     labels = {'ok': 'Dernier cycle réussi', 'degraded': 'Cycle en échec',
+              'processing': 'Traitement en cours', 'stalled': 'Traitement anormalement long — à vérifier',
               'stale': 'Suivi des cycles trop ancien', 'unknown': 'Suivi des cycles indisponible'}
     chunks = ['<!doctype html><html lang="fr"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">',
               '<title>Suivi comptable | FLUX INTELLIGENT</title>', f'<style>{CSS}</style>',

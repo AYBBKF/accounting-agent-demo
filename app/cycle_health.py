@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 import time
 
+MAX_CYCLE_SECONDS = 1800
+
 
 def _path(db_path: str) -> Path:
     return Path(db_path).with_suffix('.cycles.json')
@@ -17,7 +19,12 @@ def read_status(db_path: str, *, now: float | None = None) -> dict:
             raise ValueError('invalid health')
         data['consecutive_failures'] = max(0, int(data.get('consecutive_failures', 0)))
         instant = time.time() if now is None else now
-        if instant - float(data['updated_at']) > max(180, 3 * float(data['poll_seconds'])):
+        if data.get('status') == 'processing':
+            elapsed = max(0, instant - float(data['started_at']))
+            data['elapsed_seconds'] = int(elapsed)
+            if elapsed > MAX_CYCLE_SECONDS:
+                data['status'] = 'stalled'
+        elif instant - float(data['updated_at']) > max(180, 3 * float(data['poll_seconds'])):
             data['status'] = 'stale'
         return data
     except (OSError, ValueError, KeyError, TypeError):
@@ -32,6 +39,19 @@ class CycleHealth:
         self.failures = int(previous.get('consecutive_failures', 0))
         self.last_success = previous.get('last_success')
 
+    def start(self, *, now: float | None = None) -> None:
+        instant = time.time() if now is None else now
+        self._write({'status': 'processing', 'started_at': instant,
+                     'updated_at': instant, 'last_success': self.last_success,
+                     'consecutive_failures': self.failures,
+                     'poll_seconds': self.poll_seconds})
+
+    def _write(self, data: dict) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_suffix('.tmp')
+        temporary.write_text(json.dumps(data), encoding='utf-8')
+        temporary.replace(self.path)
+
     def finish(self, ok: bool, *, now: float | None = None) -> str:
         instant = time.time() if now is None else now
         was_failed = self.failures >= 3
@@ -41,10 +61,7 @@ class CycleHealth:
         data = {'status': 'ok' if ok else 'degraded', 'updated_at': instant,
                 'last_success': self.last_success, 'consecutive_failures': self.failures,
                 'poll_seconds': self.poll_seconds}
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.path.with_suffix('.tmp')
-        temporary.write_text(json.dumps(data), encoding='utf-8')
-        temporary.replace(self.path)
+        self._write(data)
         if self.failures == 3:
             return 'failure'
         if ok and was_failed:

@@ -920,6 +920,7 @@ async def _gmail_watch_loop(bot: Bot) -> None:
         while True:
             cycle_ok = False
             try:
+                await asyncio.to_thread(health.start)
                 rapport = await asyncio.to_thread(moteur.process_once)
                 cycle_ok = not getattr(rapport, 'technical_failures', 0)
                 for entree in rapport.emails:
@@ -948,6 +949,7 @@ async def _gmail_watch_loop(bot: Bot) -> None:
     while True:
         cycle_ok = False
         try:
+            await asyncio.to_thread(health.start)
             summaries = await asyncio.to_thread(mail_worker.process_once)
             cycle_ok = True
             for summary in summaries:
