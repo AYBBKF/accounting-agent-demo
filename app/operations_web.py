@@ -1,4 +1,4 @@
-"""Read-only operator dashboard. Loopback only; no browser-side writes."""
+"""Loopback operator dashboard; optional audited bank decisions only."""
 from __future__ import annotations
 
 import base64
@@ -6,6 +6,8 @@ import hmac
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
+import secrets
+from urllib.parse import parse_qs
 
 from app.operations import snapshot
 
@@ -75,6 +77,27 @@ def render(data: dict) -> str:
             chunks.append('</tbody></table></div>')
             if queue > len(co['reviews']):
                 chunks.append(f'<p class="muted">{len(co["reviews"])} documents affichés sur {queue}. Le classeur contient le suivi détaillé.</p>')
+        bank_reviews = co.get('bank_reviews', [])
+        chunks.append('<h3>Rapprochement bancaire</h3><p class="muted">Paiements partiels et groupes : propositions a valider par l’operateur. Une facture deja payee, un trop-percu ou une reference ambigue restent a examiner.</p>')
+        if not bank_reviews:
+            chunks.append('<p>Aucune proposition bancaire enregistree.</p>')
+        for review in bank_reviews:
+            plan = review['plan']
+            chunks.append('<details><summary>' + e(review['bank_id']) + ' · ' + e(review['status']) + ' · ' + e(plan['reason']) + '</summary>')
+            chunks.append('<p>Reference : ' + e(plan['bank'][5]) + ' · Debit : ' + e(plan['bank'][6]) + ' · Credit : ' + e(plan['bank'][7]) + '</p>')
+            if review.get('last_error'):
+                chunks.append('<p class="badge warn">' + e(review['last_error']) + '</p>')
+            for allocation in plan['allocations']:
+                chunks.append('<p>Facture ' + e(allocation['invoice'][1]) + ' : allocation ' + e(allocation['amount']) + ' MAD ; paye ' + e(allocation['before']) + ' → ' + e(allocation['target']) + ' / ' + e(allocation['total']) + '.</p>')
+            chunks.append('<p>Decision : ' + e(review['actor']) + ' · ' + e(review['note']) + '</p><p class="muted">Revision pour validation operateur : <code>' + e(review['revision']) + '</code></p></details>')
+            if data.get('bank_csrf') and review['status'] == 'pending':
+                chunks.append('<form method="post" action="/bank-decision">')
+                for name, value in [('csrf', data['bank_csrf']), ('company', co['company_id']), ('bank', review['bank_id']), ('revision', review['revision'])]:
+                    chunks.append('<input type="hidden" name="' + name + '" value="' + e(value) + '">')
+                chunks.append('<label>Motif de decision <input name="note" required maxlength="2000"></label> ')
+                if plan['allocations']:
+                    chunks.append('<button name="decision" value="approve">Approuver cette repartition</button> ')
+                chunks.append('<button name="decision" value="reject">Refuser</button></form><p class="muted">L’approbation sera recontrolee et appliquee par le prochain cycle. Elle ne declenche aucun virement.</p>')
         chunks.append('<details><summary>Consommation IA</summary>')
         if co['usage']:
             for u in co['usage']:
@@ -101,6 +124,8 @@ def make_server(db_path: str, company_id: str | None, port: int, token: str):
     if len(token) < 32:
         raise ValueError('OPERATIONS_TOKEN doit contenir au moins 32 caracteres')
     expected = 'Basic ' + base64.b64encode(('operator:' + token).encode()).decode()
+    csrf = secrets.token_urlsafe(32)
+    from app.bank_review import enabled as bank_enabled
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
@@ -114,7 +139,7 @@ def make_server(db_path: str, company_id: str | None, port: int, token: str):
             self.send_header('Cache-Control', 'no-store')
             self.send_header('X-Content-Type-Options', 'nosniff')
             self.send_header('Referrer-Policy', 'no-referrer')
-            self.send_header('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
+            self.send_header('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
             if status == 401:
                 self.send_header('WWW-Authenticate', 'Basic realm="Operations", charset="UTF-8"')
             self.end_headers()
@@ -126,12 +151,39 @@ def make_server(db_path: str, company_id: str | None, port: int, token: str):
             if self.path != '/':
                 return self.send(404, 'Page inconnue.')
             try:
-                self.send(200, render(snapshot(db_path, company_id)))
+                data = snapshot(db_path, company_id)
+                if bank_enabled():
+                    data['bank_csrf'] = csrf
+                self.send(200, render(data))
             except Exception:
                 self.send(503, 'Lecture temporairement indisponible. Consulter les journaux opérateur.')
 
         def do_POST(self):
-            self.send(405, 'Lecture seule.')
+            if not bank_enabled() or self.path != '/bank-decision':
+                return self.send(405, 'Lecture seule.')
+            if not hmac.compare_digest(self.headers.get('Authorization', '').encode(), expected.encode()):
+                return self.send(401, 'Authentification requise.')
+            try:
+                length = int(self.headers.get('Content-Length', '0'))
+                if not 0 < length <= 12000 or self.headers.get_content_type() != 'application/x-www-form-urlencoded':
+                    return self.send(400, 'Formulaire invalide.')
+                fields = parse_qs(self.rfile.read(length).decode('utf-8'), strict_parsing=True, max_num_fields=8)
+                if set(fields) != {'csrf', 'company', 'bank', 'revision', 'note', 'decision'} or any(len(v) != 1 for v in fields.values()):
+                    return self.send(400, 'Formulaire invalide.')
+                values = {k: v[0] for k, v in fields.items()}
+                if not hmac.compare_digest(values['csrf'], csrf):
+                    return self.send(403, 'Formulaire expire : actualiser la page.')
+                data = snapshot(db_path, company_id)
+                selected = next((co for co in data['companies'] if co['company_id'] == values['company']), None)
+                if not selected or selected['status'] != 'ACTIVE' or selected['approval_required']:
+                    return self.send(403, 'Entreprise hors du perimetre actif.')
+                from app.bank_review import decide
+                decide(db_path, values['company'], values['bank'], values['revision'], values['decision'], 'operator', values['note'])
+                self.send(200, '<p>Decision enregistree. Revalidation au prochain cycle.</p><a href="/">Retour au suivi</a>')
+            except (ValueError, UnicodeError):
+                self.send(409, 'Proposition modifiee ou decision invalide : actualiser la page.')
+            except Exception:
+                self.send(503, 'Decision non confirmee : actualiser la page avant toute nouvelle tentative.')
 
     server = ThreadingHTTPServer(('127.0.0.1', port), Handler)
     server.daemon_threads = True

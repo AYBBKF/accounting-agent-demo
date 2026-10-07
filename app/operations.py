@@ -109,6 +109,12 @@ def snapshot(db_path: str, company_id: str | None = None) -> dict:
             notes = [dict(r) for r in conn.execute(
                 'SELECT doc_key, actor, action, detail, created_at FROM operation_audit '
                 'WHERE company_id=? ORDER BY id DESC LIMIT 30', (cid,))] if 'operation_audit' in tables else []
+            bank_reviews = []
+            if 'bank_reviews' in tables:
+                for row in conn.execute('SELECT bank_id,revision,payload,status,actor,note,last_error,updated_at FROM bank_reviews WHERE company_id=? AND sheet_id=? ORDER BY updated_at DESC LIMIT 200', (cid, co['sheet_id'])):
+                    item = dict(row)
+                    item['plan'] = json.loads(item.pop('payload'))
+                    bank_reviews.append(item)
             result.append({
                 'company_id': cid, 'legal_name': co['legal_name'], 'status': co['status'],
                 'approval_required': bool(co.get('approval_required', 0)),
@@ -117,7 +123,7 @@ def snapshot(db_path: str, company_id: str | None = None) -> dict:
                 'drive_link': safe_link('https://drive.google.com/drive/folders/' + co['drive_folder_id']) if co['drive_folder_id'] else '',
                 'last_successful_cycle': co['last_successful_cycle'],
                 'revision': fingerprint(co), 'counts': counts, 'reviews': reviews,
-                'usage': usage, 'audit': notes,
+                'usage': usage, 'audit': notes, 'bank_reviews': bank_reviews,
             })
         return {'generated_at': registry._now(), 'companies': result,
                 'health': health_status(db_path), 'review_limit_per_company': 200}
@@ -224,12 +230,22 @@ def main() -> None:
     note_cmd.add_argument('--company', required=True)
     note_cmd.add_argument('--document', required=True)
     note_cmd.add_argument('--text', required=True)
+    bank_cmd = commands.add_parser('bank-decision')
+    bank_cmd.add_argument('--company', required=True)
+    bank_cmd.add_argument('--bank', required=True)
+    bank_cmd.add_argument('--revision', required=True)
+    bank_cmd.add_argument('--decision', choices=['approve', 'reject'], required=True)
+    bank_cmd.add_argument('--note', required=True)
     args = parser.parse_args()
     # Refuse typos before any write command can create an empty DB.
     if not Path(args.db).is_file():
         parser.error('base existante requise')
     try:
-        if args.command == 'approve':
+        if args.command == 'bank-decision':
+            from app.bank_review import decide
+            decide(args.db, args.company, args.bank, args.revision, args.decision, getpass.getuser(), args.note)
+            print('Decision bancaire enregistree ; application et revalidation au prochain cycle.')
+        elif args.command == 'approve':
             approve(args.db, args.company, json.loads(Path(args.config).read_text(encoding='utf-8')),
                     args.revision, getpass.getuser())
             print('Entreprise validee. Aucun document rejoue par cette commande.')

@@ -12,6 +12,8 @@ perdrait une - silencieusement.
 
 from __future__ import annotations
 
+from contextlib import closing
+
 import sqlite3
 import tempfile
 from decimal import Decimal
@@ -314,7 +316,7 @@ def test_le_journal_des_couts_ne_peut_pas_stocker_de_contenu(db_path):
     d'une autre.
     """
     llm_usage.ensure_schema(db_path)
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         colonnes = {row[1] for row in conn.execute("PRAGMA table_info(llm_usage)")}
     interdits = {
         "content", "payload", "image", "image_b64", "base64", "raw_text",

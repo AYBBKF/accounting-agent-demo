@@ -12,6 +12,8 @@ Accounted (contraintes en base, pieces immuables) et paperless-ngx
 
 from __future__ import annotations
 
+from contextlib import closing
+
 import sqlite3
 import tempfile
 from pathlib import Path
@@ -48,7 +50,7 @@ def _insert_document(conn, *, doc_key, company="xblaste", chat="999653395",
 
 
 def test_la_migration_pose_l_index_d_evenement_unique(db_path):
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         row = conn.execute(
             "SELECT 1 FROM sqlite_master WHERE type='index'"
             " AND name='uniq_documents_evenement'"
@@ -60,7 +62,7 @@ def test_le_meme_evenement_est_refuse_par_la_base_meme_avec_une_autre_cle(db_pat
     """Le scenario du rollback : une version differente du code calcule
     une AUTRE cle applicative pour la MEME piece. Sans la contrainte, la
     piece serait recomptabilisee ; avec, la base refuse."""
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         _insert_document(conn, doc_key="cle-du-digest-vert")
         with pytest.raises(sqlite3.IntegrityError):
             _insert_document(conn, doc_key="cle-de-l-ancien-digest")
@@ -70,7 +72,7 @@ def test_sans_la_contrainte_le_doublon_passerait(db_path):
     """Preuve que le test precedent discrimine reellement : l'index
     retire (etat d'avant le correctif), le second evenement s'insere
     sans erreur - c'est exactement la faille corrigee."""
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.execute("DROP INDEX uniq_documents_evenement")
         _insert_document(conn, doc_key="k1")
         _insert_document(conn, doc_key="k2")  # ne leve PAS : la faille
@@ -84,7 +86,7 @@ def test_la_contrainte_s_applique_a_un_insert_brut_comme_l_ancien_digest(db_path
     """L'ancien digest n'appelle aucun code nouveau : un INSERT brut via
     sqlite3 (ce que fait son doc_store) est bloque par le fichier de la
     base lui-meme."""
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         _insert_document(conn, doc_key="k-green")
     autre = sqlite3.connect(db_path)  # connexion independante, code ancien
     with pytest.raises(sqlite3.IntegrityError):
@@ -95,7 +97,7 @@ def test_la_contrainte_s_applique_a_un_insert_brut_comme_l_ancien_digest(db_path
 def test_deux_membres_distincts_d_un_zip_ne_sont_pas_confondus(db_path):
     """Deux fichiers aux MEMES octets dans le meme email (deux membres
     d'un ZIP) restent deux documents : la cle canonique inclut le membre."""
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         _insert_document(conn, doc_key="m1", member="dossier/a.pdf",
                          filename="a.pdf")
         _insert_document(conn, doc_key="m2", member="dossier/b.pdf",
@@ -105,7 +107,7 @@ def test_deux_membres_distincts_d_un_zip_ne_sont_pas_confondus(db_path):
 
 
 def test_deux_entreprises_gardent_chacune_leur_evenement(db_path):
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         _insert_document(conn, doc_key="x1", company="xblaste")
         _insert_document(conn, doc_key="s1", company="v2-smoke")
         total = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
@@ -116,7 +118,7 @@ def test_des_doublons_historiques_ne_bloquent_pas_le_demarrage(db_path):
     """Un volume de production peut porter des doublons anterieurs au
     correctif de cle stable : la pose de la contrainte echoue alors SANS
     bloquer (False), et la migration reste rejouable."""
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         conn.execute("DROP INDEX uniq_documents_evenement")
         _insert_document(conn, doc_key="h1")
         _insert_document(conn, doc_key="h2")  # doublon historique

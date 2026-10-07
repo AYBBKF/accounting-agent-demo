@@ -11,6 +11,8 @@ demande le multi-entreprises, tout echec de preparation est TERMINAL.
 
 from __future__ import annotations
 
+from contextlib import closing
+
 import asyncio
 import json
 import tempfile
@@ -185,7 +187,7 @@ def test_aucun_email_traite_et_aucun_curseur_avance(db_path, monkeypatch):
     import sqlite3
 
     _lancer_boucle(monkeypatch, db_path, companies_json="{casse")
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         documents = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
         curseurs = conn.execute(
             "SELECT COUNT(*) FROM gmail_sync_state"

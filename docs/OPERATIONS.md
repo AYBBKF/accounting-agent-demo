@@ -70,7 +70,7 @@ python -m app.operations --db /app/data/demo.db serve --company client-demo
 
 Ouvrir `http://127.0.0.1:8765`, utilisateur `operator`, mot de passe : le token.
 Le serveur écoute exclusivement sur loopback ; utiliser un tunnel SSH pour le
-consulter à distance. Ne pas l'exposer publiquement. Il refuse les écritures
+consulter à distance. Ne pas l'exposer publiquement. Par défaut, il refuse les écritures
 HTTP et ne charge aucun script externe. Le scope société est fixé au démarrage,
 pas choisi dans une URL par le visiteur.
 

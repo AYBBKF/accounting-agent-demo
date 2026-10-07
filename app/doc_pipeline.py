@@ -1348,7 +1348,14 @@ class DocumentPipeline:
             self._safe_log(outcome, message, row_index=log_row)
 
         store.set_state(self._db, doc_key, store.COMPLETED)
+        if self._company_id and doc.doc_type in (BANK_STATEMENT, PURCHASE_INVOICE, SALES_INVOICE, IMPORT_INVOICE, EXPORT_INVOICE):
+            self.refresh_bank_review()
         return outcome
+
+    def refresh_bank_review(self) -> None:
+        from app.bank_review import enabled, refresh
+        if enabled():
+            refresh(self)
 
     def _write_primary(
         self, outcome, doc, party, party_tab, route, receipt_matches
@@ -1425,7 +1432,8 @@ class DocumentPipeline:
             outcome.row_index = start
             outcome.stable_id = doc.numero or f"REL-{year}"
             outcome.reasons.append(f"{written} operation(s) bancaire(s) ecrite(s)")
-            if written:
+            from app.bank_review import enabled as bank_review_enabled
+            if written and (not self._company_id or not bank_review_enabled()):
                 # Le rapprochement ne bloque JAMAIS l'ecriture du releve : une
                 # operation qu'on ne sait pas rattacher reste "Non rapproche".
                 try:
