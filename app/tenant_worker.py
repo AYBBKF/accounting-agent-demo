@@ -298,6 +298,16 @@ class TenantWorker:
             except TenantError as exc:  # pragma: no cover - defensif
                 logger.warning("Curseur non avance pour %s : %s", company_id, exc)
 
+        from app.bank_review import enabled as bank_review_enabled
+        for company_id in self.active_companies if bank_review_enabled() else ():
+            with self._locks.hold(company_id, timeout=0) as held:
+                if not held:
+                    continue
+                try:
+                    self.worker_for(company_id).pipeline.refresh_bank_review()
+                except Exception as exc:
+                    logger.warning('Revue bancaire %s impossible : %s', company_id, type(exc).__name__)
+                    rapport.technical_failures += 1
         rapport.skipped_busy = tuple(dict.fromkeys(occupees))
         return rapport
 

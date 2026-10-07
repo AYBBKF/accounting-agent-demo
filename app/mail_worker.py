@@ -667,6 +667,8 @@ class MailWorker:
             store.advance_cursor(
                 self._db_path, self._chat_id, newest, **self._scope()
             )
+        if self.company_id:
+            self.pipeline.refresh_bank_review()
         return summaries
 
     def run_startup_tasks(self) -> None:

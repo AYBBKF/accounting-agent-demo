@@ -7,6 +7,8 @@ contaminer une autre.
 
 from __future__ import annotations
 
+from contextlib import closing
+
 import tempfile
 from decimal import Decimal
 from pathlib import Path
@@ -133,7 +135,7 @@ def test_le_registre_ne_stocke_aucun_secret(db_path):
     import sqlite3
 
     registry.register_company(db_path, "xblaste")
-    with sqlite3.connect(db_path) as conn:
+    with closing(sqlite3.connect(db_path)) as conn, conn:
         colonnes = {row[1] for row in conn.execute("PRAGMA table_info(companies)")}
     interdits = {
         "api_key", "token", "secret", "password", "client_secret",
